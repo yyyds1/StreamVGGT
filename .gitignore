@@ -1,0 +1,14 @@
+**/**.pth
+**/**.png
+**/**.mp4
+**/**.jpg
+
+ckpt/
+input**/
+
+.gradio/
+
+.vscode/
+
+__pycache__/
+

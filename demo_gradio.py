@@ -38,15 +38,21 @@ if os.path.exists(local_ckpt_path):
     del ckpt
 else:
     print("Local checkpoint not found, downloading from Hugging Face...")
-    from huggingface_hub import hf_hub_download
-    path = hf_hub_download(
+    # from huggingface_hub import hf_hub_download
+    # path = hf_hub_download(
+    #     repo_id="lch01/StreamVGGT",
+    #     filename="checkpoints.pth",
+    #     revision="main",
+    #     force_download=True
+    # )
+    from huggingface_hub import snapshot_download
+    snapshot_download(
         repo_id="lch01/StreamVGGT",
-        filename="checkpoints.pth",
-        revision="main",
-        force_download=True
+        local_dir="./ckpt",
+        allow_patterns="checkpoints.pth"
     )
     model = StreamVGGT()
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch.load(local_ckpt_path, map_location="cpu")
     model.load_state_dict(ckpt, strict=True)
     model.eval() 
     del ckpt
@@ -539,7 +545,7 @@ with gr.Blocks(
                 label="Preview",
                 columns=4,
                 height="300px",
-                show_download_button=True,
+                buttons=["download"],
                 object_fit="contain",
                 preview=True,
             )
