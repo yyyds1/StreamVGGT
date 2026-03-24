@@ -472,9 +472,6 @@ class Aggregator(nn.Module):
         if tokens.shape != (B, S * P, C):
             tokens = tokens.reshape(B, S, P, C).reshape(B, S * P, C)
 
-        if pos is not None and pos.shape != (B, S * P, 3):
-            pos = pos.reshape(B, S, P, 3).reshape(B, S * P, 3)
-
         intermediates = []
 
         for _ in range(self.aa_block_size):

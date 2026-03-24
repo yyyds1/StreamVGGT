@@ -2,6 +2,27 @@
 import torch
 import torch.distributed as dist
 
+try:
+    import torch_npu  # noqa: F401 — register NPU backend
+except ImportError:
+    pass
+
+
+def device_synchronize():
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
+    elif torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def device_empty_cache():
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        empty = getattr(torch.npu, "empty_cache", None)
+        if callable(empty):
+            empty()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
     """
@@ -22,12 +43,22 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
 
 
 def init_distributed(world_size, local_rank, rank):
-    # if world_size > 1:
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl",
-                            init_method="env://",
-                            rank=rank,
-                            world_size=world_size)
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.set_device(local_rank)
+        dist.init_process_group(
+            backend="hccl",
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+        )
+    else:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+        )
 
 def dist_mean(local_tensor):
     if dist.is_initialized():

@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
@@ -78,7 +80,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         aggregated_tokens_list, patch_start_idx = self.aggregator(images)
         predictions = {}
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with nullcontext():
             if self.camera_head is not None:
                 pose_enc_list = self.camera_head(aggregated_tokens_list)
                 predictions["pose_enc"] = pose_enc_list[-1]  # pose encoding of the last iteration
@@ -176,7 +178,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         aggregated_tokens_list, patch_start_idx = self.aggregator(images)
         predictions = {}
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with nullcontext():
             if self.camera_head is not None:
                 pose_enc_list = self.camera_head(aggregated_tokens_list)
                 predictions["pose_enc"] = pose_enc_list[-1]  # pose encoding of the last iteration

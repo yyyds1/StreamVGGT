@@ -18,6 +18,7 @@ pyglet<2
 viser
 gradio
 lpips
+easydict
 hydra-core
 h5py
 accelerate

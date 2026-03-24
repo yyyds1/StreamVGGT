@@ -16,3 +16,5 @@ src/wandb/
 
 __pycache__/
 
+.venv/
+

@@ -2,6 +2,7 @@
 import gc
 
 import torch
+from distributed.util import device_empty_cache
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -64,4 +65,4 @@ def shard_model(model,
 def free_model(model):
     del model
     gc.collect()
-    torch.cuda.empty_cache()
+    device_empty_cache()

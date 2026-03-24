@@ -11,6 +11,10 @@ from omegaconf import OmegaConf
 import pathlib
 
 import torch
+try:
+    import torch_npu  # noqa: F401 — register NPU for torch.distributed / FSDP
+except ImportError:
+    pass
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
@@ -29,10 +33,12 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from configs import VA_CONFIGS
 from distributed.fsdp import shard_model, apply_ac
 from distributed.util import (
-    _configure_model, 
-    init_distributed, 
-    dist_mean, 
-    dist_max
+    _configure_model,
+    init_distributed,
+    dist_mean,
+    dist_max,
+    device_synchronize,
+    device_empty_cache,
 )
 from einops import rearrange
 # from modules.utils import (
@@ -70,8 +76,10 @@ class Trainer:
             logger.info("WandB logging enabled")
         self.step = 0
         self.config = config
-        self.device = torch.device(f"cuda:{config.local_rank}")
-        # self.device = torch.device(f"cuda:0")
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            self.device = torch.device(f"npu:{config.local_rank}")
+        else:
+            self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
 
@@ -208,6 +216,7 @@ class Trainer:
                 f"Example frozen parameters: {', '.join(frozen_param_names[:5])}{'...' if len(frozen_param_names) > 5 else ''}")
 
         # Optimizer
+        _adam_fused = self.device.type == "cuda"
         self.optimizer = torch.optim.AdamW(
             [p for p in self.transformer.parameters() if p.requires_grad]
             + [p for p in self.action_head.parameters() if p.requires_grad],
@@ -215,7 +224,7 @@ class Trainer:
             betas=(config.beta1, config.beta2),
             eps=1e-8,
             weight_decay=config.weight_decay,
-            fused=True,
+            fused=_adam_fused,
             foreach=False,
         )
 
@@ -556,9 +565,9 @@ class Trainer:
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
 
-                torch.cuda.synchronize()
+                device_synchronize()
                 if self.step % self.config.gc_interval == 0:
-                    torch.cuda.empty_cache()
+                    device_empty_cache()
                     gc.collect()
 
                 if self.config.rank == 0:

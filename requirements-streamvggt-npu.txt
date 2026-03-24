@@ -1,0 +1,40 @@
+# StreamVGGT / ActionVGGT — NPU 环境专用（不包含 torch / torchvision）
+#
+# 请先在与 CANN 匹配的虚拟环境（推荐仓库内 .venv）中安装 torch、torchvision、torch_npu 官方 whl，
+# 再执行: pip install -r requirements-streamvggt-npu.txt
+# 或使用: bash scripts/setup_streamvggt_npu_env.sh
+#
+# torch_npu 初始化会 import yaml，须先于 import 检查安装
+pyyaml
+# AOE / CANN Python adapters may require this at runtime
+decorator
+numpy==1.26.1
+Pillow==10.3.0
+diffusers==0.36.0
+huggingface_hub
+safetensors
+roma
+gradio
+matplotlib
+tqdm
+opencv-python
+scipy
+einops
+trimesh
+tensorboard
+pyglet<2
+viser
+lpips
+easydict
+hydra-core
+h5py
+accelerate
+transformers
+scikit-learn
+gsplat
+evo
+open3d
+wandb
+msgpack
+lerobot==0.3.3
+timm==1.0.15

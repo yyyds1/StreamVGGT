@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
@@ -122,8 +124,11 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
             action_grid_id=action_grid_id,
         )
         
-        # Handle both old (2-tuple) and new (3-tuple/4-tuple with use_cache) returns
-        if isinstance(agg_out, tuple):
+        # Handle both old tuple return and current list-style return.
+        if isinstance(agg_out, list):
+            aggregated_tokens_list = agg_out
+            patch_start_idx = 0
+        elif isinstance(agg_out, tuple):
             if len(agg_out) == 2:
                 aggregated_tokens_list, patch_start_idx = agg_out
             elif len(agg_out) == 3:
@@ -131,7 +136,7 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
             else:
                 raise ValueError(f"Unexpected aggregator output length: {len(agg_out)}")
         else:
-            raise ValueError("Aggregator output must be a tuple")
+            raise ValueError("Aggregator output must be list/tuple")
 
         pred_frame_idx_val = pred_frame_idx
         if torch.is_tensor(pred_frame_idx_val):
@@ -151,7 +156,7 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         rdt_act_c = self.rdt_action_proj(act_tokens)
 
         predictions = {}
-        with torch.cuda.amp.autocast(enabled=False):
+        with nullcontext():  # was torch.cuda.amp.autocast(enabled=False); keep NPU-safe
 
             # if self.camera_head is not None:
             #     pose_enc_list = self.camera_head(aggregated_tokens_list)
@@ -228,7 +233,7 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
             else:
                 aggregated_tokens, patch_start_idx = aggregator_output
             
-            with torch.cuda.amp.autocast(enabled=False):
+            with nullcontext():
                 if self.camera_head is not None:
                     pose_enc, past_key_values_camera = self.camera_head(aggregated_tokens, past_key_values_camera=past_key_values_camera, use_cache=True)
                     pose_enc = pose_enc[-1]
