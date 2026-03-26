@@ -4,7 +4,6 @@ from .va_robotwin_train_cfg import va_robotwin_train_cfg
 from .va_robotwin_train_rdt_cfg import va_robotwin_train_rdt_cfg
 
 VA_CONFIGS = {
-    'robotwin': va_robotwin_cfg,
-    # 'robotwin_train': va_robotwin_train_cfg,
-    'robotwin_train': va_robotwin_train_rdt_cfg,
+    "robotwin": va_robotwin_cfg,
+    "robotwin_train": va_robotwin_train_rdt_cfg,
 }

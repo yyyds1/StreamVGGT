@@ -8,13 +8,14 @@ va_robotwin_train_cfg.update(va_robotwin_cfg)
 
 # va_robotwin_train_cfg.resume_from = '/robby/share/Robotics/lilin1/code/Wan_VA_Release/train_out/checkpoints/checkpoint_step_10'
 
-va_robotwin_train_cfg.dataset_path = '/home/yds/dataset/lerobot'
+va_robotwin_train_cfg.dataset_path = "/mnt/nas/datasets5/robotwin_lerobot"
 va_robotwin_train_cfg.empty_emb_path = os.path.join(va_robotwin_train_cfg.dataset_path, 'empty_emb.pt')
 va_robotwin_train_cfg.enable_wandb = True
 va_robotwin_train_cfg.load_worker = 16
 va_robotwin_train_cfg.dataset_init_worker = 8
 va_robotwin_train_cfg.dataset_mp_start_method = 'spawn'
-va_robotwin_train_cfg.save_interval = 1000
+va_robotwin_train_cfg.multi_view_image_mode = 'vertical'
+va_robotwin_train_cfg.save_interval = 100
 va_robotwin_train_cfg.gc_interval = 50
 va_robotwin_train_cfg.cfg_prob = 0.1
 
@@ -26,4 +27,5 @@ va_robotwin_train_cfg.weight_decay = 0.1
 va_robotwin_train_cfg.warmup_steps = 10
 va_robotwin_train_cfg.batch_size = 1 
 va_robotwin_train_cfg.gradient_accumulation_steps = 1
-va_robotwin_train_cfg.num_steps = 50000 
+va_robotwin_train_cfg.num_steps = 1000 
+va_robotwin_train_cfg.single_task = "adjust_bottle"

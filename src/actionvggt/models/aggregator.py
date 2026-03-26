@@ -76,6 +76,7 @@ class Aggregator(nn.Module):
         super().__init__()
         self.image_height = img_height
         self.image_width = img_width
+        self._frame_causal_mask_cache = {}
         self.__build_patch_embed__(patch_embed, img_height, img_width, patch_size, num_register_tokens, embed_dim=embed_dim)
 
         # Initialize rotary position embedding if frequency > 0
@@ -123,22 +124,23 @@ class Aggregator(nn.Module):
             ]
         )
 
-        self.cross_blocks = nn.ModuleList(
-            [
-                CrossBlock(
-                    dim=embed_dim,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    proj_bias=proj_bias,
-                    ffn_bias=ffn_bias,
-                    init_values=init_values,
-                    qk_norm=qk_norm,
-                    rope=self.rope,
-                )
-                for _ in range(depth)
-            ]
-        )
+        if "cross" in aa_order:
+            self.cross_blocks = nn.ModuleList(
+                [
+                    CrossBlock(
+                        dim=embed_dim,
+                        num_heads=num_heads,
+                        mlp_ratio=mlp_ratio,
+                        qkv_bias=qkv_bias,
+                        proj_bias=proj_bias,
+                        ffn_bias=ffn_bias,
+                        init_values=init_values,
+                        qk_norm=qk_norm,
+                        rope=self.rope,
+                    )
+                    for _ in range(depth)
+                ]
+            )
 
         self.depth = depth
         self.aa_order = aa_order
@@ -232,6 +234,7 @@ class Aggregator(nn.Module):
         past_frame_idx=0,
         image_grid_id: Optional[torch.Tensor] = None,
         action_grid_id: Optional[torch.Tensor] = None,
+        return_all_layers: bool = True,
      ) -> Tuple[List[torch.Tensor], int, Optional[Dict]]:
         """
         Args:
@@ -335,7 +338,7 @@ class Aggregator(nn.Module):
         frame_idx = 0
         global_idx = 0
         cross_idx = 0
-        output_list = []
+        last_output = None
 
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
@@ -369,14 +372,33 @@ class Aggregator(nn.Module):
                 # concat frame and global intermediates, [B x S x P x 2C]
                 # concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i], cross_intermediates[i]], dim=-1)
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                output_list.append(concat_inter)
+                if return_all_layers:
+                    if last_output is None:
+                        last_output = []
+                    last_output.append(concat_inter)
+                else:
+                    last_output = concat_inter
+
+        if return_all_layers:
+            output = last_output if last_output is not None else []
+        else:
+            output = [last_output] if last_output is not None else []
 
         del concat_inter
         del frame_intermediates
         del global_intermediates
         if use_cache:
-            return output_list, self.token_idx, past_key_values
-        return output_list, self.token_idx
+            return output, self.token_idx, past_key_values
+        return output, self.token_idx
+
+    def _get_frame_causal_mask(self, seq_len, tokens_per_frame, device):
+        key = (seq_len, tokens_per_frame, device)
+        mask = self._frame_causal_mask_cache.get(key)
+        if mask is None:
+            frame_ids = torch.arange(seq_len, device=device) // tokens_per_frame
+            mask = frame_ids.unsqueeze(1) >= frame_ids.unsqueeze(0)
+            self._frame_causal_mask_cache[key] = mask
+        return mask
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """
@@ -432,10 +454,10 @@ class Aggregator(nn.Module):
         for _ in range(self.aa_block_size):
             if not use_cache:
                 L = S * P
-                frame_ids = torch.arange(L, device=tokens.device) // P  # [0,0,...,1,1,...,S-1]
-                # print(f"Frame ids for global attention: {frame_ids.shape}")
-                future_frame = frame_ids.unsqueeze(1) < frame_ids.unsqueeze(0)
-                attn_mask = future_frame.to(tokens.dtype) * torch.finfo(tokens.dtype).min
+                # Boolean masks keep the original frame-causal semantics while
+                # avoiding the large additive mask tensor that pushes SDPA onto
+                # a more memory-hungry path.
+                attn_mask = self._get_frame_causal_mask(L, P, tokens.device)
             else:
                 attn_mask = None
                 

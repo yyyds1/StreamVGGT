@@ -92,8 +92,13 @@ class Attention(nn.Module):
 
             # Mask
             if attn_mask is not None:
-                assert attn_mask.shape[-2:] == (N, N), f"Expected mask shape [..., {N}, {N}], got {attn_mask.shape}"
-                attn = attn + attn_mask
+                assert attn_mask.shape[-2:] == attn.shape[-2:], (
+                    f"Expected mask shape [..., {attn.shape[-2]}, {attn.shape[-1]}], got {attn_mask.shape}"
+                )
+                if attn_mask.dtype == torch.bool:
+                    attn = attn.masked_fill(~attn_mask, torch.finfo(attn.dtype).min)
+                else:
+                    attn = attn + attn_mask
 
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
@@ -176,7 +181,13 @@ class CrossAttention(nn.Module):
             attn = q @ k.transpose(-2, -1)
 
             if attn_mask is not None:
-                attn = attn + attn_mask
+                assert attn_mask.shape[-2:] == attn.shape[-2:], (
+                    f"Expected mask shape [..., {attn.shape[-2]}, {attn.shape[-1]}], got {attn_mask.shape}"
+                )
+                if attn_mask.dtype == torch.bool:
+                    attn = attn.masked_fill(~attn_mask, torch.finfo(attn.dtype).min)
+                else:
+                    attn = attn + attn_mask
 
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)

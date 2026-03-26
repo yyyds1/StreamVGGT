@@ -1,5 +1,7 @@
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
 from actionvggt.models.aggregator import Aggregator
@@ -34,6 +36,10 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         text_dim=4096,
         window_size=4,
         chunk_size=4,
+        num_image_views=1,
+        rdt_img_cond_mode="full",
+        rdt_img_pool_size=1,
+        rdt_img_keep_summary_tokens=False,
     ):
         """Vision–action model inspired by WAN transformer.
 
@@ -53,6 +59,12 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         self.chunk_size = chunk_size
         self.img_height = img_height
         self.img_width = img_width
+        self.num_image_views = num_image_views
+        self.rdt_img_cond_mode = rdt_img_cond_mode
+        self.rdt_img_pool_size = max(int(rdt_img_pool_size), 1)
+        self.rdt_img_keep_summary_tokens = rdt_img_keep_summary_tokens
+        self.patch_grid_h = img_height // patch_size
+        self.patch_grid_w = img_width // patch_size
 
         # original image processing backbone (DINO aggregator)
         self.aggregator = Aggregator(img_height=img_height, img_width=img_width, patch_size=patch_size, embed_dim=embed_dim)
@@ -62,7 +74,59 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
 
         self.output_image_proj = nn.Linear(2 * embed_dim, embed_dim)
         self.output_action_proj = nn.Linear(2 * embed_dim, embed_dim)
-    
+ 
+    def _build_rdt_img_tokens(self, img_tokens: torch.Tensor) -> torch.Tensor:
+        if self.rdt_img_cond_mode == "full":
+            return img_tokens.reshape(img_tokens.shape[0], -1, img_tokens.shape[-1])
+
+        patches_per_view = self.patch_grid_h * self.patch_grid_w
+        expected_tokens = patches_per_view * self.num_image_views
+        if img_tokens.shape[2] != expected_tokens:
+            raise ValueError(
+                f"Expected {expected_tokens} image tokens per frame, got {img_tokens.shape[2]}. "
+                "Check num_image_views and patch-grid settings."
+            )
+
+        bsz, frames, _, dim = img_tokens.shape
+        view_tokens = img_tokens.reshape(
+            bsz,
+            frames,
+            self.num_image_views,
+            self.patch_grid_h,
+            self.patch_grid_w,
+            dim,
+        )
+
+        pooled_h = max(1, math.ceil(self.patch_grid_h / self.rdt_img_pool_size))
+        pooled_w = max(1, math.ceil(self.patch_grid_w / self.rdt_img_pool_size))
+
+        pooled = view_tokens.permute(0, 1, 2, 5, 3, 4).reshape(
+            bsz * frames * self.num_image_views,
+            dim,
+            self.patch_grid_h,
+            self.patch_grid_w,
+        )
+        pooled = F.adaptive_avg_pool2d(pooled, output_size=(pooled_h, pooled_w))
+        pooled = pooled.reshape(
+            bsz,
+            frames,
+            self.num_image_views,
+            dim,
+            pooled_h,
+            pooled_w,
+        ).permute(0, 1, 2, 4, 5, 3).reshape(
+            bsz,
+            frames,
+            self.num_image_views,
+            pooled_h * pooled_w,
+            dim,
+        )
+
+        if self.rdt_img_keep_summary_tokens:
+            summary = view_tokens.mean(dim=(3, 4)).unsqueeze(3)
+            pooled = torch.cat([summary, pooled], dim=3)
+
+        return pooled.reshape(bsz, -1, dim)
 
 
     def forward(
@@ -88,7 +152,7 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         self.window_size = input_dict['window_size']
 
         actions = action_dict["actions"] # [B, C_action, F, N, 1]
-        action_mask = action_dict.get("actions_mask", None)  # [B, C_action, F, N, 1]
+        action_mask = action_dict.get("actions_mask", action_dict.get("action_mask", None))  # [B, C_action, F, N, 1]
         masked_actions = actions * action_mask if action_mask is not None else actions
 
         images = image_dict["images"]  # [B, C, F, H, W]
@@ -110,8 +174,8 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         # image_dict stores images as [B, C, F, H, W]; convert to [B, F, C, H, W]        
         masked_images = masked_images.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
         # create views list for downstream heads/output
-        B, F, C, H, W = images.shape
-        views = [{"img": images[:, i]} for i in range(F)]
+        B, F, C, H, W = masked_images.shape
+        views = [{"img": masked_images[:, i]} for i in range(F)]
 
         # Call aggregator with dataset-style inputs if provided
         agg_out = self.aggregator(
@@ -120,6 +184,7 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
             text_emb=text_emb,
             image_grid_id=image_grid_id,
             action_grid_id=action_grid_id,
+            return_all_layers=False,
         )
         
         # Handle both old (2-tuple) and new (3-tuple/4-tuple with use_cache) returns
@@ -145,7 +210,7 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         img_tokens = window_tokens[:, :, token_idx["image"][0]:token_idx["image"][1]]
         act_tokens = window_tokens[:, :, token_idx["action"][0]:token_idx["action"][1]]
 
-        img_tokens = img_tokens.reshape(img_tokens.shape[0], -1, token_dim)
+        img_tokens = self._build_rdt_img_tokens(img_tokens)
         act_tokens = act_tokens.reshape(act_tokens.shape[0], -1, token_dim)
         rdt_img_c = self.output_image_proj(img_tokens)
         rdt_act_c = self.output_action_proj(act_tokens)
@@ -180,7 +245,7 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
             #     predictions["conf"] = conf
             # predictions["images"] = images
 
-            B, S = images.shape[:2]
+            B, S = masked_images.shape[:2]
             # ress = []
             # for s in range(S):
             #     res = {
