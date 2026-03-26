@@ -7,7 +7,7 @@ from pathlib import Path
 from collections.abc import Callable
 import os
 from tqdm import tqdm
-from multiprocessing import Pool
+from multiprocessing import get_context
 from functools import partial
 import torch
 from einops import rearrange
@@ -37,7 +37,7 @@ def construct_lerobot(
         config=config,
     )
 
-def construct_lerobot_multi_processor(config, 
+def construct_lerobot_multi_processor(config,
                                       num_init_worker=128,
                                       ):
     datasets_out_lst = []
@@ -47,8 +47,10 @@ def construct_lerobot_multi_processor(config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-    repo_list = repo_list[:2]
-    with Pool(num_init_worker) as pool:
+    # repo_list = repo_list[:2]
+    mp_start_method = getattr(config, 'dataset_mp_start_method', 'spawn')
+    pool_context = get_context(mp_start_method)
+    with pool_context.Pool(num_init_worker) as pool:
         datasets_out_lst = pool.map(construct_func, repo_list)
     # for repo in repo_list:
     #     datasets_out_lst.append(construct_func(repo))
@@ -74,8 +76,10 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         config,
-        num_init_worker=128,
+        num_init_worker=None,
     ):
+        if num_init_worker is None:
+            num_init_worker = getattr(config, 'dataset_init_worker', 8)
         self._datasets = construct_lerobot_multi_processor(config, 
                                                            num_init_worker, 
                                                            )
@@ -142,6 +146,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             self.revision = get_safe_version(self.repo_id, self.revision)
             self.download_episodes(download_videos)
             self.hf_dataset = self.load_hf_dataset()
+        # self.hf_dataset = self.load_hf_dataset()
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         
         self.latent_path = Path(repo_id) / 'latents'
@@ -153,11 +158,10 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.image_height, self.image_width = config.image_height, config.image_width
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
-        self._hf_torch_view = self.hf_dataset.with_format(
-                type='torch',
-                columns=['action'],
-                output_all_columns=False
-            )
+        self._hf_action_view = self.hf_dataset.with_format(
+            columns=['action'],
+            output_all_columns=False,
+        )
         self.parse_meta()
 
     def parse_meta(self):
@@ -200,8 +204,13 @@ class LatentLeRobotDataset(LeRobotDataset):
         return local_index + ep_start
 
     def _get_range_hf_data(self, start_frame, end_frame):
-        batch = self._hf_torch_view[start_frame:end_frame]
-        return batch
+        batch = self._hf_action_view[start_frame:end_frame]
+        actions = batch['action']
+        if isinstance(actions, torch.Tensor):
+            action_tensor = actions
+        else:
+            action_tensor = torch.as_tensor(np.asarray(actions))
+        return {'action': action_tensor}
 
     def _flatten_latent_dict(self, latent_dict):
         out = {}
@@ -306,6 +315,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             latents = cat_latent,
             text_emb = text_emb,
         )
+        print(f"lactent shape: {cat_latent.shape}")
         return out_dict
     
     def _cat_video_images(self,
@@ -322,7 +332,7 @@ class LatentLeRobotDataset(LeRobotDataset):
                                  h= image_height, 
                                  w= image_width)
             # downsample image frames to frames/4
-            image = image[::4]
+            image = image[::self.config.image_frame_stride]
             # resize and padding image to self.image_height and self.image_width, Does not distort the image content
             import torch.nn.functional as F
 
@@ -369,10 +379,10 @@ class LatentLeRobotDataset(LeRobotDataset):
         left_action = get_relative_pose(action[:, :7])
         right_action = get_relative_pose(action[:, 8:15])
         action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
-        action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
+        action = np.pad(action, pad_width=((frame_stride * self.config.image_frame_stride, 0), (0, 0)), mode='constant', constant_values=0)
 
-        image_frame_num = (len(image_frame_ids) - 1) // 4 + 1
-        required_action_num = image_frame_num * frame_stride * 4
+        image_frame_num = (len(image_frame_ids) - 1) // self.config.image_frame_stride + 1
+        required_action_num = image_frame_num * frame_stride * self.config.image_frame_stride
 
         action = action[:required_action_num]
         action_mask = np.ones_like(action, dtype='bool')
@@ -408,6 +418,9 @@ class LatentLeRobotDataset(LeRobotDataset):
         end_frame = cur_meta["end_frame"]
         local_start_frame = start_frame
         local_end_frame = end_frame
+
+        # ori_latent_data_dict = self._get_range_latent_data(start_frame, end_frame, episode_index)
+        # cat_latent = self._cat_video_latents(ori_latent_data_dict)
 
         ori_data_dict = self._get_range_image_data(start_frame, end_frame, episode_index)
 

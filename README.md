@@ -67,10 +67,21 @@ StreamVGGT
 
 To start training, run:
 ```bash
-NGPU=8 bash script/run_va_posttrain.sh
+NGPU=8 bash scripts/run_va_posttrain.sh
 ```
 
 
 ## Evaluation
 
 TODO
+
+## Trouble Shooting
+
+1. To load the dataset offline, set env variable:
+``` bash
+export HF_HUB_OFFLINE=1 
+export HF_DATASETS_OFFLINE=1 
+export TRANSFORMERS_OFFLINE=1
+```
+
+2. 

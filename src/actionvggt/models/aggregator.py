@@ -65,7 +65,7 @@ class Aggregator(nn.Module):
         proj_bias=True,
         ffn_bias=True,
         patch_embed="dinov2_vitl14_reg",
-        aa_order=["frame", "global", "cross"],
+        aa_order=["frame", "global"],
         aa_block_size=1,
         qk_norm=True,
         rope_freq=100,
@@ -321,7 +321,7 @@ class Aggregator(nn.Module):
                     action_pos = act_grid.reshape(B * S, -1, 3)
                 pos = torch.cat([pos, action_pos], dim=1)
 
-        self.token_idx["image"] = (self.token_idx["register"][1], self.token_idx["register"][1] + P)
+        self.token_idx["image"] = (self.token_idx["register"][1], self.token_idx["register"][1] + patch_tokens.shape[1])
         self.token_idx["action"] = (self.token_idx["image"][1], self.token_idx["image"][1] + action_tokens.shape[1])
 
         if self.token_idx["image"][0] > 0:
@@ -331,6 +331,7 @@ class Aggregator(nn.Module):
 
         _, P, C = tokens.shape
 
+
         frame_idx = 0
         global_idx = 0
         cross_idx = 0
@@ -338,6 +339,7 @@ class Aggregator(nn.Module):
 
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
+                # print(f"Processing block group with attention type: {attn_type}, frame_idx: {frame_idx}, global_idx: {global_idx}")
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
                         tokens, B, S, P, C, frame_idx, pos=pos
@@ -364,8 +366,9 @@ class Aggregator(nn.Module):
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
             for i in range(len(frame_intermediates)):
-                # concat frame and global intermediates, [B x S x P x 3C]
-                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i], cross_intermediates[i]], dim=-1)
+                # concat frame and global intermediates, [B x S x P x 2C]
+                # concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i], cross_intermediates[i]], dim=-1)
+                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                 output_list.append(concat_inter)
 
         del concat_inter
@@ -430,6 +433,7 @@ class Aggregator(nn.Module):
             if not use_cache:
                 L = S * P
                 frame_ids = torch.arange(L, device=tokens.device) // P  # [0,0,...,1,1,...,S-1]
+                # print(f"Frame ids for global attention: {frame_ids.shape}")
                 future_frame = frame_ids.unsqueeze(1) < frame_ids.unsqueeze(0)
                 attn_mask = future_frame.to(tokens.dtype) * torch.finfo(tokens.dtype).min
             else:
@@ -471,9 +475,6 @@ class Aggregator(nn.Module):
         """Separate cross-attention stage over text embeddings."""
         if tokens.shape != (B, S * P, C):
             tokens = tokens.reshape(B, S, P, C).reshape(B, S * P, C)
-
-        if pos is not None and pos.shape != (B, S * P, 3):
-            pos = pos.reshape(B, S, P, 3).reshape(B, S * P, 3)
 
         intermediates = []
 

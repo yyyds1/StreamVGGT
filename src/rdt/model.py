@@ -161,7 +161,9 @@ class RDT(nn.Module):
         state_c: Optional[torch.Tensor] = None, 
         lang_mask: Optional[torch.Tensor] = None, 
         img_mask: Optional[torch.Tensor] = None,
-        act_mask: Optional[torch.Tensor] = None
+        act_mask: Optional[torch.Tensor] = None,
+        embed_input: bool = False,
+        decode_output: bool = False,
     ):
         """
         Forward pass of RDT.
@@ -182,7 +184,13 @@ class RDT(nn.Module):
             lang_mask: (B, L_lang) or None, language condition mask (True for valid).
             img_mask: (B, L_img) or None, image condition mask (True for valid).
             act_mask: (B, L_act) or None, action condition mask (True for valid).
+            embed_input: whether to map action-dim inputs to hidden size using action_embedder.
+            decode_output: whether to map hidden outputs back to action dim using action_decoder.
         """
+        if embed_input:
+            x = self.action_embedder(x)
+            state_c = self.action_embedder(state_c) if state_c is not None else None
+
         t = self.t_embedder(t) # (B, D) or (1, D)
         if t.shape[0] == 1:
             t = t.expand(x.shape[0], -1)    # (B, D)
@@ -207,8 +215,8 @@ class RDT(nn.Module):
         if act_c is not None and self.act_pos_emb is not None:
             act_c = act_c + self.act_pos_emb
         
-        conds = [lang_c_kv or lang_c]
-        masks = [lang_mask]
+        conds = []
+        masks = []
         if self.img_pos_emb is not None:
             conds.append(img_c)
             masks.append(img_mask)
@@ -233,5 +241,8 @@ class RDT(nn.Module):
 
         # Unpack [x, r]
         x = x[:, :-self.num_register_tokens]
+
+        if decode_output:
+            x = self.action_decoder(x)
 
         return x

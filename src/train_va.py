@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import math
 import os
 import sys
 import re
@@ -81,7 +82,10 @@ class Trainer:
         # Load and shard transformer with FSDP
         logger.info("Loading transformer...")
 
-        self.transformer = ActionVGGT()
+        self.transformer = ActionVGGT(
+            img_height=config.image_height,
+            img_width=config.image_width,
+        )
         logger.info(f"All model parameters: {sum(p.numel() for p in self.transformer.parameters())}")
 
         self.transformer.to(self.device)
@@ -89,11 +93,11 @@ class Trainer:
         rdt_config = config.rdt
         patch_h = self.transformer.img_height // self.transformer.patch_size
         patch_w = self.transformer.img_width // self.transformer.patch_size
-        img_tokens_per_frame = patch_h * patch_w
-        act_tokens_per_frame = 1
+        img_tokens_per_frame = patch_h * patch_w * len(self.config.obs_cam_keys)
+        act_tokens_per_frame = self.config.image_frame_stride
         rdt_horizon = self.config.chunk_size
         rdt_x_pos_emb_config = [("act", rdt_horizon + self.config.rdt.num_register_tokens)]
-        rdt_img_pos_emb_config = [("image", (self.config.window_size, patch_h, patch_w))]
+        rdt_img_pos_emb_config = [("image", (self.config.window_size * len(self.config.obs_cam_keys), patch_h, patch_w))]
         rdt_act_pos_emb_config = [("action", (self.config.window_size, act_tokens_per_frame))]
 
         self.action_head = RDT(
@@ -124,6 +128,62 @@ class Trainer:
                 return state['state_dict']
             return state
 
+        def _resize_pos_embed_tensor(src_pos_embed: torch.Tensor, dst_pos_embed: torch.Tensor):
+            if src_pos_embed.ndim != 3 or dst_pos_embed.ndim != 3:
+                return None
+            if src_pos_embed.shape[-1] != dst_pos_embed.shape[-1]:
+                return None
+
+            src_len = src_pos_embed.shape[1]
+            dst_len = dst_pos_embed.shape[1]
+            if src_len == dst_len:
+                return src_pos_embed
+
+            src_prefix = 1
+            dst_prefix = 1
+            src_grid_tokens = src_len - src_prefix
+            dst_grid_tokens = dst_len - dst_prefix
+            src_hw = int(math.sqrt(src_grid_tokens))
+            dst_hw = int(math.sqrt(dst_grid_tokens))
+
+            if src_hw * src_hw != src_grid_tokens or dst_hw * dst_hw != dst_grid_tokens:
+                return None
+
+            src_prefix_tokens = src_pos_embed[:, :src_prefix]
+            src_grid = src_pos_embed[:, src_prefix:]
+            src_grid = src_grid.reshape(1, src_hw, src_hw, -1).permute(0, 3, 1, 2)
+            src_grid = F.interpolate(src_grid, size=(dst_hw, dst_hw), mode="bicubic", align_corners=False)
+            src_grid = src_grid.permute(0, 2, 3, 1).reshape(1, dst_hw * dst_hw, -1)
+
+            return torch.cat([src_prefix_tokens, src_grid], dim=1)
+
+        def _adapt_transformer_state_for_resolution(model: torch.nn.Module, state: dict):
+            if not isinstance(state, dict):
+                return state
+
+            adapted = dict(state)
+            model_state = model.state_dict()
+            pos_key = "aggregator.patch_embed.pos_embed"
+
+            if pos_key in adapted and pos_key in model_state:
+                src_pos = adapted[pos_key]
+                dst_pos = model_state[pos_key]
+                if src_pos.shape != dst_pos.shape:
+                    resized = _resize_pos_embed_tensor(src_pos, dst_pos)
+                    if resized is None:
+                        logger.warning(
+                            f"Skip loading {pos_key}: checkpoint shape {tuple(src_pos.shape)} "
+                            f"!= model shape {tuple(dst_pos.shape)} and resize is not applicable"
+                        )
+                        adapted.pop(pos_key, None)
+                    else:
+                        adapted[pos_key] = resized.to(dtype=dst_pos.dtype, device=dst_pos.device)
+                        logger.info(
+                            f"Resized {pos_key} from {tuple(src_pos.shape)} to {tuple(dst_pos.shape)}"
+                        )
+
+            return adapted
+
         # ActionVGGT loading: prefer resume_from, fallback to pretrained.
         transformer_resume_from = getattr(config, 'transformer_resume_from', None)
         transformer_pretrained = getattr(config, 'transformer_pretrained', None)
@@ -131,10 +191,13 @@ class Trainer:
             if config.rank == 0:
                 logger.info(f"Resuming ActionVGGT from: {transformer_resume_from}")
             transformer_state = _load_checkpoint_state(transformer_resume_from)
+            transformer_state = _adapt_transformer_state_for_resolution(self.transformer, transformer_state)
             logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
         elif transformer_pretrained:
             logger.info(f"Loading ActionVGGT pretrained from: {transformer_pretrained}")
-            logger.info(self.transformer.load_state_dict(_load_checkpoint_state(transformer_pretrained), strict=False))
+            transformer_state = _load_checkpoint_state(transformer_pretrained)
+            transformer_state = _adapt_transformer_state_for_resolution(self.transformer, transformer_state)
+            logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
 
         # RDT action head loading: prefer resume_from, fallback to pretrained.
         action_head_resume_from = getattr(config, 'action_head_resume_from', None)
@@ -312,26 +375,47 @@ class Trainer:
         if 'images' not in batch_dict:
             raise ValueError("batch_dict must include raw 'images' for ActionVGGT training")
 
-        images = batch_dict['images']  # [B, C_image, F, H, W]
+        images_full = batch_dict['images']  # [B, C_image, F, H, W]
         # cut image height and width to be divisible by patch size
         # patch_f, patch_h, patch_w = self.patch_size
         # H = (H // patch_h) * patch_h
         # W = (W // patch_w) * patch_w
         # images = images[:, :, :, :H, :W]
-        B, _, F, H, W = images.shape
+        B, _, F_total, H, W = images_full.shape
         # Build action dict
-        actions = batch_dict["actions"] # [B, C_action, F, N, 1]
-        B, _, F, N, _ = actions.shape
+        actions_full = batch_dict["actions"] # [B, C_action, F, N, 1]
+        B, _, F_total_action, N, _ = actions_full.shape
+
+        if F_total != F_total_action:
+            raise ValueError(f"images/actions frame count mismatch: {F_total} vs {F_total_action}")
 
                 # Use action frame nums as chunk_size, instead of image frames
         min_t = max(window_size - 1, 0)
         max_t = max(batch_dict['num_frames'] - (chunk_size + 1) // N, min_t)
         if max_t < min_t:
-            data_timestep = min_t if F > 0 else 0
+            data_timestep = min_t if F_total > 0 else 0
         else:
             data_timestep = torch.randint(min_t, max_t + 1, (B,)).to(self.device)
 
-        window_end = data_timestep + 1
+        if not torch.is_tensor(data_timestep):
+            data_timestep = torch.full((B,), int(data_timestep), device=self.device, dtype=torch.long)
+        data_timestep = data_timestep.long()
+
+        window_end_global = data_timestep + 1
+        window_start_global = torch.clamp(window_end_global - window_size, min=0)
+
+        if (window_start_global != window_start_global[0]).any() or (window_end_global != window_end_global[0]).any():
+            raise ValueError("Variable window boundaries across batch are not supported")
+
+        window_start_idx = int(window_start_global[0].item())
+        window_end_idx = int(window_end_global[0].item())
+
+        images = images_full[:, :, window_start_idx:window_end_idx]
+        actions = actions_full[:, :, window_start_idx:window_end_idx]
+        F = images.shape[2]
+        local_data_timestep = data_timestep - window_start_global
+
+        window_end = local_data_timestep + 1
         image_mask = torch.zeros_like(images, dtype=torch.bool)
         action_mask = torch.zeros_like(actions, dtype=torch.bool)
         image_mask[:, :, :window_end] = True
@@ -378,9 +462,17 @@ class Trainer:
         )
 
         # Build noised action chunks
-        action_chunk_start_idx = data_timestep * N + 1
-        action_chunk_end_idx = min(action_chunk_start_idx + chunk_size, F)
-        action_chunk = rearrange(actions, 'b c f n 1 -> b c (f n)')[:, :, action_chunk_start_idx:action_chunk_end_idx]  # [B, C_action, chunk_size]
+        action_chunk_start_idx = data_timestep * N
+        action_flat = rearrange(actions_full, 'b c f n 1 -> b c (f n)')
+        max_action_tokens = action_flat.shape[-1]
+        action_chunk_end_idx = torch.clamp(action_chunk_start_idx + chunk_size, max=max_action_tokens)
+
+        if (action_chunk_start_idx != action_chunk_start_idx[0]).any() or (action_chunk_end_idx != action_chunk_end_idx[0]).any():
+            raise ValueError("Variable action chunk boundaries across batch are not supported")
+
+        action_chunk_start = int(action_chunk_start_idx[0].item())
+        action_chunk_end = int(action_chunk_end_idx[0].item())
+        action_chunk = action_flat[:, :, action_chunk_start:action_chunk_end]  # [B, C_action, chunk_size]
         action_chunk = rearrange(action_chunk, 'b c f -> b c f 1 1')  # [B, C_action, chunk_size, 1, 1]
         action_chunk_dict = self._add_noise(
             action_chunk,
@@ -388,10 +480,11 @@ class Trainer:
             action_mask=None,
             action_mode=True,
         )
-        action_chunk_dict["pred_frame_idx"] = data_timestep
+        action_chunk_dict["pred_frame_idx"] = local_data_timestep
         action_chunk_dict['targets'] = rearrange(action_chunk_dict['targets'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
         action_chunk_dict['noisy_latents'] = rearrange(action_chunk_dict['noisy_latents'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
-
+        action_chunk_dict['latent'] = rearrange(action_chunk_dict['latent'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
+        
         input_dict = {
             'image_dict': image_dict,
             'action_dict': action_dict,
@@ -422,11 +515,11 @@ class Trainer:
     def compute_loss(self, input_dict, pred):
         action_pred = pred
         action_pred = rearrange(action_pred, 'b f c -> b c f')
-        Bn, Fn = input_dict['latent_dict']['timesteps'].shape
-        action_loss_weight = self.train_scheduler_action.training_weight(input_dict['action_dict']['timesteps'].flatten()).reshape(Bn, Fn)
+        Bn, Fn = input_dict['pred_action_chunk_dict']['timesteps'].shape
+        action_loss_weight = self.train_scheduler_action.training_weight(input_dict['pred_action_chunk_dict']['timesteps'].flatten()).reshape(Bn, Fn)
 
         # Frame-wise action loss calculation
-        action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
+        action_loss = F.mse_loss(action_pred.float(), input_dict['pred_action_chunk_dict']['targets'].float().detach(), reduction='none')
         action_loss = action_loss * action_loss_weight[:, None, :]
         # action_loss = action_loss * input_dict['action_dict']['actions_mask'].float()
         # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
@@ -439,49 +532,7 @@ class Trainer:
         # action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
         # action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
 
-        return action_loss / self.gradient_accumulation_steps
-
-
-    # def compute_loss(self,
-    #     input_dict,
-    #     pred
-    # ):
-    #     latent_pred, action_pred = pred
-    #     action_pred = rearrange(action_pred, 'b (f n) c -> b c f n 1', f=input_dict['action_dict']['targets'].shape[-3])
-    #     latent_pred = data_seq_to_patch(
-    #                     self.patch_size, latent_pred,
-    #                     input_dict['latent_dict']['targets'].shape[-3], input_dict['latent_dict']['targets'].shape[-2],
-    #                     input_dict['latent_dict']['targets'].shape[-1], batch_size=latent_pred.shape[0])
-    #     Bn, Fn = input_dict['latent_dict']['timesteps'].shape
-    #     latent_loss_weight = self.train_scheduler_latent.training_weight(input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
-    #     action_loss_weight = self.train_scheduler_action.training_weight(input_dict['action_dict']['timesteps'].flatten()).reshape(Bn, Fn)
-
-    #     # Frame-wise video loss calculation
-    #     latent_loss = F.mse_loss(latent_pred.float(), input_dict['latent_dict']['targets'].float().detach(), reduction='none')
-    #     latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
-    #     # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
-    #     latent_loss = latent_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-    #     latent_loss = latent_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-    #     # Sum per frame and compute mask per frame
-    #     latent_loss_per_frame = latent_loss.sum(dim=1)  # (B*F,)
-    #     latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
-    #     latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
-
-    #     # Frame-wise action loss calculation
-    #     action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
-    #     action_loss = action_loss * action_loss_weight[:, None, :, None, None]
-    #     action_loss = action_loss * input_dict['action_dict']['actions_mask'].float()
-    #     # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
-    #     action_loss = action_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-    #     action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-    #     action_loss = action_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-    #     action_mask = action_mask.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-    #     # Sum per frame and normalize by mask per frame
-    #     action_loss_per_frame = action_loss.sum(dim=1)  # (B*F,)
-    #     action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
-    #     action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
-
-    #     return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
+        return action_loss_per_frame.mean() / self.gradient_accumulation_steps
 
     def train_epoch(self):
         self.transformer.train()
@@ -516,17 +567,19 @@ class Trainer:
 
             action_chunk = input_dict['pred_action_chunk_dict']['noisy_latents']  # [B, C_action, chunk_size]
             action_chunk = action_chunk.permute(0, 2, 1) # [B, chunk_size, C_action]
-            action_chunk_emb = self.action_head.action_embedder(action_chunk)  # [B, chunk_size, embed_dim]
             timesteps = input_dict['pred_action_chunk_dict']['timesteps'][:, 0]
+            state_c = input_dict['pred_action_chunk_dict']['latent'][:, :, 0:1]  # [B, C_latent, 1]
+            state_c = state_c.permute(0, 2, 1)  # [B, 1, C_latent]
 
             action_pred = self.action_head(
-                action_chunk_emb,
+                action_chunk,
                 timesteps,
                 img_c=rdt_conds['rdt_img_c'],
                 act_c=rdt_conds['rdt_act_c'],
+                state_c=state_c,
+                embed_input=True,
+                decode_output=True,
             )
-
-            action_pred = self.action_head.action_decoder(action_pred) # [B, chunk_size, C_action]
 
             action_loss = self.compute_loss(input_dict, action_pred)
             loss = action_loss
@@ -547,10 +600,14 @@ class Trainer:
                 lr = self.lr_scheduler.get_last_lr()[0]
 
                 # Average accumulated losses
-                latent_loss_show = dist_mean(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
                 action_loss_show = dist_mean(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
-                max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
                 max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
+                if len(accumulated_latent_losses) > 0:
+                    latent_loss_show = dist_mean(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
+                    max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
+                else:
+                    latent_loss_show = 0.0
+                    max_latent_loss_show = 0.0
 
                 # Clear accumulated losses
                 accumulated_latent_losses = []

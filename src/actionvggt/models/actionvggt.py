@@ -60,8 +60,8 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         # self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         # self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
 
-        self.rdt_image_proj = nn.Linear(3 * embed_dim, embed_dim)
-        self.rdt_action_proj = nn.Linear(3 * embed_dim, embed_dim)
+        self.output_image_proj = nn.Linear(2 * embed_dim, embed_dim)
+        self.output_action_proj = nn.Linear(2 * embed_dim, embed_dim)
     
 
 
@@ -114,7 +114,7 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         views = [{"img": images[:, i]} for i in range(F)]
 
         # Call aggregator with dataset-style inputs if provided
-        agg_out, token_idx = self.aggregator(
+        agg_out = self.aggregator(
             images=masked_images,
             actions=masked_actions,
             text_emb=text_emb,
@@ -125,13 +125,13 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         # Handle both old (2-tuple) and new (3-tuple/4-tuple with use_cache) returns
         if isinstance(agg_out, tuple):
             if len(agg_out) == 2:
-                aggregated_tokens_list, patch_start_idx = agg_out
+                aggregated_tokens_list, token_idx = agg_out
             elif len(agg_out) == 3:
-                aggregated_tokens_list, patch_start_idx, past_key_values_agg = agg_out
+                aggregated_tokens_list, token_idx, past_key_values_agg = agg_out
             else:
                 raise ValueError(f"Unexpected aggregator output length: {len(agg_out)}")
         else:
-            raise ValueError("Aggregator output must be a tuple")
+            raise ValueError(f"Aggregator output must be a tuple, got: {type(agg_out)}")
 
         pred_frame_idx_val = pred_frame_idx
         if torch.is_tensor(pred_frame_idx_val):
@@ -147,8 +147,8 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
 
         img_tokens = img_tokens.reshape(img_tokens.shape[0], -1, token_dim)
         act_tokens = act_tokens.reshape(act_tokens.shape[0], -1, token_dim)
-        rdt_img_c = self.rdt_image_proj(img_tokens)
-        rdt_act_c = self.rdt_action_proj(act_tokens)
+        rdt_img_c = self.output_image_proj(img_tokens)
+        rdt_act_c = self.output_action_proj(act_tokens)
 
         predictions = {}
         with torch.cuda.amp.autocast(enabled=False):
@@ -278,8 +278,8 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
     
 
 if __name__ == '__main__':
-    checkpoint_path = '../ckpt/checkpoints.pth'
+    checkpoint_path = '../ckpt/actionvggt.pth'
     model = ActionVGGT()
     model.load_state_dict(torch.load(checkpoint_path), strict=False)
     # Save the model
-    torch.save(model.state_dict(), '../ckpt/actionvggt.pth')
+    torch.save(model.state_dict(), '../ckpt/action.pth')
