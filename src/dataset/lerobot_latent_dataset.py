@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
 
+from utils import logger
 def recursive_find_file(directory, filename='info.json'):
     result = []
     try:
@@ -47,6 +48,12 @@ def construct_lerobot_multi_processor(config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
+    if config.single_task:
+        repo_list = [
+            v for v in repo_list
+            if Path(v).name.startswith(f"{config.single_task}-")
+        ]
+        logger.info(f"Found {len(repo_list)} repositories with info.json in {config.dataset_path} for task {config.single_task}.")
     # repo_list = repo_list[:2]
     mp_start_method = getattr(config, 'dataset_mp_start_method', 'spawn')
     pool_context = get_context(mp_start_method)
@@ -317,6 +324,27 @@ class LatentLeRobotDataset(LeRobotDataset):
         )
         print(f"lactent shape: {cat_latent.shape}")
         return out_dict
+
+    def _merge_multi_view_images(self, image_lst):
+        mode = getattr(self.config, 'multi_view_image_mode', 'vertical')
+        if mode == 'vertical':
+            return torch.cat(image_lst, dim=2)
+        if mode == 'frame':
+            return rearrange(torch.stack(image_lst, dim=1), 'f v c h w -> (f v) c h w')
+        if mode == 'first':
+            return image_lst[0]
+        raise ValueError(
+            f"Unsupported multi_view_image_mode `{mode}`. Expected one of ['vertical', 'frame', 'first']."
+        )
+
+    def _align_actions_with_multi_view_mode(self, actions, actions_mask):
+        if getattr(self.config, 'multi_view_image_mode', 'vertical') != 'frame':
+            return actions, actions_mask
+
+        num_views = len(self.used_video_keys)
+        actions = actions.repeat_interleave(num_views, dim=1)
+        actions_mask = actions_mask.repeat_interleave(num_views, dim=1)
+        return actions, actions_mask
     
     def _cat_video_images(self,
                           data_dict):
@@ -361,7 +389,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             image = F.pad(image, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
             image_lst.append(image)
 
-        cat_image = torch.cat(image_lst, dim=2) # [f, c, 3*h, w]
+        cat_image = self._merge_multi_view_images(image_lst)
         text_emb = data_dict[f"{self.used_video_keys[0]}.text_emb"]
         if torch.rand(1).item() < self.cfg_prob:
             text_emb = self.empty_emb
@@ -432,7 +460,16 @@ class LatentLeRobotDataset(LeRobotDataset):
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_images(ori_data_dict)
 
-        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, image_frame_ids, ori_data_dict['action'])
+        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(
+            local_start_frame,
+            local_end_frame,
+            image_frame_ids,
+            ori_data_dict['action'],
+        )
+        out_dict['actions'], out_dict['actions_mask'] = self._align_actions_with_multi_view_mode(
+            out_dict['actions'],
+            out_dict['actions_mask'],
+        )
         out_dict['images'] = out_dict['images'].permute(1, 0, 2, 3) # [C, F, H, W]
 
         window_size = getattr(self.config, 'window_size', 1)

@@ -54,6 +54,27 @@ from dataset import MultiLatentLeRobotDataset
 import gc
 
 
+def get_effective_num_image_views(config):
+    mode = getattr(config, "multi_view_image_mode", "vertical")
+    if mode == "vertical":
+        return len(config.obs_cam_keys)
+    if mode in {"frame", "first"}:
+        return 1
+    raise ValueError(f"Unsupported multi_view_image_mode `{mode}`")
+
+
+def _to_plain_config(value):
+    if isinstance(value, dict):
+        return {str(k): _to_plain_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain_config(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, torch.dtype):
+        return str(value)
+    return value
+
+
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
@@ -85,19 +106,52 @@ class Trainer:
         self.transformer = ActionVGGT(
             img_height=config.image_height,
             img_width=config.image_width,
+            num_image_views=get_effective_num_image_views(self.config),
+            rdt_img_cond_mode=getattr(config, "rdt_img_cond_mode", "full"),
+            rdt_img_pool_size=getattr(config, "rdt_img_pool_size", 1),
+            rdt_img_keep_summary_tokens=getattr(config, "rdt_img_keep_summary_tokens", False),
         )
+        self.transformer.config = _to_plain_config({
+            "img_height": config.image_height,
+            "img_width": config.image_width,
+            "patch_size": self.transformer.patch_size,
+            "embed_dim": self.transformer.embed_dim,
+            "action_dim": self.transformer.action_dim,
+            "window_size": self.transformer.window_size,
+            "chunk_size": self.transformer.chunk_size,
+            "num_image_views": self.transformer.num_image_views,
+            "rdt_img_cond_mode": self.transformer.rdt_img_cond_mode,
+            "rdt_img_pool_size": self.transformer.rdt_img_pool_size,
+            "rdt_img_keep_summary_tokens": self.transformer.rdt_img_keep_summary_tokens,
+        })
         logger.info(f"All model parameters: {sum(p.numel() for p in self.transformer.parameters())}")
 
         self.transformer.to(self.device)
 
         rdt_config = config.rdt
+        effective_num_image_views = get_effective_num_image_views(self.config)
         patch_h = self.transformer.img_height // self.transformer.patch_size
         patch_w = self.transformer.img_width // self.transformer.patch_size
-        img_tokens_per_frame = patch_h * patch_w * len(self.config.obs_cam_keys)
+        pooled_patch_h = max(1, math.ceil(patch_h / self.transformer.rdt_img_pool_size))
+        pooled_patch_w = max(1, math.ceil(patch_w / self.transformer.rdt_img_pool_size))
+        if self.transformer.rdt_img_cond_mode == "pool":
+            pooled_tokens_per_view = pooled_patch_h * pooled_patch_w
+            img_tokens_per_frame = pooled_tokens_per_view * effective_num_image_views
+            if self.transformer.rdt_img_keep_summary_tokens:
+                img_tokens_per_frame += effective_num_image_views
+                rdt_img_pos_emb_config = [("image", self.config.window_size * img_tokens_per_frame)]
+            else:
+                rdt_img_pos_emb_config = [
+                    ("image", (self.config.window_size * effective_num_image_views, pooled_patch_h, pooled_patch_w))
+                ]
+        else:
+            img_tokens_per_frame = patch_h * patch_w * effective_num_image_views
+            rdt_img_pos_emb_config = [
+                ("image", (self.config.window_size * effective_num_image_views, patch_h, patch_w))
+            ]
         act_tokens_per_frame = self.config.image_frame_stride
         rdt_horizon = self.config.chunk_size
         rdt_x_pos_emb_config = [("act", rdt_horizon + self.config.rdt.num_register_tokens)]
-        rdt_img_pos_emb_config = [("image", (self.config.window_size * len(self.config.obs_cam_keys), patch_h, patch_w))]
         rdt_act_pos_emb_config = [("action", (self.config.window_size, act_tokens_per_frame))]
 
         self.action_head = RDT(
@@ -113,10 +167,21 @@ class Trainer:
             max_act_len=self.config.window_size * act_tokens_per_frame,
             dtype=self.dtype,
         )
+        self.action_head.config = _to_plain_config({
+            "horizon": rdt_horizon,
+            "output_size": self.transformer.action_dim,
+            "config": rdt_config,
+            "x_pos_emb_config": rdt_x_pos_emb_config,
+            "lang_pos_emb_config": None,
+            "max_lang_len": 0,
+            "img_pos_emb_config": rdt_img_pos_emb_config,
+            "max_img_len": self.config.window_size * img_tokens_per_frame,
+            "act_pos_emb_config": rdt_act_pos_emb_config,
+            "max_act_len": self.config.window_size * act_tokens_per_frame,
+            "dtype": self.dtype,
+        })
         self.action_head.to(self.device)
 
-        if config.gradient_checkpointing:
-            self.transformer.gradient_checkpointing_enable()
         if config.long_context:
             self.transformer.fixed_input_length = False
 
@@ -210,6 +275,11 @@ class Trainer:
         elif action_head_pretrained:
             logger.info(f"Loading RDT action head pretrained from: {action_head_pretrained}")
             logger.info(self.action_head.load_state_dict(_load_checkpoint_state(action_head_pretrained), strict=False))
+
+        if config.gradient_checkpointing:
+            logger.info("Enabling activation checkpointing on transformer and action head...")
+            apply_ac(self.transformer)
+            apply_ac(self.action_head)
 
         logger.info("Setting up FSDP...")
         shard_fn = shard_model
@@ -458,7 +528,8 @@ class Trainer:
             actions=actions,
             grid_id=action_grid_id,
             text_emb=batch_dict.get('text_emb', None),
-            action_mask = action_mask,
+            action_mask=action_mask,
+            actions_mask=action_mask,
         )
 
         # Build noised action chunks

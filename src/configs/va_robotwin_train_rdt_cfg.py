@@ -14,17 +14,21 @@ va_robotwin_train_rdt_cfg.update(va_robotwin_train_cfg)
 # -----------------------------------------------------------------------------
 # ActionVGGT encoder checkpoints
 va_robotwin_train_rdt_cfg.transformer_resume_from = None
-va_robotwin_train_rdt_cfg.transformer_pretrained = '../ckpt/actionvggt.pth'
+va_robotwin_train_rdt_cfg.transformer_pretrained = '/mnt/nas/share/home/yds/actionvggt.pth'
 
 # RDT action head checkpoints
 va_robotwin_train_rdt_cfg.action_head_resume_from = None
-va_robotwin_train_rdt_cfg.action_head_pretrained = '../ckpt/RDT.pth'
+va_robotwin_train_rdt_cfg.action_head_pretrained = '/mnt/nas/share/home/yds/RDT.pth'
 
 va_robotwin_train_rdt_cfg.image_height = 224
 va_robotwin_train_rdt_cfg.image_width = 224
 va_robotwin_train_rdt_cfg.window_size = 4
 va_robotwin_train_rdt_cfg.chunk_size = 24
 va_robotwin_train_rdt_cfg.image_frame_stride = 8
+# va_robotwin_train_rdt_cfg.multi_view_image_mode = 'vertical'    #['vertical', 'frame', 'first']
+# va_robotwin_train_rdt_cfg.rdt_img_cond_mode = 'pool'
+# va_robotwin_train_rdt_cfg.rdt_img_pool_size = 4
+# va_robotwin_train_rdt_cfg.rdt_img_keep_summary_tokens = False
 
 va_robotwin_train_rdt_cfg.gradient_checkpointing = False
 va_robotwin_train_rdt_cfg.long_context = False
