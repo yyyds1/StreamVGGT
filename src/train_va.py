@@ -5,6 +5,8 @@ import os
 import sys
 import re
 from pathlib import Path
+
+from datetime import datetime
 import wandb
 
 import hydra
@@ -250,14 +252,45 @@ class Trainer:
             return adapted
 
         # ActionVGGT loading: prefer resume_from, fallback to pretrained.
+        transformer_resume = getattr(config, 'transformer_resume', False)
         transformer_resume_from = getattr(config, 'transformer_resume_from', None)
         transformer_pretrained = getattr(config, 'transformer_pretrained', None)
-        if transformer_resume_from:
-            if config.rank == 0:
-                logger.info(f"Resuming ActionVGGT from: {transformer_resume_from}")
-            transformer_state = _load_checkpoint_state(transformer_resume_from)
-            transformer_state = _adapt_transformer_state_for_resolution(self.transformer, transformer_state)
-            logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
+        if transformer_resume:
+            if transformer_resume_from:
+                if config.rank == 0:
+                    logger.info(f"Resuming ActionVGGT from: {transformer_resume_from}")
+                transformer_state = _load_checkpoint_state(transformer_resume_from)
+                transformer_state = _adapt_transformer_state_for_resolution(self.transformer, transformer_state)
+                logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
+            else: # resume from the latest checkpoint
+                ckpt_dir = Path(config.save_root)
+                ckpt_pattern = re.compile(r"checkpoint_step_(\d+)$")
+                latest_ckpt = None
+                latest_step = -1
+
+                if ckpt_dir.exists():
+                    for p in ckpt_dir.rglob("checkpoint_step_*"):
+                        if not p.is_dir():
+                            continue
+                        m = ckpt_pattern.match(p.name)
+                        if not m:
+                            continue
+                        step = int(m.group(1))
+                        if step > latest_step:
+                            latest_step = step
+                            latest_ckpt = p
+
+                if latest_ckpt is None:
+                    raise FileNotFoundError(f"No checkpoint_step_* found under: {ckpt_dir}")
+
+                transformer_path = latest_ckpt / "transformer" / "diffusion_pytorch_model.safetensors"
+                if not transformer_path.exists():
+                    raise FileNotFoundError(f"Transformer checkpoint not found: {transformer_path}")
+
+                logger.info(f"Resuming ActionVGGT from latest checkpoint: {transformer_path}")
+                transformer_state = _load_checkpoint_state(transformer_path)
+                transformer_state = _adapt_transformer_state_for_resolution(self.transformer, transformer_state)
+                logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
         elif transformer_pretrained:
             logger.info(f"Loading ActionVGGT pretrained from: {transformer_pretrained}")
             transformer_state = _load_checkpoint_state(transformer_pretrained)
@@ -265,13 +298,43 @@ class Trainer:
             logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
 
         # RDT action head loading: prefer resume_from, fallback to pretrained.
+        action_head_resume = getattr(config, 'action_head_resume', False)
         action_head_resume_from = getattr(config, 'action_head_resume_from', None)
         action_head_pretrained = getattr(config, 'action_head_pretrained', None)
-        if action_head_resume_from:
-            if config.rank == 0:
-                logger.info(f"Resuming RDT action head from: {action_head_resume_from}")
-            action_head_state = _load_checkpoint_state(action_head_resume_from)
-            logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
+        if action_head_resume:
+            if action_head_resume_from:
+                if config.rank == 0:
+                    logger.info(f"Resuming RDT action head from: {action_head_resume_from}")
+                action_head_state = _load_checkpoint_state(action_head_resume_from)
+                logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
+            else: # resume from the latest checkpoint
+                ckpt_dir = Path(config.save_root)
+                ckpt_pattern = re.compile(r"checkpoint_step_(\d+)$")
+                latest_ckpt = None
+                latest_step = -1
+
+                if ckpt_dir.exists():
+                    for p in ckpt_dir.rglob("checkpoint_step_*"):
+                        if not p.is_dir():
+                            continue
+                        m = ckpt_pattern.match(p.name)
+                        if not m:
+                            continue
+                        step = int(m.group(1))
+                        if step > latest_step:
+                            latest_step = step
+                            latest_ckpt = p
+
+                if latest_ckpt is None:
+                    raise FileNotFoundError(f"No checkpoint_step_* found under: {ckpt_dir}")
+
+                action_head_path = latest_ckpt / "action_head" / "diffusion_pytorch_model.safetensors"
+                if not action_head_path.exists():
+                    raise FileNotFoundError(f"RDT action head checkpoint not found: {action_head_path}")
+
+                logger.info(f"Resuming RDT action head from latest checkpoint: {action_head_path}")
+                action_head_state = _load_checkpoint_state(action_head_path)
+                logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
         elif action_head_pretrained:
             logger.info(f"Loading RDT action head pretrained from: {action_head_pretrained}")
             logger.info(self.action_head.load_state_dict(_load_checkpoint_state(action_head_pretrained), strict=False))
@@ -376,7 +439,7 @@ class Trainer:
         self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_action.set_timesteps(1000, training=True)
 
-        self.save_dir = Path(config.save_root) / "ckpt"
+        self.save_dir = Path(config.save_root) / datetime.now().strftime("train_log_%Y%m%d_%H%M%S") / "ckpt" # Add timestamp YYMMDD_HHMMSS to save directory
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
@@ -390,7 +453,7 @@ class Trainer:
         timestep_ids = sample_timestep_id(batch_size=B, num_train_timesteps=train_scheduler.num_train_timesteps)
         noise = torch.zeros_like(latent).normal_()
         timesteps = train_scheduler.timesteps[timestep_ids].to(device=self.device)
-        noisy_latents =train_scheduler.add_noise(latent, noise, timesteps, t_dim=1)
+        noisy_latents = train_scheduler.add_noise(latent, noise, timesteps, t_dim=0)
         targets =train_scheduler.training_target(latent, noise, timesteps)
 
         patch_f, patch_h, patch_w = self.patch_size
@@ -417,7 +480,7 @@ class Trainer:
                 )
             noise = torch.zeros_like(latent).normal_()
             cond_timesteps = train_scheduler.timesteps[cond_timestep_ids].to(device=self.device)
-            latent = train_scheduler.add_noise(latent, noise, cond_timesteps, t_dim=1)
+            latent = train_scheduler.add_noise(latent, noise, cond_timesteps, t_dim=0)
         else:
             cond_timesteps = torch.zeros_like(timesteps)
 
@@ -437,59 +500,29 @@ class Trainer:
 
     @torch.no_grad()
     def _prepare_input_dict(self, batch_dict):
-        """Prepare input dict following WAN-style structure but with raw images."""
-        window_size = getattr(self.config, 'window_size', None)
+        """Prepare model input dict from fixed-size dataset outputs."""
         chunk_size = getattr(self.config, 'chunk_size', None)
 
-        # Build image dict
         if 'images' not in batch_dict:
             raise ValueError("batch_dict must include raw 'images' for ActionVGGT training")
+        if 'actions' not in batch_dict:
+            raise ValueError("batch_dict must include 'actions' for ActionVGGT training")
+        if 'action_chunk' not in batch_dict:
+            raise ValueError("batch_dict must include 'action_chunk' for ActionVGGT training")
+        if 'pred_frame_idx' not in batch_dict:
+            raise ValueError("batch_dict must include 'pred_frame_idx' for ActionVGGT training")
 
-        images_full = batch_dict['images']  # [B, C_image, F, H, W]
-        # cut image height and width to be divisible by patch size
-        # patch_f, patch_h, patch_w = self.patch_size
-        # H = (H // patch_h) * patch_h
-        # W = (W // patch_w) * patch_w
-        # images = images[:, :, :, :H, :W]
-        B, _, F_total, H, W = images_full.shape
-        # Build action dict
-        actions_full = batch_dict["actions"] # [B, C_action, F, N, 1]
-        B, _, F_total_action, N, _ = actions_full.shape
+        images = batch_dict['images']  # [B, C_image, F, H, W]
+        actions = batch_dict['actions']  # [B, C_action, F, N, 1]
+        image_mask = batch_dict.get('images_mask', torch.ones_like(images, dtype=torch.bool))
+        action_mask = batch_dict.get('actions_mask', torch.ones_like(actions, dtype=torch.bool))
 
-        if F_total != F_total_action:
-            raise ValueError(f"images/actions frame count mismatch: {F_total} vs {F_total_action}")
-
-                # Use action frame nums as chunk_size, instead of image frames
-        min_t = max(window_size - 1, 0)
-        max_t = max(batch_dict['num_frames'] - (chunk_size + 1) // N, min_t)
-        if max_t < min_t:
-            data_timestep = min_t if F_total > 0 else 0
-        else:
-            data_timestep = torch.randint(min_t, max_t + 1, (B,)).to(self.device)
-
-        if not torch.is_tensor(data_timestep):
-            data_timestep = torch.full((B,), int(data_timestep), device=self.device, dtype=torch.long)
-        data_timestep = data_timestep.long()
-
-        window_end_global = data_timestep + 1
-        window_start_global = torch.clamp(window_end_global - window_size, min=0)
-
-        if (window_start_global != window_start_global[0]).any() or (window_end_global != window_end_global[0]).any():
-            raise ValueError("Variable window boundaries across batch are not supported")
-
-        window_start_idx = int(window_start_global[0].item())
-        window_end_idx = int(window_end_global[0].item())
-
-        images = images_full[:, :, window_start_idx:window_end_idx]
-        actions = actions_full[:, :, window_start_idx:window_end_idx]
-        F = images.shape[2]
-        local_data_timestep = data_timestep - window_start_global
-
-        window_end = local_data_timestep + 1
-        image_mask = torch.zeros_like(images, dtype=torch.bool)
-        action_mask = torch.zeros_like(actions, dtype=torch.bool)
-        image_mask[:, :, :window_end] = True
-        action_mask[:, :, :window_end - 1] = True
+        B, _, F, H, W = images.shape
+        B_action, _, F_action, N, _ = actions.shape
+        if B != B_action or F != F_action:
+            raise ValueError(
+                f"images/actions shape mismatch: images={tuple(images.shape)}, actions={tuple(actions.shape)}"
+            )
 
 
         # Build grid_id for image tokens using 3D mesh (F, H//p, W//p)
@@ -532,18 +565,12 @@ class Trainer:
             actions_mask=action_mask,
         )
 
-        # Build noised action chunks
-        action_chunk_start_idx = data_timestep * N
-        action_flat = rearrange(actions_full, 'b c f n 1 -> b c (f n)')
-        max_action_tokens = action_flat.shape[-1]
-        action_chunk_end_idx = torch.clamp(action_chunk_start_idx + chunk_size, max=max_action_tokens)
-
-        if (action_chunk_start_idx != action_chunk_start_idx[0]).any() or (action_chunk_end_idx != action_chunk_end_idx[0]).any():
-            raise ValueError("Variable action chunk boundaries across batch are not supported")
-
-        action_chunk_start = int(action_chunk_start_idx[0].item())
-        action_chunk_end = int(action_chunk_end_idx[0].item())
-        action_chunk = action_flat[:, :, action_chunk_start:action_chunk_end]  # [B, C_action, chunk_size]
+        # Build noised action chunks from dataset-provided chunk targets.
+        action_chunk = batch_dict['action_chunk']  # [B, C_action, chunk_size]
+        if action_chunk.shape[-1] != chunk_size:
+            raise ValueError(
+                f"action_chunk length mismatch: got {action_chunk.shape[-1]}, expected {chunk_size}"
+            )
         action_chunk = rearrange(action_chunk, 'b c f -> b c f 1 1')  # [B, C_action, chunk_size, 1, 1]
         action_chunk_dict = self._add_noise(
             action_chunk,
@@ -551,7 +578,7 @@ class Trainer:
             action_mask=None,
             action_mode=True,
         )
-        action_chunk_dict["pred_frame_idx"] = local_data_timestep
+        action_chunk_dict["pred_frame_idx"] = batch_dict['pred_frame_idx'].long()
         action_chunk_dict['targets'] = rearrange(action_chunk_dict['targets'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
         action_chunk_dict['noisy_latents'] = rearrange(action_chunk_dict['noisy_latents'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
         action_chunk_dict['latent'] = rearrange(action_chunk_dict['latent'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
@@ -561,7 +588,7 @@ class Trainer:
             'action_dict': action_dict,
             'pred_action_chunk_dict': action_chunk_dict,
             'chunk_size': chunk_size,
-            'window_size': window_size,
+            'window_size': F,
         }
         return input_dict
 

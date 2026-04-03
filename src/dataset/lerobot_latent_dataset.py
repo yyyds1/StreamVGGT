@@ -246,6 +246,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         episode_chunk = self.meta.get_episode_chunk(episode_index)
         image_path = Path(self.image_path) / f"chunk-{episode_chunk:03d}"
         latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
+        frame_stride = max(1, int(getattr(self.config, 'image_frame_stride', 1)))
         out = {}
         for key in self.used_video_keys:
             cur_path = image_path / key
@@ -253,29 +254,33 @@ class LatentLeRobotDataset(LeRobotDataset):
                 cur_path / f"episode_{episode_index:06d}.mp4"
             )
             assert os.path.exists(image_file)
-            # Load image_data from mp4 file as a tensor of shape [F, H, W, C].
+            # Decode only the needed frame slice to avoid holding full videos in worker memory.
             try:
                 import av
+                frames = []
                 with av.open(str(image_file)) as container:
-                    frames = [
-                        frame.to_ndarray(format='rgb24')
-                        for frame in container.decode(video=0)
-                    ]
+                    for frame_idx, frame in enumerate(container.decode(video=0)):
+                        if frame_idx < start_frame:
+                            continue
+                        if frame_idx >= end_frame:
+                            break
+                        if (frame_idx - start_frame) % frame_stride != 0:
+                            continue
+                        frames.append(frame.to_ndarray(format='rgb24'))
             except Exception as e:
                 raise RuntimeError(
                     f"Failed to decode video {image_file}. "
                     "OpenCV and PyAV both failed."
                 ) from e
 
-            image_data = torch.from_numpy(np.stack(frames)).float() / 255.0
-            image_data = image_data[start_frame:end_frame]
-            num_frames, height, width, channels = image_data.shape
-
-            if num_frames == 0:
+            if len(frames) == 0:
                 raise RuntimeError(
                     f"Empty frame slice [{start_frame}:{end_frame}] for {image_file}. "
                     "Check action segment boundaries versus available frames."
                 )
+
+            image_data = torch.from_numpy(np.stack(frames)).float() / 255.0
+            num_frames, height, width, channels = image_data.shape
             
             cur_path = latent_path / key
             latent_file = (
@@ -289,6 +294,7 @@ class LatentLeRobotDataset(LeRobotDataset):
                 "video_num_frames": num_frames,
                 "video_height": height,
                 "video_width": width,
+                "video_already_downsampled": True,
                 "frame_ids": torch.arange(start_frame, end_frame, dtype=torch.long),
                 "text_emb": latent_data.get("text_emb", None)
             }
@@ -354,13 +360,15 @@ class LatentLeRobotDataset(LeRobotDataset):
             image_num_frames = data_dict[f"{key}.video_num_frames"]
             image_height = data_dict[f"{key}.video_height"]
             image_width = data_dict[f"{key}.video_width"]
+            already_downsampled = bool(data_dict.get(f"{key}.video_already_downsampled", False))
             image = rearrange(image, 
                                  '(f h w) c -> f c h w ', 
                                  f= image_num_frames, 
                                  h= image_height, 
                                  w= image_width)
-            # downsample image frames to frames/4
-            image = image[::self.config.image_frame_stride]
+            # Downsample only when decode path did not already subsample frames.
+            if not already_downsampled:
+                image = image[::self.config.image_frame_stride]
             # resize and padding image to self.image_height and self.image_width, Does not distort the image content
             import torch.nn.functional as F
 
@@ -429,6 +437,70 @@ class LatentLeRobotDataset(LeRobotDataset):
         action_aligned *= action_mask_aligned
         return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
 
+    def _sample_window_and_chunk(self, images, actions):
+        """Sample prediction timestep and return fixed-size window/chunk for stable batching."""
+        window_size = int(getattr(self.config, 'window_size', 1))
+        chunk_size = int(getattr(self.config, 'chunk_size', 1))
+
+        c_img, f_total, h, w = images.shape
+        c_act, f_total_action, n, one = actions.shape
+        if f_total != f_total_action:
+            raise ValueError(f"images/actions frame count mismatch: {f_total} vs {f_total_action}")
+        if f_total <= 0:
+            raise ValueError("No valid frames available after preprocessing")
+
+        required_frames_for_chunk = max(1, (chunk_size + n - 1) // n)
+        min_t = max(window_size - 1, 0)
+        max_t = f_total - required_frames_for_chunk
+
+        if max_t >= min_t:
+            data_timestep = int(np.random.randint(min_t, max_t + 1))
+        else:
+            data_timestep = max(0, f_total - 1)
+
+        window_end = data_timestep + 1
+        window_start = max(0, window_end - window_size)
+
+        images_window = images[:, window_start:window_end]
+        actions_window = actions[:, window_start:window_end]
+
+        local_data_timestep = data_timestep - window_start
+        images_mask = torch.ones_like(images_window, dtype=torch.bool)
+        actions_mask = torch.zeros_like(actions_window, dtype=torch.bool)
+        if local_data_timestep > 0:
+            actions_mask[:, :local_data_timestep] = True
+
+        pad_frames = window_size - images_window.shape[1]
+        if pad_frames > 0:
+            image_pad = torch.zeros((c_img, pad_frames, h, w), dtype=images_window.dtype)
+            action_pad = torch.zeros((c_act, pad_frames, n, one), dtype=actions_window.dtype)
+            image_mask_pad = torch.zeros_like(image_pad, dtype=torch.bool)
+            action_mask_pad = torch.zeros_like(action_pad, dtype=torch.bool)
+
+            images_window = torch.cat([image_pad, images_window], dim=1)
+            actions_window = torch.cat([action_pad, actions_window], dim=1)
+            images_mask = torch.cat([image_mask_pad, images_mask], dim=1)
+            actions_mask = torch.cat([action_mask_pad, actions_mask], dim=1)
+            local_data_timestep += pad_frames
+
+        action_flat = rearrange(actions, 'c f n 1 -> c (f n)')
+        chunk_start = data_timestep * n
+        chunk_end = min(chunk_start + chunk_size, action_flat.shape[-1])
+        action_chunk = action_flat[:, chunk_start:chunk_end]
+        if action_chunk.shape[-1] < chunk_size:
+            chunk_pad = torch.zeros((c_act, chunk_size - action_chunk.shape[-1]), dtype=action_chunk.dtype)
+            action_chunk = torch.cat([action_chunk, chunk_pad], dim=1)
+
+        return {
+            'images': images_window,
+            'actions': actions_window,
+            'images_mask': images_mask,
+            'actions_mask': actions_mask,
+            'action_chunk': action_chunk,
+            'pred_frame_idx': torch.tensor(local_data_timestep, dtype=torch.long),
+            'num_frames': torch.tensor(window_size, dtype=torch.long),
+        }
+
     def __getitem__(self, idx) -> dict:
         """
         Arguments:
@@ -472,37 +544,13 @@ class LatentLeRobotDataset(LeRobotDataset):
         )
         out_dict['images'] = out_dict['images'].permute(1, 0, 2, 3) # [C, F, H, W]
 
-        window_size = getattr(self.config, 'window_size', 1)
-        chunk_size = getattr(self.config, 'chunk_size', 1)
-        num_frames_image = out_dict['images'].shape[1]
-        num_frames_act = out_dict['actions'].shape[1]
-        assert num_frames_image == num_frames_act, f"Number of frames in images and actions must be the same, but got {num_frames_image} and {num_frames_act}"
-        out_dict['num_frames'] = num_frames_image
-        # Use action frame nums as chunk_size, instead of image frames
-        # min_t = max(window_size - 1, 0)
-        # max_t = max(num_frames - (chunk_size + 1) // out_dict['actions'].shape[2], min_t)
-        # if max_t < min_t:
-        #     data_timestep = min_t if num_frames > 0 else 0
-        # else:
-        #     data_timestep = np.random.randint(min_t, max_t + 1)
-        # out_dict['data_timestep'] = int(data_timestep)
+        sampled_dict = self._sample_window_and_chunk(
+            images=out_dict['images'],
+            actions=out_dict['actions'],
+        )
+        sampled_dict['text_emb'] = out_dict['text_emb']
 
-        # window_start = 0
-        # window_end = int(data_timestep) + 1
-        # image_mask = torch.zeros(num_frames, dtype=torch.bool)
-        # action_mask = torch.zeros(num_frames, dtype=torch.bool)
-        # image_mask[window_start:window_end] = True
-        # action_mask[window_start:window_end - 1] = True
-        # expand image_mask and action mask to have the same shape as the data
-        # image_mask = image_mask.unsqueeze(0).unsqueeze(2).unsqueeze(3)
-        # image_mask = image_mask.expand(out_dict['images'].shape[0], -1, out_dict['images'].shape[2], out_dict['images'].shape[3])
-        # action_mask = action_mask.unsqueeze(0).unsqueeze(2).unsqueeze(3)
-        # action_mask = action_mask.expand(out_dict['actions'].shape[0], -1, out_dict['actions'].shape[2], out_dict['actions'].shape[3])
-
-        # out_dict['images_mask'] = image_mask
-        # out_dict['actions_mask'] = action_mask
-
-        return out_dict
+        return sampled_dict
 
     def __len__(self):
         return len(self.new_metas)

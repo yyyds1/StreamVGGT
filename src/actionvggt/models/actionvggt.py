@@ -198,14 +198,49 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         else:
             raise ValueError(f"Aggregator output must be a tuple, got: {type(agg_out)}")
 
-        pred_frame_idx_val = pred_frame_idx
-        if torch.is_tensor(pred_frame_idx_val):
-            pred_frame_idx_val = int(pred_frame_idx_val.item())
-
         tokens = aggregated_tokens_list[-1]  # [B, S, P, 3C]
-        window_tokens_start = max(0, pred_frame_idx_val - self.window_size + 1)
-        window_tokens_end = pred_frame_idx_val + 1
-        window_tokens = tokens[:, window_tokens_start:window_tokens_end]
+        bsz, seq_len = tokens.shape[:2]
+        if pred_frame_idx is None:
+            pred_frame_idx_tensor = torch.full(
+                (bsz,),
+                seq_len - 1,
+                dtype=torch.long,
+                device=tokens.device,
+            )
+        elif torch.is_tensor(pred_frame_idx):
+            pred_frame_idx_tensor = pred_frame_idx.to(device=tokens.device, dtype=torch.long).reshape(-1)
+            if pred_frame_idx_tensor.numel() == 1:
+                pred_frame_idx_tensor = pred_frame_idx_tensor.repeat(bsz)
+            elif pred_frame_idx_tensor.numel() != bsz:
+                raise ValueError(
+                    f"pred_frame_idx has {pred_frame_idx_tensor.numel()} elements, expected {bsz}"
+                )
+        else:
+            pred_frame_idx_tensor = torch.full(
+                (bsz,),
+                int(pred_frame_idx),
+                dtype=torch.long,
+                device=tokens.device,
+            )
+
+        pred_frame_idx_tensor = pred_frame_idx_tensor.clamp(min=0, max=seq_len - 1)
+
+        window_tokens_list = []
+        for b in range(bsz):
+            pred_idx = int(pred_frame_idx_tensor[b].item())
+            start = max(0, pred_idx - self.window_size + 1)
+            end = pred_idx + 1
+            cur_tokens = tokens[b:b + 1, start:end]
+            if cur_tokens.shape[1] < self.window_size:
+                pad = torch.zeros(
+                    (1, self.window_size - cur_tokens.shape[1], cur_tokens.shape[2], cur_tokens.shape[3]),
+                    dtype=cur_tokens.dtype,
+                    device=cur_tokens.device,
+                )
+                cur_tokens = torch.cat([pad, cur_tokens], dim=1)
+            window_tokens_list.append(cur_tokens)
+
+        window_tokens = torch.cat(window_tokens_list, dim=0)
         token_dim = window_tokens.shape[-1]
         img_tokens = window_tokens[:, :, token_idx["image"][0]:token_idx["image"][1]]
         act_tokens = window_tokens[:, :, token_idx["action"][0]:token_idx["action"][1]]

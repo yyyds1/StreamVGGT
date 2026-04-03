@@ -18,3 +18,8 @@ __pycache__/
 
 *.md
 *.log
+
+src/train_out**/**
+src/train_out/**
+
+src/logs/**

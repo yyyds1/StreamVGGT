@@ -13,10 +13,12 @@ va_robotwin_train_rdt_cfg.update(va_robotwin_train_cfg)
 # 1) *_resume_from, 2) *_pretrained, 3) random init
 # -----------------------------------------------------------------------------
 # ActionVGGT encoder checkpoints
+va_robotwin_train_rdt_cfg.transformer_resume = True
 va_robotwin_train_rdt_cfg.transformer_resume_from = None
 va_robotwin_train_rdt_cfg.transformer_pretrained = '/mnt/nas/share/home/yds/actionvggt.pth'
 
 # RDT action head checkpoints
+va_robotwin_train_rdt_cfg.action_head_resume = True
 va_robotwin_train_rdt_cfg.action_head_resume_from = None
 va_robotwin_train_rdt_cfg.action_head_pretrained = '/mnt/nas/share/home/yds/RDT.pth'
 
