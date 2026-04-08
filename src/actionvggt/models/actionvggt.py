@@ -307,74 +307,98 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
             out = ActionVGGTOutput(ress=ress, views=views)
             return out
         
-    def inference(self, frames, query_points: torch.Tensor = None, past_key_values=None):        
-        past_key_values = [None] * self.aggregator.depth
-        past_key_values_camera = [None] * self.camera_head.trunk_depth
-        
-        all_ress = []
-        processed_frames = []
+    def inference(self, frames, past_key_values=None):
+        if len(frames) == 0:
+            raise ValueError("frames must contain at least one frame")
 
-        for i, frame in enumerate(frames):
-            images = frame["img"].unsqueeze(0) 
-            aggregator_output = self.aggregator(
-                images, 
+        first_img = frames[0]["img"]
+        if first_img.dim() == 3:
+            images = torch.stack([frame["img"] for frame in frames], dim=0).unsqueeze(0)  # [1, S, C, H, W]
+        elif first_img.dim() == 4:
+            images = torch.stack([frame["img"] for frame in frames], dim=1)  # [B, S, C, H, W]
+        else:
+            raise ValueError(f"Expected frame['img'] to have 3 or 4 dims, got shape {tuple(first_img.shape)}")
+
+        bsz, seq_len = images.shape[:2]
+
+        action_items = [frame.get("actions", frame.get("action", None)) for frame in frames]
+        if all(action is not None for action in action_items):
+            normalized_actions = []
+            for action in action_items:
+                if action.dim() == 2:
+                    cur = action.unsqueeze(-1).unsqueeze(-1)
+                elif action.dim() == 3:
+                    cur = action.unsqueeze(-1)
+                elif action.dim() == 4:
+                    cur = action
+                else:
+                    raise ValueError(
+                        "Each action tensor must have shape [B, C_action], [B, C_action, N], "
+                        f"or [B, C_action, N, 1], got {tuple(action.shape)}"
+                    )
+                normalized_actions.append(cur)
+            actions = torch.stack(normalized_actions, dim=2)  # [B, C_action, S, N, 1]
+        else:
+            actions = images.new_zeros((bsz, self.action_dim, seq_len, 1, 1))
+
+        text_emb = frames[0].get("text_emb", None)
+        image_grid_id = frames[0].get("image_grid_id", frames[0].get("grid_id", None))
+        action_grid_id = frames[0].get("action_grid_id", None)
+
+        use_cache = past_key_values is not None
+        if use_cache:
+            agg_out = self.aggregator(
+                images=images,
+                actions=actions,
+                text_emb=text_emb,
+                image_grid_id=image_grid_id,
+                action_grid_id=action_grid_id,
                 past_key_values=past_key_values,
-                use_cache=True, 
-                past_frame_idx=i
+                use_cache=True,
+                past_frame_idx=0,
+                return_all_layers=False,
             )
-            
-            if isinstance(aggregator_output, tuple) and len(aggregator_output) >= 3:
-                aggregated_tokens, patch_start_idx, past_key_values = aggregator_output
-            else:
-                aggregated_tokens, patch_start_idx = aggregator_output
-            
-            with torch.cuda.amp.autocast(enabled=False):
-                if self.camera_head is not None:
-                    pose_enc, past_key_values_camera = self.camera_head(aggregated_tokens, past_key_values_camera=past_key_values_camera, use_cache=True)
-                    pose_enc = pose_enc[-1]
-                    camera_pose = pose_enc[:, 0, :]
+        else:
+            agg_out = self.aggregator(
+                images=images,
+                actions=actions,
+                text_emb=text_emb,
+                image_grid_id=image_grid_id,
+                action_grid_id=action_grid_id,
+                return_all_layers=False,
+            )
 
-                if self.depth_head is not None:
-                    depth, depth_conf = self.depth_head(
-                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx
-                    )
-                    depth = depth[:, 0] 
-                    depth_conf = depth_conf[:, 0]
-                
-                if self.point_head is not None:
-                    pts3d, pts3d_conf = self.point_head(
-                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx
-                    )
-                    pts3d = pts3d[:, 0] 
-                    pts3d_conf = pts3d_conf[:, 0]
+        if not isinstance(agg_out, tuple):
+            raise ValueError(f"Aggregator output must be a tuple, got: {type(agg_out)}")
 
-                if self.track_head is not None and query_points is not None:
-                    track_list, vis, conf = self.track_head(
-                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx, query_points=query_points
-                )
-                    track = track_list[-1][:, 0]  
-                    query_points = track
-                    vis = vis[:, 0]
-                    track_conf = conf[:, 0]
+        if len(agg_out) == 2:
+            aggregated_tokens_list, token_idx = agg_out
+            updated_past_key_values = None
+        elif len(agg_out) == 3:
+            aggregated_tokens_list, token_idx, updated_past_key_values = agg_out
+        else:
+            raise ValueError(f"Unexpected aggregator output length: {len(agg_out)}")
 
-            all_ress.append({
-                'pts3d_in_other_view': pts3d,
-                'conf': pts3d_conf,
-                'depth': depth,
-                'depth_conf': depth_conf,
-                'camera_pose': camera_pose,
-                **({'valid_mask': frame["valid_mask"]}
-                    if 'valid_mask' in frame else {}),  
+        tokens = aggregated_tokens_list[-1]  # [B, S, P, 2C]
+        token_dim = tokens.shape[-1]
 
-                **({'track': track, 
-                    'vis': vis,  
-                    'track_conf': track_conf}
-                if query_points is not None else {})
-            })
-            processed_frames.append(frame)
-        
-        output = ActionVGGTOutput(ress=all_ress, views=processed_frames)
-        return output
+        img_tokens = tokens[:, :, token_idx["image"][0]:token_idx["image"][1]]
+        act_tokens = tokens[:, :, token_idx["action"][0]:token_idx["action"][1]]
+
+        img_tokens = self._build_rdt_img_tokens(img_tokens)
+        act_tokens = act_tokens.reshape(act_tokens.shape[0], -1, token_dim)
+
+        rdt_img_c = self.output_image_proj(img_tokens)
+        rdt_act_c = self.output_action_proj(act_tokens)
+
+        ress = {
+            "rdt_img_c": rdt_img_c,
+            "rdt_act_c": rdt_act_c,
+        }
+        if updated_past_key_values is not None:
+            ress["past_key_values"] = updated_past_key_values
+
+        return ActionVGGTOutput(ress=ress, views=frames)
     
 
 if __name__ == '__main__':

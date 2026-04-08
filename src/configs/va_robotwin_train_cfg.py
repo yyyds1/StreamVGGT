@@ -14,8 +14,7 @@ va_robotwin_train_cfg.enable_wandb = True
 va_robotwin_train_cfg.load_worker = 16
 va_robotwin_train_cfg.dataset_init_worker = 8
 va_robotwin_train_cfg.dataset_mp_start_method = 'spawn'
-va_robotwin_train_cfg.multi_view_image_mode = 'vertical'
-va_robotwin_train_cfg.save_interval = 100
+va_robotwin_train_cfg.save_interval = 1000
 va_robotwin_train_cfg.gc_interval = 50
 va_robotwin_train_cfg.cfg_prob = 0.1
 
@@ -27,5 +26,5 @@ va_robotwin_train_cfg.weight_decay = 0.1
 va_robotwin_train_cfg.warmup_steps = 10
 va_robotwin_train_cfg.batch_size = 3
 va_robotwin_train_cfg.gradient_accumulation_steps = 1
-va_robotwin_train_cfg.num_steps = 100000 
+va_robotwin_train_cfg.num_steps = 100000
 va_robotwin_train_cfg.single_task = None

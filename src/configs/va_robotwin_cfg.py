@@ -25,6 +25,41 @@ va_robotwin_cfg.num_inference_steps = 25
 va_robotwin_cfg.video_exec_step = -1
 va_robotwin_cfg.action_num_inference_steps = 50
 
+# Shared by both training and online evaluation (va_server.py + train_va.py)
+va_robotwin_cfg.multi_view_image_mode = 'vertical'
+va_robotwin_cfg.image_height = 224
+va_robotwin_cfg.image_width = 224
+va_robotwin_cfg.window_size = 4
+va_robotwin_cfg.chunk_size = 24
+va_robotwin_cfg.image_frame_stride = 8
+
+# Separate checkpoint controls
+# Priority per model in train_va.py:
+# 1) *_resume_from, 2) *_pretrained, 3) random init
+va_robotwin_cfg.transformer_resume = True
+va_robotwin_cfg.transformer_resume_from = None
+va_robotwin_cfg.transformer_pretrained = '/mnt/nas/share/home/yds/actionvggt.pth'
+
+va_robotwin_cfg.action_head_resume = True
+va_robotwin_cfg.action_head_resume_from = None
+va_robotwin_cfg.action_head_pretrained = '/mnt/nas/share/home/yds/RDT.pth'
+
+va_robotwin_cfg.gradient_checkpointing = False
+va_robotwin_cfg.long_context = False
+
+# RDT settings (from RDT2/configs/rdt/post_train.yaml)
+va_robotwin_cfg.rdt = EasyDict()
+va_robotwin_cfg.rdt.hidden_size = 1024
+va_robotwin_cfg.rdt.depth = 14
+va_robotwin_cfg.rdt.num_heads = 8
+va_robotwin_cfg.rdt.num_register_tokens = 4
+va_robotwin_cfg.rdt.norm_eps = 1e-5
+va_robotwin_cfg.rdt.multiple_of = 256
+va_robotwin_cfg.rdt.ffn_dim_multiplier = None
+va_robotwin_cfg.rdt.num_kv_heads = 4
+va_robotwin_cfg.rdt.use_flash_attn = True
+va_robotwin_cfg.rdt.action_dim = va_robotwin_cfg.action_dim
+
 va_robotwin_cfg.snr_shift = 5.0
 va_robotwin_cfg.action_snr_shift = 1.0
 
