@@ -262,6 +262,7 @@ class VA_Server:
 
     def _reset_runtime_buffers(self, prompt=None):
         self.prompt = prompt
+        self.runtime_text_emb = None
         self.frame_history = []
         self.action_history = []
         self.rdt_img_cond_history = []
@@ -271,6 +272,35 @@ class VA_Server:
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, "real", self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
+
+    def _trim_transformer_kv_cache(self, past_key_values):
+        if not isinstance(past_key_values, (list, tuple)):
+            return past_key_values
+
+        max_frames = max(int(self.window_size), 1)
+        trimmed = []
+        for block_kv in past_key_values:
+            if (
+                block_kv is None
+                or not isinstance(block_kv, (list, tuple))
+                or len(block_kv) != 2
+            ):
+                trimmed.append(block_kv)
+                continue
+
+            k, v = block_kv
+            if not torch.is_tensor(k) or not torch.is_tensor(v):
+                trimmed.append(block_kv)
+                continue
+
+            # Expected KV cache shape from global attention: [B, heads, S_cache, P, dim].
+            # Keep only the latest S_cache entries within the temporal window.
+            if k.ndim >= 3 and v.ndim >= 3 and k.shape[2] > max_frames and v.shape[2] > max_frames:
+                k = k[:, :, -max_frames:, ...]
+                v = v[:, :, -max_frames:, ...]
+            trimmed.append((k, v))
+
+        return trimmed
 
     def _resize_pad_frame(self, image_np):
         frame = torch.from_numpy(image_np).float().permute(2, 0, 1).unsqueeze(0) / 255.0
@@ -465,7 +495,7 @@ class VA_Server:
             )
         conds = transformer_out.ress
         if "past_key_values" in conds:
-            self.transformer_past_key_values = conds["past_key_values"]
+            self.transformer_past_key_values = self._trim_transformer_kv_cache(conds["past_key_values"])
         return conds
 
     def _append_rdt_condition_history(self, conds):

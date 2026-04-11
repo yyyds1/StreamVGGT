@@ -37,4 +37,5 @@ python -m torch.distributed.run \
     --local-ranks-filter=${log_rank} \
     --master_port ${master_port} \
     --tee 3 \
-    -m train_va --config-name ${config_name} $overrides
+    -m train_va --config-name ${config_name} $overrides \
+    --task_name adjust_bottle

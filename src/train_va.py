@@ -884,9 +884,14 @@ def run(args):
     if args.save_root is not None:
         config.save_root = args.save_root
 
+    if args.single_task is not None:
+        config.single_task = args.single_task
+
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
+        if getattr(config, "single_task", None):
+            logger.info(f"Single-task training enabled: {config.single_task}")
 
     trainer = Trainer(config)
     trainer.train()
@@ -905,6 +910,14 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--single-task",
+        "--task_name",
+        dest="single_task",
+        type=str,
+        default=None,
+        help="Train on a single task only (same semantics as evaluation task_name)",
     )
 
     args = parser.parse_args()

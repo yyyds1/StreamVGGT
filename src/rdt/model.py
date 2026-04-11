@@ -217,12 +217,18 @@ class RDT(nn.Module):
         
         conds = []
         masks = []
+        if lang_c is not None:
+            conds.append(lang_c_kv or lang_c)
+            masks.append(lang_mask)
         if self.img_pos_emb is not None:
             conds.append(img_c)
             masks.append(img_mask)
         if act_c is not None:
             conds.append(act_c)
             masks.append(act_mask)
+
+        if len(conds) == 0:
+            raise ValueError("At least one condition (lang_c/img_c/act_c) must be provided.")
         
         num_conds = len(conds)
         for i, block in enumerate(self.blocks):
