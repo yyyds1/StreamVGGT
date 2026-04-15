@@ -19,12 +19,12 @@ va_robotwin_train_cfg.gc_interval = 50
 va_robotwin_train_cfg.cfg_prob = 0.1
 
 # Training parameters
-va_robotwin_train_cfg.learning_rate = 1e-4
+va_robotwin_train_cfg.learning_rate = 1e-5
 va_robotwin_train_cfg.beta1 = 0.9
 va_robotwin_train_cfg.beta2 = 0.95
 va_robotwin_train_cfg.weight_decay = 0.1
 va_robotwin_train_cfg.warmup_steps = 10
-va_robotwin_train_cfg.batch_size = 2
+va_robotwin_train_cfg.batch_size = 6
 va_robotwin_train_cfg.gradient_accumulation_steps = 1
 va_robotwin_train_cfg.num_steps = 100000
 va_robotwin_train_cfg.single_task = None

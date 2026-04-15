@@ -598,21 +598,18 @@ def eval_policy(task_name,
         inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
         initial_formatted_obs = format_obs(initial_obs, prompt)
         full_obs_list.append(initial_formatted_obs)
-        first_obs = None
         while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
-            if first:
-                observation = TASK_ENV.get_obs()
-                first_obs = format_obs(observation, prompt)
+            observation = TASK_ENV.get_obs()
+            current_obs = format_obs(observation, prompt)
 
-            ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
+            ret = model.infer(dict(obs=current_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
             action = ret['action']
             if 'video' in ret:
                 imagined_video = ret['video']
                 gen_video_list.append(imagined_video)
             key_frame_list = []
 
-            assert action.shape[2] % 4 == 0
-            action_per_frame = action.shape[2] // 4
+            action_per_frame = action.shape[2]
 
             start_idx = 1 if first else 0
             for i in range(start_idx, action.shape[1]):

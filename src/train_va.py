@@ -94,6 +94,7 @@ class Trainer:
             logger.info("WandB logging enabled")
         self.step = 0
         self.config = config
+        self._warned_lang_dim_mismatch = False
         self.device = torch.device(f"cuda:{config.local_rank}")
         # self.device = torch.device(f"cuda:0")
         self.dtype = config.param_dtype
@@ -514,6 +515,7 @@ class Trainer:
 
         images = batch_dict['images']  # [B, C_image, F, H, W]
         actions = batch_dict['actions']  # [B, C_action, F, N, 1]
+        text_emb = batch_dict.get('text_emb', None)
         image_mask = batch_dict.get('images_mask', torch.ones_like(images, dtype=torch.bool))
         action_mask = batch_dict.get('actions_mask', torch.ones_like(actions, dtype=torch.bool))
 
@@ -582,11 +584,34 @@ class Trainer:
         action_chunk_dict['targets'] = rearrange(action_chunk_dict['targets'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
         action_chunk_dict['noisy_latents'] = rearrange(action_chunk_dict['noisy_latents'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
         action_chunk_dict['latent'] = rearrange(action_chunk_dict['latent'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
+
+        # RDT expects language conditioning as token sequences [B, L_lang, D].
+        if text_emb is not None:
+            if text_emb.ndim == 2:
+                text_emb = text_emb.unsqueeze(1)
+            elif text_emb.ndim != 3:
+                raise ValueError(
+                    f"text_emb must have shape [B, D] or [B, L, D], got {tuple(text_emb.shape)}"
+                )
+            rdt_hidden_size = int(self.config.rdt.hidden_size)
+            if text_emb.shape[-1] != rdt_hidden_size:
+                if not self._warned_lang_dim_mismatch and self.config.rank == 0:
+                    logger.warning(
+                        f"text_emb dim {text_emb.shape[-1]} != RDT hidden_size {rdt_hidden_size}; "
+                        "adapting via adaptive average pooling"
+                    )
+                    self._warned_lang_dim_mismatch = True
+                bsz, lang_len, _ = text_emb.shape
+                text_emb = torch.nn.functional.adaptive_avg_pool1d(
+                    text_emb.reshape(bsz * lang_len, 1, text_emb.shape[-1]),
+                    rdt_hidden_size,
+                ).reshape(bsz, lang_len, rdt_hidden_size)
         
         input_dict = {
             'image_dict': image_dict,
             'action_dict': action_dict,
             'pred_action_chunk_dict': action_chunk_dict,
+            'lang_c': text_emb,
             'chunk_size': chunk_size,
             'window_size': F,
         }
@@ -672,6 +697,7 @@ class Trainer:
             action_pred = self.action_head(
                 action_chunk,
                 timesteps,
+                lang_c=input_dict.get('lang_c', None),
                 img_c=rdt_conds['rdt_img_c'],
                 act_c=rdt_conds['rdt_act_c'],
                 state_c=state_c,
@@ -690,7 +716,14 @@ class Trainer:
 
             # Only update weights after accumulating gradients
             if should_sync:
-                total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    [
+                        p for p in self.transformer.parameters() if p.requires_grad
+                    ] + [
+                        p for p in self.action_head.parameters() if p.requires_grad
+                    ],
+                    2.0,
+                )
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad()

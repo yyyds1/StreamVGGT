@@ -16,8 +16,9 @@ va_robotwin_cfg.height = 256
 va_robotwin_cfg.width = 320
 va_robotwin_cfg.action_dim = 30
 va_robotwin_cfg.action_per_frame = 16
-va_robotwin_cfg.obs_cam_keys = ['observation.images.cam_high', 'observation.images.cam_left_wrist',
-    'observation.images.cam_right_wrist']
+# va_robotwin_cfg.obs_cam_keys = ['observation.images.cam_high', 'observation.images.cam_left_wrist',
+#     'observation.images.cam_right_wrist']
+va_robotwin_cfg.obs_cam_keys = ['observation.images.cam_high']
 va_robotwin_cfg.guidance_scale = 5
 va_robotwin_cfg.action_guidance_scale = 1
 
@@ -36,11 +37,11 @@ va_robotwin_cfg.image_frame_stride = 8
 # Separate checkpoint controls
 # Priority per model in train_va.py:
 # 1) *_resume_from, 2) *_pretrained, 3) random init
-va_robotwin_cfg.transformer_resume = True
+va_robotwin_cfg.transformer_resume = False
 va_robotwin_cfg.transformer_resume_from = None
 va_robotwin_cfg.transformer_pretrained = '/mnt/nas/share/home/yds/actionvggt.pth'
 
-va_robotwin_cfg.action_head_resume = True
+va_robotwin_cfg.action_head_resume = False
 va_robotwin_cfg.action_head_resume_from = None
 va_robotwin_cfg.action_head_pretrained = '/mnt/nas/share/home/yds/RDT.pth'
 
