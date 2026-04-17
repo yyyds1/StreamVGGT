@@ -32,6 +32,7 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         img_width=518,
         patch_size=14,
         embed_dim=1024,
+        aggregator_depth=24,
         action_dim=30,
         text_dim=4096,
         window_size=4,
@@ -65,9 +66,16 @@ class ActionVGGT(nn.Module, PyTorchModelHubMixin):
         self.rdt_img_keep_summary_tokens = rdt_img_keep_summary_tokens
         self.patch_grid_h = img_height // patch_size
         self.patch_grid_w = img_width // patch_size
+        self.aggregator_depth = int(aggregator_depth)
 
         # original image processing backbone (DINO aggregator)
-        self.aggregator = Aggregator(img_height=img_height, img_width=img_width, patch_size=patch_size, embed_dim=embed_dim)
+        self.aggregator = Aggregator(
+            img_height=img_height,
+            img_width=img_width,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            depth=self.aggregator_depth,
+        )
         # self.camera_head = CameraHead(dim_in=2 * embed_dim)
         # self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         # self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")

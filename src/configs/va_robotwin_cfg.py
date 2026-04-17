@@ -16,9 +16,9 @@ va_robotwin_cfg.height = 256
 va_robotwin_cfg.width = 320
 va_robotwin_cfg.action_dim = 30
 va_robotwin_cfg.action_per_frame = 16
-# va_robotwin_cfg.obs_cam_keys = ['observation.images.cam_high', 'observation.images.cam_left_wrist',
-#     'observation.images.cam_right_wrist']
-va_robotwin_cfg.obs_cam_keys = ['observation.images.cam_high']
+va_robotwin_cfg.obs_cam_keys = ['observation.images.cam_high', 'observation.images.cam_left_wrist',
+    'observation.images.cam_right_wrist']
+# va_robotwin_cfg.obs_cam_keys = ['observation.images.cam_high']
 va_robotwin_cfg.guidance_scale = 5
 va_robotwin_cfg.action_guidance_scale = 1
 
@@ -30,19 +30,20 @@ va_robotwin_cfg.action_num_inference_steps = 50
 va_robotwin_cfg.multi_view_image_mode = 'vertical'
 va_robotwin_cfg.image_height = 224
 va_robotwin_cfg.image_width = 224
-va_robotwin_cfg.window_size = 4
-va_robotwin_cfg.chunk_size = 24
-va_robotwin_cfg.image_frame_stride = 8
+va_robotwin_cfg.window_size = 3
+va_robotwin_cfg.chunk_size = 8
+va_robotwin_cfg.image_frame_stride = 4
+va_robotwin_cfg.actionvggt_depth = 12
 
 # Separate checkpoint controls
 # Priority per model in train_va.py:
 # 1) *_resume_from, 2) *_pretrained, 3) random init
-va_robotwin_cfg.transformer_resume = False
-va_robotwin_cfg.transformer_resume_from = None
+va_robotwin_cfg.transformer_resume = True
+va_robotwin_cfg.transformer_resume_from = '/home/yds/code/StreamVGGT/src/train_out/train_log_20260417_162133/ckpt/checkpoint_step_2500/transformer/diffusion_pytorch_model.safetensors'
 va_robotwin_cfg.transformer_pretrained = '/mnt/nas/share/home/yds/actionvggt.pth'
 
-va_robotwin_cfg.action_head_resume = False
-va_robotwin_cfg.action_head_resume_from = None
+va_robotwin_cfg.action_head_resume = True
+va_robotwin_cfg.action_head_resume_from = '/home/yds/code/StreamVGGT/src/train_out/train_log_20260417_162133/ckpt/checkpoint_step_2500/action_head/diffusion_pytorch_model.safetensors'
 va_robotwin_cfg.action_head_pretrained = '/mnt/nas/share/home/yds/RDT.pth'
 
 va_robotwin_cfg.gradient_checkpointing = False
@@ -51,7 +52,7 @@ va_robotwin_cfg.long_context = False
 # RDT settings (from RDT2/configs/rdt/post_train.yaml)
 va_robotwin_cfg.rdt = EasyDict()
 va_robotwin_cfg.rdt.hidden_size = 1024
-va_robotwin_cfg.rdt.depth = 14
+va_robotwin_cfg.rdt.depth = 7
 va_robotwin_cfg.rdt.num_heads = 8
 va_robotwin_cfg.rdt.num_register_tokens = 4
 va_robotwin_cfg.rdt.norm_eps = 1e-5

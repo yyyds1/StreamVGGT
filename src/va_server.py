@@ -37,6 +37,126 @@ def get_effective_num_image_views(config):
     raise ValueError(f"Unsupported multi_view_image_mode `{mode}`")
 
 
+def _extract_modulelist_indices_from_state(state, prefix):
+    pattern = re.compile(rf"^{re.escape(prefix)}\.(\d+)\.")
+    indices = set()
+    for key in state.keys():
+        match = pattern.match(key)
+        if match:
+            indices.add(int(match.group(1)))
+    return sorted(indices)
+
+
+def _build_even_layer_map(src_indices, target_depth):
+    if target_depth <= 0:
+        raise ValueError(f"target_depth must be > 0, got {target_depth}")
+    if len(src_indices) == 0:
+        return {}
+
+    src_count = len(src_indices)
+    sampled_positions = [
+        min((i * src_count) // target_depth, src_count - 1)
+        for i in range(target_depth)
+    ]
+    sampled_src_indices = [src_indices[pos] for pos in sampled_positions]
+    return {src_idx: dst_idx for dst_idx, src_idx in enumerate(sampled_src_indices)}
+
+
+def _remap_modulelist_state_dict(state, prefix, target_depth):
+    src_indices = _extract_modulelist_indices_from_state(state, prefix)
+    if len(src_indices) == 0:
+        return state, None
+
+    if len(src_indices) == target_depth and src_indices == list(range(target_depth)):
+        return state, src_indices
+
+    src_to_dst = _build_even_layer_map(src_indices, target_depth)
+    pattern = re.compile(rf"^{re.escape(prefix)}\.(\d+)(\..+)$")
+
+    remapped = {}
+    for key, value in state.items():
+        match = pattern.match(key)
+        if not match:
+            remapped[key] = value
+            continue
+
+        src_idx = int(match.group(1))
+        suffix = match.group(2)
+        if src_idx in src_to_dst:
+            dst_idx = src_to_dst[src_idx]
+            remapped[f"{prefix}.{dst_idx}{suffix}"] = value
+
+    sampled_src_indices = [src_idx for src_idx, _ in sorted(src_to_dst.items(), key=lambda x: x[1])]
+    return remapped, sampled_src_indices
+
+
+def _adapt_transformer_state_for_depth(state, target_depth):
+    adapted = dict(state)
+    prefixes = [
+        "aggregator.frame_blocks",
+        "aggregator.global_blocks",
+        "aggregator.cross_blocks",
+    ]
+    for prefix in prefixes:
+        adapted, sampled = _remap_modulelist_state_dict(adapted, prefix, target_depth)
+        if sampled is not None and len(sampled) > 0:
+            logger.info(
+                f"Layer remap for {prefix}: sampled pretrained layers {sampled} -> target depth {target_depth}"
+            )
+    return adapted
+
+
+def _adapt_rdt_state_for_depth(state, target_depth):
+    adapted, sampled = _remap_modulelist_state_dict(state, "blocks", target_depth)
+    if sampled is not None and len(sampled) > 0:
+        logger.info(
+            f"Layer remap for RDT blocks: sampled pretrained layers {sampled} -> target depth {target_depth}"
+        )
+    return adapted
+
+
+def _resize_1d_positional_embedding(src_emb, dst_emb):
+    if src_emb.ndim != 3 or dst_emb.ndim != 3:
+        return None
+    if src_emb.shape[0] != dst_emb.shape[0] or src_emb.shape[2] != dst_emb.shape[2]:
+        return None
+    if src_emb.shape[1] == dst_emb.shape[1]:
+        return src_emb
+
+    src = src_emb.transpose(1, 2)
+    resized = F.interpolate(src, size=dst_emb.shape[1], mode="linear", align_corners=False)
+    return resized.transpose(1, 2)
+
+
+def _adapt_rdt_state_for_model(state, model):
+    adapted = _adapt_rdt_state_for_depth(state, target_depth=model.depth)
+    model_state = model.state_dict()
+
+    for pos_key in ["x_pos_emb", "img_pos_emb", "act_pos_emb"]:
+        if pos_key not in adapted or pos_key not in model_state:
+            continue
+        src_pos = adapted[pos_key]
+        dst_pos = model_state[pos_key]
+        if src_pos.shape == dst_pos.shape:
+            continue
+
+        resized = _resize_1d_positional_embedding(src_pos, dst_pos)
+        if resized is None:
+            logger.warning(
+                f"Skip loading {pos_key}: checkpoint shape {tuple(src_pos.shape)} != "
+                f"model shape {tuple(dst_pos.shape)} and resize is not applicable"
+            )
+            adapted.pop(pos_key, None)
+            continue
+
+        adapted[pos_key] = resized.to(dtype=dst_pos.dtype, device=dst_pos.device)
+        logger.info(
+            f"Resized RDT {pos_key} from {tuple(src_pos.shape)} to {tuple(dst_pos.shape)}"
+        )
+
+    return adapted
+
+
 class VA_Server:
     def __init__(self, job_config):
         self.job_config = job_config
@@ -81,6 +201,7 @@ class VA_Server:
             window_size=self.window_size,
             chunk_size=self.chunk_size,
             action_dim=self.action_dim,
+            aggregator_depth=int(getattr(job_config, "actionvggt_depth", 24)),
         )
         self.transformer.to(self.device)
 
@@ -199,6 +320,10 @@ class VA_Server:
                     adapted[pos_key] = resized.to(dtype=dst_pos.dtype, device=dst_pos.device)
                     logger.info(f"Resized {pos_key} from {tuple(src_pos.shape)} to {tuple(dst_pos.shape)}")
 
+        adapted = _adapt_transformer_state_for_depth(
+            adapted,
+            target_depth=model.aggregator.depth,
+        )
         return adapted
 
     def _resolve_latest_ckpt(self, root_dir, subdir_name):
@@ -258,6 +383,10 @@ class VA_Server:
 
         logger.info(f"Loading RDT checkpoint from: {action_head_path}")
         action_head_state = self._load_checkpoint_state(action_head_path)
+        action_head_state = _adapt_rdt_state_for_model(
+            action_head_state,
+            model=self.action_head,
+        )
         logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
 
     def _reset_runtime_buffers(self, prompt=None):

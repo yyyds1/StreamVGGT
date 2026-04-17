@@ -77,6 +77,129 @@ def _to_plain_config(value):
     return value
 
 
+def _extract_modulelist_indices_from_state(state, prefix):
+    pattern = re.compile(rf"^{re.escape(prefix)}\.(\d+)\.")
+    indices = set()
+    for key in state.keys():
+        match = pattern.match(key)
+        if match:
+            indices.add(int(match.group(1)))
+    return sorted(indices)
+
+
+def _build_even_layer_map(src_indices, target_depth):
+    if target_depth <= 0:
+        raise ValueError(f"target_depth must be > 0, got {target_depth}")
+    if len(src_indices) == 0:
+        return {}
+
+    src_count = len(src_indices)
+    sampled_positions = [
+        min((i * src_count) // target_depth, src_count - 1)
+        for i in range(target_depth)
+    ]
+    sampled_src_indices = [src_indices[pos] for pos in sampled_positions]
+    return {src_idx: dst_idx for dst_idx, src_idx in enumerate(sampled_src_indices)}
+
+
+def _remap_modulelist_state_dict(state, prefix, target_depth):
+    src_indices = _extract_modulelist_indices_from_state(state, prefix)
+    if len(src_indices) == 0:
+        return state, None
+
+    if len(src_indices) == target_depth and src_indices == list(range(target_depth)):
+        return state, src_indices
+
+    src_to_dst = _build_even_layer_map(src_indices, target_depth)
+    pattern = re.compile(rf"^{re.escape(prefix)}\.(\d+)(\..+)$")
+
+    remapped = {}
+    for key, value in state.items():
+        match = pattern.match(key)
+        if not match:
+            remapped[key] = value
+            continue
+
+        src_idx = int(match.group(1))
+        suffix = match.group(2)
+        if src_idx in src_to_dst:
+            dst_idx = src_to_dst[src_idx]
+            remapped[f"{prefix}.{dst_idx}{suffix}"] = value
+
+    sampled_src_indices = [src_idx for src_idx, _ in sorted(src_to_dst.items(), key=lambda x: x[1])]
+    return remapped, sampled_src_indices
+
+
+def _adapt_transformer_state_for_depth(state, target_depth, rank=0):
+    adapted = dict(state)
+    prefixes = [
+        "aggregator.frame_blocks",
+        "aggregator.global_blocks",
+    ]
+
+    for prefix in prefixes:
+        adapted, sampled = _remap_modulelist_state_dict(adapted, prefix, target_depth)
+        if sampled is not None and rank == 0 and len(sampled) > 0:
+            logger.info(
+                f"Layer remap for {prefix}: sampled pretrained layers {sampled} -> target depth {target_depth}"
+            )
+
+    return adapted
+
+
+def _adapt_rdt_state_for_depth(state, target_depth, rank=0):
+    adapted, sampled = _remap_modulelist_state_dict(state, "blocks", target_depth)
+    if sampled is not None and rank == 0 and len(sampled) > 0:
+        logger.info(
+            f"Layer remap for RDT blocks: sampled pretrained layers {sampled} -> target depth {target_depth}"
+        )
+    return adapted
+
+
+def _resize_1d_positional_embedding(src_emb, dst_emb):
+    if src_emb.ndim != 3 or dst_emb.ndim != 3:
+        return None
+    if src_emb.shape[0] != dst_emb.shape[0] or src_emb.shape[2] != dst_emb.shape[2]:
+        return None
+    if src_emb.shape[1] == dst_emb.shape[1]:
+        return src_emb
+
+    src = src_emb.transpose(1, 2)
+    resized = F.interpolate(src, size=dst_emb.shape[1], mode="linear", align_corners=False)
+    return resized.transpose(1, 2)
+
+
+def _adapt_rdt_state_for_model(state, model, rank=0):
+    adapted = _adapt_rdt_state_for_depth(state, target_depth=model.depth, rank=rank)
+    model_state = model.state_dict()
+
+    for pos_key in ["x_pos_emb", "img_pos_emb", "act_pos_emb"]:
+        if pos_key not in adapted or pos_key not in model_state:
+            continue
+        src_pos = adapted[pos_key]
+        dst_pos = model_state[pos_key]
+        if src_pos.shape == dst_pos.shape:
+            continue
+
+        resized = _resize_1d_positional_embedding(src_pos, dst_pos)
+        if resized is None:
+            if rank == 0:
+                logger.warning(
+                    f"Skip loading {pos_key}: checkpoint shape {tuple(src_pos.shape)} != "
+                    f"model shape {tuple(dst_pos.shape)} and resize is not applicable"
+                )
+            adapted.pop(pos_key, None)
+            continue
+
+        adapted[pos_key] = resized.to(dtype=dst_pos.dtype, device=dst_pos.device)
+        if rank == 0:
+            logger.info(
+                f"Resized RDT {pos_key} from {tuple(src_pos.shape)} to {tuple(dst_pos.shape)}"
+            )
+
+    return adapted
+
+
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
@@ -113,6 +236,7 @@ class Trainer:
             rdt_img_cond_mode=getattr(config, "rdt_img_cond_mode", "full"),
             rdt_img_pool_size=getattr(config, "rdt_img_pool_size", 1),
             rdt_img_keep_summary_tokens=getattr(config, "rdt_img_keep_summary_tokens", False),
+            aggregator_depth=int(getattr(config, "actionvggt_depth", 24)),
         )
         self.transformer.config = _to_plain_config({
             "img_height": config.image_height,
@@ -126,6 +250,7 @@ class Trainer:
             "rdt_img_cond_mode": self.transformer.rdt_img_cond_mode,
             "rdt_img_pool_size": self.transformer.rdt_img_pool_size,
             "rdt_img_keep_summary_tokens": self.transformer.rdt_img_keep_summary_tokens,
+            "aggregator_depth": self.transformer.aggregator.depth,
         })
         logger.info(f"All model parameters: {sum(p.numel() for p in self.transformer.parameters())}")
 
@@ -250,6 +375,11 @@ class Trainer:
                             f"Resized {pos_key} from {tuple(src_pos.shape)} to {tuple(dst_pos.shape)}"
                         )
 
+            adapted = _adapt_transformer_state_for_depth(
+                adapted,
+                target_depth=model.aggregator.depth,
+                rank=self.config.rank,
+            )
             return adapted
 
         # ActionVGGT loading: prefer resume_from, fallback to pretrained.
@@ -307,6 +437,11 @@ class Trainer:
                 if config.rank == 0:
                     logger.info(f"Resuming RDT action head from: {action_head_resume_from}")
                 action_head_state = _load_checkpoint_state(action_head_resume_from)
+                action_head_state = _adapt_rdt_state_for_model(
+                    action_head_state,
+                    model=self.action_head,
+                    rank=self.config.rank,
+                )
                 logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
             else: # resume from the latest checkpoint
                 ckpt_dir = Path(config.save_root)
@@ -335,10 +470,21 @@ class Trainer:
 
                 logger.info(f"Resuming RDT action head from latest checkpoint: {action_head_path}")
                 action_head_state = _load_checkpoint_state(action_head_path)
+                action_head_state = _adapt_rdt_state_for_model(
+                    action_head_state,
+                    model=self.action_head,
+                    rank=self.config.rank,
+                )
                 logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
         elif action_head_pretrained:
             logger.info(f"Loading RDT action head pretrained from: {action_head_pretrained}")
-            logger.info(self.action_head.load_state_dict(_load_checkpoint_state(action_head_pretrained), strict=False))
+            action_head_state = _load_checkpoint_state(action_head_pretrained)
+            action_head_state = _adapt_rdt_state_for_model(
+                action_head_state,
+                model=self.action_head,
+                rank=self.config.rank,
+            )
+            logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
 
         if config.gradient_checkpointing:
             logger.info("Enabling activation checkpointing on transformer and action head...")
