@@ -17,6 +17,7 @@ from safetensors.torch import load_file
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from actionvggt.models.actionvggt import ActionVGGT
+from vga.models.vga import VGA
 from configs import VA_CONFIGS
 from rdt.model import RDT
 from utils import (
@@ -94,6 +95,8 @@ def _adapt_transformer_state_for_depth(state, target_depth):
     adapted = dict(state)
     prefixes = [
         "aggregator.frame_blocks",
+        "aggregator.frame_blocks_image",
+        "aggregator.frame_blocks_action",
         "aggregator.global_blocks",
         "aggregator.cross_blocks",
     ]
@@ -171,6 +174,7 @@ class VA_Server:
         self.action_dim = int(job_config.action_dim)
         self.patch_size = tuple(getattr(job_config, "patch_size", (1, 14, 14)))
         self.multi_view_image_mode = getattr(job_config, "multi_view_image_mode", "vertical")
+        self.model_arch = str(getattr(job_config, "model_arch", "actionvggt")).lower()
 
         self.image_height = int(getattr(job_config, "image_height", job_config.height))
         self.image_width = int(getattr(job_config, "image_width", job_config.width))
@@ -191,7 +195,7 @@ class VA_Server:
         action_steps = int(getattr(self.job_config, "action_num_inference_steps", 50))
         self.train_scheduler_action.set_timesteps(action_steps)
 
-        self.transformer = ActionVGGT(
+        common_kwargs = dict(
             img_height=self.image_height,
             img_width=self.image_width,
             num_image_views=get_effective_num_image_views(self.job_config),
@@ -202,7 +206,15 @@ class VA_Server:
             chunk_size=self.chunk_size,
             action_dim=self.action_dim,
             aggregator_depth=int(getattr(job_config, "actionvggt_depth", 24)),
+            image_frame_stride=self.image_frame_stride,
         )
+        if self.model_arch == "vga":
+            self.transformer = VGA(
+                enable_camera_depth_heads=bool(getattr(job_config, "enable_geometry_heads_eval", False)),
+                **common_kwargs,
+            )
+        else:
+            self.transformer = ActionVGGT(**common_kwargs)
         self.transformer.to(self.device)
 
         rdt_config = self.job_config.rdt
@@ -360,9 +372,9 @@ class VA_Server:
             transformer_path = Path(transformer_pretrained) if transformer_pretrained else None
 
         if transformer_path is None or not transformer_path.exists():
-            raise FileNotFoundError("Unable to locate transformer checkpoint for ActionVGGT")
+            raise FileNotFoundError("Unable to locate transformer checkpoint")
 
-        logger.info(f"Loading ActionVGGT checkpoint from: {transformer_path}")
+        logger.info(f"Loading transformer checkpoint from: {transformer_path}")
         transformer_state = self._load_checkpoint_state(transformer_path)
         transformer_state = self._adapt_transformer_state_for_resolution(self.transformer, transformer_state)
         logger.info(self.transformer.load_state_dict(transformer_state, strict=False))

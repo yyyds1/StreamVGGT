@@ -49,10 +49,11 @@ from utils import (
     warmup_constant_lambda,
     FlowMatchScheduler,
 )
-from actionvggt.models.actionvggt import ActionVGGT
+from vga.models.vga import VGA
 from rdt.model import RDT
+from vga.utils.lora import extract_lora_state_dict, load_lora_state_dict
 
-from dataset import MultiLatentLeRobotDataset
+from dataset import MultiLatentLeRobotDataset, MultiVGARobotwinDataset
 import gc
 
 
@@ -134,7 +135,10 @@ def _adapt_transformer_state_for_depth(state, target_depth, rank=0):
     adapted = dict(state)
     prefixes = [
         "aggregator.frame_blocks",
+        "aggregator.frame_blocks_image",
+        "aggregator.frame_blocks_action",
         "aggregator.global_blocks",
+        "aggregator.cross_blocks",
     ]
 
     for prefix in prefixes:
@@ -147,56 +151,41 @@ def _adapt_transformer_state_for_depth(state, target_depth, rank=0):
     return adapted
 
 
-def _adapt_rdt_state_for_depth(state, target_depth, rank=0):
-    adapted, sampled = _remap_modulelist_state_dict(state, "blocks", target_depth)
-    if sampled is not None and rank == 0 and len(sampled) > 0:
-        logger.info(
-            f"Layer remap for RDT blocks: sampled pretrained layers {sampled} -> target depth {target_depth}"
-        )
-    return adapted
+def _strip_state_dict_prefixes(state):
+    stripped = {}
+    for key, value in state.items():
+        new_key = key
+        for prefix in ("module.", "model.", "transformer.", "_orig_mod."):
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix):]
+        stripped[new_key] = value
+    return stripped
 
 
-def _resize_1d_positional_embedding(src_emb, dst_emb):
-    if src_emb.ndim != 3 or dst_emb.ndim != 3:
-        return None
-    if src_emb.shape[0] != dst_emb.shape[0] or src_emb.shape[2] != dst_emb.shape[2]:
-        return None
-    if src_emb.shape[1] == dst_emb.shape[1]:
-        return src_emb
+def _adapt_streamvggt_state_for_vga(state, target_depth, rank=0):
+    """Map StreamVGGT checkpoint keys to VGA keys and remap depth if needed."""
+    source = _strip_state_dict_prefixes(state)
+    adapted = {}
 
-    src = src_emb.transpose(1, 2)
-    resized = F.interpolate(src, size=dst_emb.shape[1], mode="linear", align_corners=False)
-    return resized.transpose(1, 2)
-
-
-def _adapt_rdt_state_for_model(state, model, rank=0):
-    adapted = _adapt_rdt_state_for_depth(state, target_depth=model.depth, rank=rank)
-    model_state = model.state_dict()
-
-    for pos_key in ["x_pos_emb", "img_pos_emb", "act_pos_emb"]:
-        if pos_key not in adapted or pos_key not in model_state:
-            continue
-        src_pos = adapted[pos_key]
-        dst_pos = model_state[pos_key]
-        if src_pos.shape == dst_pos.shape:
+    for key, value in source.items():
+        if key.startswith("aggregator.frame_blocks."):
+            suffix = key[len("aggregator.frame_blocks.") :]
+            adapted[f"aggregator.frame_blocks_image.{suffix}"] = value
+            adapted[f"aggregator.frame_blocks_action.{suffix}"] = value
             continue
 
-        resized = _resize_1d_positional_embedding(src_pos, dst_pos)
-        if resized is None:
-            if rank == 0:
-                logger.warning(
-                    f"Skip loading {pos_key}: checkpoint shape {tuple(src_pos.shape)} != "
-                    f"model shape {tuple(dst_pos.shape)} and resize is not applicable"
-                )
-            adapted.pop(pos_key, None)
+        if key.startswith("aggregator.global_blocks."):
+            suffix = key[len("aggregator.global_blocks.") :]
+            adapted[f"aggregator.global_blocks.{suffix}"] = value
             continue
 
-        adapted[pos_key] = resized.to(dtype=dst_pos.dtype, device=dst_pos.device)
-        if rank == 0:
-            logger.info(
-                f"Resized RDT {pos_key} from {tuple(src_pos.shape)} to {tuple(dst_pos.shape)}"
-            )
+        # StreamVGGT-only heads are intentionally ignored.
+        if key.startswith("point_head.") or key.startswith("track_head."):
+            continue
 
+        adapted[key] = value
+
+    adapted = _adapt_transformer_state_for_depth(adapted, target_depth=target_depth, rank=rank)
     return adapted
 
 
@@ -222,14 +211,37 @@ class Trainer:
         # self.device = torch.device(f"cuda:0")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
+        self.model_arch = "vga"
+
+        requested_arch = str(getattr(config, "model_arch", "vga")).lower()
+        if requested_arch != "vga":
+            raise ValueError(
+                f"train_va.py now supports VGA + RDT only, got model_arch={requested_arch}"
+            )
 
         # Load models
         logger.info("Loading models...")
 
+        self.enable_camera_loss = bool(getattr(config, "enable_camera_loss", False))
+        self.enable_depth_loss = bool(getattr(config, "enable_depth_loss", False))
+        self.loss_weight_camera = float(getattr(config, "loss_weight_camera", 0.0))
+        self.loss_weight_depth = float(getattr(config, "loss_weight_depth", 0.0))
+        self.loss_weight_action = float(getattr(config, "loss_weight_action", 1.0))
+        self.use_lora = bool(getattr(config, "use_lora", True))
+        self.lora_rank = int(getattr(config, "lora_rank", 8))
+        self.lora_alpha = float(getattr(config, "lora_alpha", 16.0))
+        self.lora_dropout = float(getattr(config, "lora_dropout", 0.05))
+        self.lora_target_modules = tuple(getattr(config, "lora_target_modules", ("qkv", "proj", "fc1", "fc2")))
+
+        # Bypass geometry heads when corresponding losses are disabled.
+        enable_camera_head = self.enable_camera_loss and self.loss_weight_camera > 0.0
+        enable_depth_head = self.enable_depth_loss and self.loss_weight_depth > 0.0
+        enable_geometry_heads_train = enable_camera_head or enable_depth_head
+
         # Load and shard transformer with FSDP
         logger.info("Loading transformer...")
 
-        self.transformer = ActionVGGT(
+        common_kwargs = dict(
             img_height=config.image_height,
             img_width=config.image_width,
             num_image_views=get_effective_num_image_views(self.config),
@@ -237,8 +249,20 @@ class Trainer:
             rdt_img_pool_size=getattr(config, "rdt_img_pool_size", 1),
             rdt_img_keep_summary_tokens=getattr(config, "rdt_img_keep_summary_tokens", False),
             aggregator_depth=int(getattr(config, "actionvggt_depth", 24)),
+            window_size=int(getattr(config, "window_size", 4)),
+            chunk_size=int(getattr(config, "chunk_size", 24)),
+            action_dim=int(getattr(config, "action_dim", 30)),
+            image_frame_stride=int(getattr(config, "image_frame_stride", 8)),
+        )
+        self.transformer = VGA(
+            rdt_condition_tokens=getattr(config, "rdt_condition_tokens", None),
+            enable_camera_depth_heads=enable_geometry_heads_train,
+            enable_camera_head=enable_camera_head,
+            enable_depth_head=enable_depth_head,
+            **common_kwargs,
         )
         self.transformer.config = _to_plain_config({
+            "model_arch": self.model_arch,
             "img_height": config.image_height,
             "img_width": config.image_width,
             "patch_size": self.transformer.patch_size,
@@ -251,6 +275,11 @@ class Trainer:
             "rdt_img_pool_size": self.transformer.rdt_img_pool_size,
             "rdt_img_keep_summary_tokens": self.transformer.rdt_img_keep_summary_tokens,
             "aggregator_depth": self.transformer.aggregator.depth,
+            "use_lora": self.use_lora,
+            "lora_rank": self.lora_rank,
+            "lora_alpha": self.lora_alpha,
+            "lora_dropout": self.lora_dropout,
+            "lora_target_modules": list(self.lora_target_modules),
         })
         logger.info(f"All model parameters: {sum(p.numel() for p in self.transformer.parameters())}")
 
@@ -310,15 +339,14 @@ class Trainer:
         })
         self.action_head.to(self.device)
 
-        if config.long_context:
-            self.transformer.fixed_input_length = False
-
         def _load_checkpoint_state(path):
             if str(path).endswith('.safetensors'):
                 return load_file(path, device=str(self.device))
             state = torch.load(path, map_location=self.device)
-            if isinstance(state, dict) and 'state_dict' in state and isinstance(state['state_dict'], dict):
-                return state['state_dict']
+            if isinstance(state, dict):
+                for top_key in ('state_dict', 'model_state_dict', 'model'):
+                    if top_key in state and isinstance(state[top_key], dict):
+                        return state[top_key]
             return state
 
         def _resize_pos_embed_tensor(src_pos_embed: torch.Tensor, dst_pos_embed: torch.Tensor):
@@ -375,116 +403,61 @@ class Trainer:
                             f"Resized {pos_key} from {tuple(src_pos.shape)} to {tuple(dst_pos.shape)}"
                         )
 
-            adapted = _adapt_transformer_state_for_depth(
-                adapted,
-                target_depth=model.aggregator.depth,
-                rank=self.config.rank,
-            )
             return adapted
 
-        # ActionVGGT loading: prefer resume_from, fallback to pretrained.
-        transformer_resume = getattr(config, 'transformer_resume', False)
-        transformer_resume_from = getattr(config, 'transformer_resume_from', None)
-        transformer_pretrained = getattr(config, 'transformer_pretrained', None)
-        if transformer_resume:
-            if transformer_resume_from:
-                if config.rank == 0:
-                    logger.info(f"Resuming ActionVGGT from: {transformer_resume_from}")
-                transformer_state = _load_checkpoint_state(transformer_resume_from)
-                transformer_state = _adapt_transformer_state_for_resolution(self.transformer, transformer_state)
-                logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
-            else: # resume from the latest checkpoint
-                ckpt_dir = Path(config.save_root)
-                ckpt_pattern = re.compile(r"checkpoint_step_(\d+)$")
-                latest_ckpt = None
-                latest_step = -1
+        streamvggt_pretrained = getattr(config, "streamvggt_pretrained", None)
+        if streamvggt_pretrained is None:
+            streamvggt_pretrained = str(Path(__file__).resolve().parent.parent / "ckpt" / "checkpoints.pth")
+        streamvggt_pretrained = Path(streamvggt_pretrained)
+        if not streamvggt_pretrained.exists():
+            raise FileNotFoundError(f"StreamVGGT checkpoint not found: {streamvggt_pretrained}")
 
-                if ckpt_dir.exists():
-                    for p in ckpt_dir.rglob("checkpoint_step_*"):
-                        if not p.is_dir():
-                            continue
-                        m = ckpt_pattern.match(p.name)
-                        if not m:
-                            continue
-                        step = int(m.group(1))
-                        if step > latest_step:
-                            latest_step = step
-                            latest_ckpt = p
+        transformer_resume_from = getattr(config, "transformer_resume_from", None)
+        action_head_resume_from = getattr(config, "action_head_resume_from", None)
+        self._resume_checkpoint_dir = None
 
-                if latest_ckpt is None:
-                    raise FileNotFoundError(f"No checkpoint_step_* found under: {ckpt_dir}")
+        logger.info(f"Initializing VGA from StreamVGGT checkpoint: {streamvggt_pretrained}")
+        transformer_state = _load_checkpoint_state(streamvggt_pretrained)
+        transformer_state = _adapt_streamvggt_state_for_vga(
+            transformer_state,
+            target_depth=self.transformer.aggregator.depth,
+            rank=self.config.rank,
+        )
+        transformer_state = _adapt_transformer_state_for_resolution(self.transformer, transformer_state)
+        logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
 
-                transformer_path = latest_ckpt / "transformer" / "diffusion_pytorch_model.safetensors"
-                if not transformer_path.exists():
-                    raise FileNotFoundError(f"Transformer checkpoint not found: {transformer_path}")
+        if self.use_lora:
+            lora_modules = self.transformer.enable_lora(
+                rank=self.lora_rank,
+                alpha=self.lora_alpha,
+                dropout=self.lora_dropout,
+                target_modules=self.lora_target_modules,
+            )
+            self.transformer.prepare_lora_training()
+            if self.config.rank == 0:
+                logger.info(
+                    f"Enabled LoRA on VGA backbone: rank={self.lora_rank}, alpha={self.lora_alpha}, "
+                    f"dropout={self.lora_dropout}, modules={len(lora_modules)}"
+                )
 
-                logger.info(f"Resuming ActionVGGT from latest checkpoint: {transformer_path}")
-                transformer_state = _load_checkpoint_state(transformer_path)
-                transformer_state = _adapt_transformer_state_for_resolution(self.transformer, transformer_state)
-                logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
-        elif transformer_pretrained:
-            logger.info(f"Loading ActionVGGT pretrained from: {transformer_pretrained}")
-            transformer_state = _load_checkpoint_state(transformer_pretrained)
+        if getattr(config, "transformer_resume", False) and transformer_resume_from:
+            transformer_resume_from = Path(transformer_resume_from)
+            self._resume_checkpoint_dir = transformer_resume_from.parent.parent
+            logger.info(f"Resuming VGA transformer from {transformer_resume_from}")
+            transformer_state = _load_checkpoint_state(transformer_resume_from)
             transformer_state = _adapt_transformer_state_for_resolution(self.transformer, transformer_state)
             logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
 
-        # RDT action head loading: prefer resume_from, fallback to pretrained.
-        action_head_resume = getattr(config, 'action_head_resume', False)
-        action_head_resume_from = getattr(config, 'action_head_resume_from', None)
-        action_head_pretrained = getattr(config, 'action_head_pretrained', None)
-        if action_head_resume:
-            if action_head_resume_from:
-                if config.rank == 0:
-                    logger.info(f"Resuming RDT action head from: {action_head_resume_from}")
-                action_head_state = _load_checkpoint_state(action_head_resume_from)
-                action_head_state = _adapt_rdt_state_for_model(
-                    action_head_state,
-                    model=self.action_head,
-                    rank=self.config.rank,
-                )
-                logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
-            else: # resume from the latest checkpoint
-                ckpt_dir = Path(config.save_root)
-                ckpt_pattern = re.compile(r"checkpoint_step_(\d+)$")
-                latest_ckpt = None
-                latest_step = -1
+            lora_state_path = self._resume_checkpoint_dir / "transformer" / "lora_weights.safetensors"
+            if lora_state_path.exists():
+                logger.info(f"Loading LoRA delta from {lora_state_path}")
+                lora_state = _load_checkpoint_state(lora_state_path)
+                logger.info(load_lora_state_dict(self.transformer, lora_state, strict=False))
+        elif self.use_lora and self.config.rank == 0:
+            logger.info("No transformer resume checkpoint configured; starting LoRA from pretrained backbone.")
 
-                if ckpt_dir.exists():
-                    for p in ckpt_dir.rglob("checkpoint_step_*"):
-                        if not p.is_dir():
-                            continue
-                        m = ckpt_pattern.match(p.name)
-                        if not m:
-                            continue
-                        step = int(m.group(1))
-                        if step > latest_step:
-                            latest_step = step
-                            latest_ckpt = p
-
-                if latest_ckpt is None:
-                    raise FileNotFoundError(f"No checkpoint_step_* found under: {ckpt_dir}")
-
-                action_head_path = latest_ckpt / "action_head" / "diffusion_pytorch_model.safetensors"
-                if not action_head_path.exists():
-                    raise FileNotFoundError(f"RDT action head checkpoint not found: {action_head_path}")
-
-                logger.info(f"Resuming RDT action head from latest checkpoint: {action_head_path}")
-                action_head_state = _load_checkpoint_state(action_head_path)
-                action_head_state = _adapt_rdt_state_for_model(
-                    action_head_state,
-                    model=self.action_head,
-                    rank=self.config.rank,
-                )
-                logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
-        elif action_head_pretrained:
-            logger.info(f"Loading RDT action head pretrained from: {action_head_pretrained}")
-            action_head_state = _load_checkpoint_state(action_head_pretrained)
-            action_head_state = _adapt_rdt_state_for_model(
-                action_head_state,
-                model=self.action_head,
-                rank=self.config.rank,
-            )
-            logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
+        if self.config.rank == 0:
+            logger.info("Initializing RDT action head from scratch (no pretrained load).")
 
         if config.gradient_checkpointing:
             logger.info("Enabling activation checkpointing on transformer and action head...")
@@ -514,33 +487,25 @@ class Trainer:
         self.action_head.train()
         self.action_head.requires_grad_(True)
 
-        # freeze
-        logger.info("Freezing patch embedding and positional encoding parameters...")
         frozen_params = 0
         total_params = 0
-
         frozen_param_names = []
 
         for name, param in self.transformer.named_parameters():
             total_params += param.numel()
-            param.requires_grad = True
-
-        if hasattr(self.transformer, 'aggregator') and hasattr(self.transformer.aggregator, 'patch_embed'):
-            for param in self.transformer.aggregator.patch_embed.parameters():
+            if self.use_lora:
                 if param.requires_grad:
-                    param.requires_grad = False
+                    continue
+            else:
+                param.requires_grad = True
 
-        if hasattr(self.transformer, 'aggregator') and hasattr(self.transformer.aggregator, 'camera_token'):
-            self.transformer.aggregator.camera_token.requires_grad = False
-
-        if hasattr(self.transformer, 'aggregator') and hasattr(self.transformer.aggregator, 'register_token'):
-            self.transformer.aggregator.register_token.requires_grad = False
-
-
-        for name, p in self.transformer.named_parameters():
-            if not p.requires_grad:
-                frozen_params += p.numel()
-                frozen_param_names.append(name)
+        if self.use_lora:
+            for name, p in self.transformer.named_parameters():
+                if not p.requires_grad:
+                    frozen_params += p.numel()
+                    frozen_param_names.append(name)
+        else:
+            logger.info("LoRA disabled: training VGA backbone normally.")
 
         logger.info(
             f"Frozen {frozen_params:,} parameters out of {total_params:,} total parameters. ({frozen_params / total_params:.2%})")
@@ -567,7 +532,11 @@ class Trainer:
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
-        train_dataset = MultiLatentLeRobotDataset(config=config)
+        dataset_type = str(getattr(config, "dataset_type", "robotwin")).lower()
+        if dataset_type == "vga_robotwin":
+            train_dataset = MultiVGARobotwinDataset(config=config)
+        else:
+            train_dataset = MultiLatentLeRobotDataset(config=config)
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=config.world_size,
@@ -590,8 +559,14 @@ class Trainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
-        # if hasattr(config, 'resume_from') and config.resume_from:
-        #     self._load_training_state(config.resume_from)
+        if getattr(config, "transformer_resume", False) and self._resume_checkpoint_dir is not None:
+            self._load_training_state(self._resume_checkpoint_dir)
+            action_head_resume_from = action_head_resume_from or (self._resume_checkpoint_dir / "action_head" / "diffusion_pytorch_model.safetensors")
+        if getattr(config, "action_head_resume", False) and action_head_resume_from:
+            action_head_resume_from = Path(action_head_resume_from)
+            logger.info(f"Resuming action head from {action_head_resume_from}")
+            action_head_state = _load_checkpoint_state(action_head_resume_from)
+            logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
     
     @torch.no_grad()
     def _add_noise(self, latent, train_scheduler, action_mask=False, action_mode=False, noisy_cond_prob=0.):
@@ -651,13 +626,13 @@ class Trainer:
         chunk_size = getattr(self.config, 'chunk_size', None)
 
         if 'images' not in batch_dict:
-            raise ValueError("batch_dict must include raw 'images' for ActionVGGT training")
+            raise ValueError("batch_dict must include raw 'images' for VGA training")
         if 'actions' not in batch_dict:
-            raise ValueError("batch_dict must include 'actions' for ActionVGGT training")
+            raise ValueError("batch_dict must include 'actions' for VGA training")
         if 'action_chunk' not in batch_dict:
-            raise ValueError("batch_dict must include 'action_chunk' for ActionVGGT training")
+            raise ValueError("batch_dict must include 'action_chunk' for VGA training")
         if 'pred_frame_idx' not in batch_dict:
-            raise ValueError("batch_dict must include 'pred_frame_idx' for ActionVGGT training")
+            raise ValueError("batch_dict must include 'pred_frame_idx' for VGA training")
 
         images = batch_dict['images']  # [B, C_image, F, H, W]
         actions = batch_dict['actions']  # [B, C_action, F, N, 1]
@@ -761,6 +736,14 @@ class Trainer:
             'chunk_size': chunk_size,
             'window_size': F,
         }
+        if 'state' in batch_dict:
+            state = batch_dict['state']
+            if state.ndim == 2:
+                input_dict['state_c'] = state.unsqueeze(1)  # [B, 1, C_action]
+            elif state.ndim == 3 and state.shape[1] == 1:
+                input_dict['state_c'] = state
+            else:
+                raise ValueError(f"state must be [B, C] or [B, 1, C], got {tuple(state.shape)}")
         return input_dict
 
     def convert_input_format(self, input_dict):
@@ -803,6 +786,50 @@ class Trainer:
 
         return action_loss_per_frame.mean() / self.gradient_accumulation_steps
 
+    def _compute_camera_depth_losses(self, batch, model_output):
+        zero = torch.zeros((), device=self.device, dtype=torch.float32)
+        geometry = getattr(model_output, "geometry", None)
+        if not isinstance(geometry, dict):
+            return zero, zero
+
+        camera_loss = zero
+        depth_loss = zero
+
+        camera_pred = geometry.get("camera_pose", None)
+        camera_gt = batch.get("camera_pose_gt", None)
+        if camera_pred is not None and camera_gt is not None:
+            camera_gt = camera_gt.to(device=camera_pred.device, dtype=camera_pred.dtype)
+            camera_loss = F.smooth_l1_loss(camera_pred, camera_gt, reduction="mean")
+
+        depth_pred = geometry.get("depth", None)
+        depth_conf = geometry.get("depth_conf", None)
+        depth_gt = batch.get("depth_gt", None)
+        if depth_pred is not None and depth_conf is not None and depth_gt is not None:
+            depth_gt = depth_gt.to(device=depth_pred.device, dtype=depth_pred.dtype)
+            valid_mask = batch.get("depth_valid_mask", None)
+            if valid_mask is not None:
+                valid_mask = valid_mask.to(device=depth_pred.device, dtype=depth_pred.dtype)
+            else:
+                valid_mask = torch.ones_like(depth_pred)
+
+            depth_err = torch.abs(depth_pred - depth_gt)
+            aleatoric = depth_err * torch.exp(-depth_conf) + depth_conf
+            aleatoric = (aleatoric * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+
+            grad_weight = float(getattr(self.config, "depth_loss_grad_weight", 0.1))
+            if depth_pred.shape[-2] > 1 and depth_pred.shape[-1] > 1:
+                pred_dx = depth_pred[..., :, 1:] - depth_pred[..., :, :-1]
+                gt_dx = depth_gt[..., :, 1:] - depth_gt[..., :, :-1]
+                pred_dy = depth_pred[..., 1:, :] - depth_pred[..., :-1, :]
+                gt_dy = depth_gt[..., 1:, :] - depth_gt[..., :-1, :]
+                grad_loss = F.l1_loss(pred_dx, gt_dx, reduction="mean") + F.l1_loss(pred_dy, gt_dy, reduction="mean")
+            else:
+                grad_loss = torch.zeros((), device=depth_pred.device, dtype=depth_pred.dtype)
+
+            depth_loss = aleatoric + grad_weight * grad_loss
+
+        return camera_loss, depth_loss
+
     def train_epoch(self):
         self.transformer.train()
 
@@ -818,6 +845,8 @@ class Trainer:
         self.optimizer.zero_grad()
         accumulated_latent_losses = []
         accumulated_action_losses = []
+        accumulated_camera_losses = []
+        accumulated_depth_losses = []
 
         for batch_idx, batch in enumerate(self.train_loader):
             batch = self.convert_input_format(batch)
@@ -837,8 +866,10 @@ class Trainer:
             action_chunk = input_dict['pred_action_chunk_dict']['noisy_latents']  # [B, C_action, chunk_size]
             action_chunk = action_chunk.permute(0, 2, 1) # [B, chunk_size, C_action]
             timesteps = input_dict['pred_action_chunk_dict']['timesteps'][:, 0]
-            state_c = input_dict['pred_action_chunk_dict']['latent'][:, :, 0:1]  # [B, C_latent, 1]
-            state_c = state_c.permute(0, 2, 1)  # [B, 1, C_latent]
+            state_c = input_dict.get('state_c', None)
+            if state_c is None:
+                state_c = input_dict['pred_action_chunk_dict']['latent'][:, :, 0:1]  # [B, C_latent, 1]
+                state_c = state_c.permute(0, 2, 1)  # [B, 1, C_latent]
 
             action_pred = self.action_head(
                 action_chunk,
@@ -852,7 +883,22 @@ class Trainer:
             )
 
             action_loss = self.compute_loss(input_dict, action_pred)
-            loss = action_loss
+            if self.model_arch == "vga":
+                if self.enable_camera_loss or self.enable_depth_loss:
+                    camera_loss, depth_loss = self._compute_camera_depth_losses(batch, output)
+                else:
+                    zero = torch.zeros((), device=self.device, dtype=torch.float32)
+                    camera_loss, depth_loss = zero, zero
+
+                loss = (
+                    self.loss_weight_action * action_loss
+                    + self.loss_weight_camera * camera_loss
+                    + self.loss_weight_depth * depth_loss
+                )
+                accumulated_camera_losses.append((camera_loss / self.gradient_accumulation_steps).detach())
+                accumulated_depth_losses.append((depth_loss / self.gradient_accumulation_steps).detach())
+            else:
+                loss = action_loss
 
             loss.backward()
 
@@ -886,9 +932,20 @@ class Trainer:
                     latent_loss_show = 0.0
                     max_latent_loss_show = 0.0
 
+                if len(accumulated_camera_losses) > 0:
+                    camera_loss_show = dist_mean(torch.stack(accumulated_camera_losses).sum()).detach().cpu().item()
+                else:
+                    camera_loss_show = 0.0
+                if len(accumulated_depth_losses) > 0:
+                    depth_loss_show = dist_mean(torch.stack(accumulated_depth_losses).sum()).detach().cpu().item()
+                else:
+                    depth_loss_show = 0.0
+
                 # Clear accumulated losses
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
+                accumulated_camera_losses = []
+                accumulated_depth_losses = []
 
                 torch.cuda.synchronize()
                 if self.step % self.config.gc_interval == 0:
@@ -901,6 +958,8 @@ class Trainer:
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
                         'action_loss': f'{action_loss_show:.4f}',
+                        'camera_loss': f'{camera_loss_show:.4f}',
+                        'depth_loss': f'{depth_loss_show:.4f}',
                         'step': self.step,
                         'grad_norm': f'{total_norm.item():.2f}',
                         'lr': f'{lr:.2e}'
@@ -909,6 +968,8 @@ class Trainer:
                         self.wandb.log({
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
                             'loss_metrics/global_avg_action_loss': action_loss_show,
+                            'loss_metrics/global_avg_camera_loss': camera_loss_show,
+                            'loss_metrics/global_avg_depth_loss': depth_loss_show,
                             'loss_metrics/global_max_video_loss': max_latent_loss_show,
                             'loss_metrics/global_max_action_loss': max_action_loss_show,
                             'grad_norm': total_norm.item(),
@@ -935,10 +996,11 @@ class Trainer:
                 options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
             action_head_state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in action_head_state_dict.items()}
-            # optim_state = get_optimizer_state_dict(
-            #         self.transformer, self.optimizer,
-            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            #     )
+            optim_state = get_optimizer_state_dict(
+                self.transformer,
+                self.optimizer,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
 
             # Only rank 0 saves the checkpoint
             if self.config.rank == 0:
@@ -978,14 +1040,25 @@ class Trainer:
                 with open(action_head_config_file, 'w') as f:
                     json.dump(action_head_config_dict, f, indent=2)
 
-                # # Save optimizer state and training metadata in PyTorch format
-                # training_state_path = checkpoint_dir / "training_state.pt"
-                # logger.info(f"Saving training state to {training_state_path}")
-                # torch.save({
-                #     'step': self.step,
-                #     'optimizer_state_dict': optim_state,
-                #     'config': vars(self.config),
-                # }, training_state_path)
+                lora_state_dict = extract_lora_state_dict(self.transformer)
+                if lora_state_dict:
+                    lora_file = transformer_dir / "lora_weights.safetensors"
+                    logger.info(f"Saving LoRA delta to {lora_file}")
+                    save_file({k: v.to(torch.bfloat16) for k, v in lora_state_dict.items()}, lora_file)
+
+                plain_training_config = _to_plain_config(dict(vars(self.config)))
+                training_config_path = checkpoint_dir / "training_config.json"
+                logger.info(f"Saving training config to {training_config_path}")
+                with open(training_config_path, 'w') as f:
+                    json.dump(plain_training_config, f, indent=2)
+
+                training_state_path = checkpoint_dir / "training_state.pt"
+                logger.info(f"Saving training state to {training_state_path}")
+                torch.save({
+                    'step': self.step,
+                    'optimizer_state_dict': optim_state,
+                    'config': plain_training_config,
+                }, training_state_path)
 
                 logger.info(f"Checkpoint saved successfully at step {self.step}")
 

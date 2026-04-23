@@ -491,12 +491,16 @@ class LatentLeRobotDataset(LeRobotDataset):
             chunk_pad = torch.zeros((c_act, chunk_size - action_chunk.shape[-1]), dtype=action_chunk.dtype)
             action_chunk = torch.cat([action_chunk, chunk_pad], dim=1)
 
+        # Use the latest action token at sampled frame as one-frame robot state.
+        state = actions[:, data_timestep, -1, 0]  # [C_action]
+
         return {
             'images': images_window,
             'actions': actions_window,
             'images_mask': images_mask,
             'actions_mask': actions_mask,
             'action_chunk': action_chunk,
+            'state': state,
             'pred_frame_idx': torch.tensor(local_data_timestep, dtype=torch.long),
             'num_frames': torch.tensor(window_size, dtype=torch.long),
         }
