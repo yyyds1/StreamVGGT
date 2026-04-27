@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from diffusers.models.embeddings import PixArtAlphaTextProjection
 from huggingface_hub import PyTorchModelHubMixin
 from transformers.file_utils import ModelOutput
 
@@ -32,6 +33,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         chunk_size=24,
         num_image_views=1,
         image_frame_stride=8,
+        text_embed_dim=4096,
         rdt_img_cond_mode="full",
         rdt_img_pool_size=1,
         rdt_img_keep_summary_tokens=False,
@@ -50,6 +52,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         self.img_width = img_width
         self.num_image_views = num_image_views
         self.image_frame_stride = image_frame_stride
+        self.text_embed_dim = int(text_embed_dim)
 
         self.rdt_img_cond_mode = rdt_img_cond_mode
         self.rdt_img_pool_size = max(int(rdt_img_pool_size), 1)
@@ -76,6 +79,11 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             num_image_views=num_image_views,
             image_frame_stride=image_frame_stride,
         )
+        self.text_token_proj = PixArtAlphaTextProjection(
+            self.text_embed_dim,
+            embed_dim,
+            act_fn="gelu_tanh",
+        )
 
         self.enable_camera_depth_heads = bool(enable_camera_depth_heads)
         self.enable_camera_head = bool(enable_camera_head) and self.enable_camera_depth_heads
@@ -97,6 +105,18 @@ class VGA(nn.Module, PyTorchModelHubMixin):
 
         self.lora_replaced_modules = []
         self.lora_config = None
+
+    def _project_text_token(self, text_emb: Optional[torch.Tensor], dtype: torch.dtype) -> Optional[torch.Tensor]:
+        if text_emb is None:
+            return None
+        if text_emb.ndim == 2:
+            text_emb = text_emb.unsqueeze(1)
+        elif text_emb.ndim != 3:
+            raise ValueError(f"text_emb must be [B,D] or [B,L,D], got shape {tuple(text_emb.shape)}")
+
+        text_token = text_emb.mean(dim=1, keepdim=True)
+        text_token = self.text_token_proj(text_token)
+        return text_token.to(dtype=dtype)
 
     def enable_lora(
         self,
@@ -141,6 +161,17 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             return torch.cat([pooled, img_tokens], dim=2).reshape(bsz, seq_len * (n_tok + 1), dim)
         return pooled.reshape(bsz, seq_len, dim)
 
+    def _build_rdt_act_tokens(self, act_tokens: torch.Tensor) -> torch.Tensor:
+        # RDT act positional embedding expects `image_frame_stride` action tokens per frame.
+        tokens_per_frame = int(self.image_frame_stride)
+        if act_tokens.shape[2] < tokens_per_frame:
+            raise ValueError(
+                f"Not enough action tokens per frame: got {act_tokens.shape[2]}, "
+                f"expected at least {tokens_per_frame}"
+            )
+        act_tokens = act_tokens[:, :, :tokens_per_frame]
+        return act_tokens.reshape(act_tokens.shape[0], -1, act_tokens.shape[-1])
+
     def _extract_geometry_predictions(self, aggregated_tokens_list, images, patch_start_idx):
         geometry = {}
         if self.camera_head is not None:
@@ -179,11 +210,13 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         if image_mask is not None:
             images = images * image_mask
 
+        text_token = self._project_text_token(text_emb, dtype=images.dtype)
+
         images = images.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
 
         aggregated_tokens_list, token_idx = self.aggregator(
             images=images,
-            text_emb=text_emb,
+            text_emb=text_token,
             return_all_layers=True,
         )
 
@@ -203,7 +236,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         lang_tokens = rdt_tokens[:, :, token_idx["lang"][0] : token_idx["lang"][1]]
 
         img_tokens = self._build_rdt_img_tokens(img_tokens)
-        act_tokens = act_tokens.reshape(act_tokens.shape[0], -1, act_tokens.shape[-1])
+        act_tokens = self._build_rdt_act_tokens(act_tokens)
         lang_tokens = lang_tokens.reshape(lang_tokens.shape[0], -1, lang_tokens.shape[-1])
 
         rdt_img_tokens = img_tokens

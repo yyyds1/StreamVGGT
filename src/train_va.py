@@ -245,6 +245,7 @@ class Trainer:
             img_height=config.image_height,
             img_width=config.image_width,
             num_image_views=get_effective_num_image_views(self.config),
+            text_embed_dim=int(getattr(config, "text_embed_dim", 4096)),
             rdt_img_cond_mode=getattr(config, "rdt_img_cond_mode", "full"),
             rdt_img_pool_size=getattr(config, "rdt_img_pool_size", 1),
             rdt_img_keep_summary_tokens=getattr(config, "rdt_img_keep_summary_tokens", False),
@@ -271,6 +272,7 @@ class Trainer:
             "window_size": self.transformer.window_size,
             "chunk_size": self.transformer.chunk_size,
             "num_image_views": self.transformer.num_image_views,
+            "text_embed_dim": self.transformer.text_embed_dim,
             "rdt_img_cond_mode": self.transformer.rdt_img_cond_mode,
             "rdt_img_pool_size": self.transformer.rdt_img_pool_size,
             "rdt_img_keep_summary_tokens": self.transformer.rdt_img_keep_summary_tokens,
@@ -327,6 +329,7 @@ class Trainer:
         self.action_head.config = _to_plain_config({
             "horizon": rdt_horizon,
             "output_size": self.transformer.action_dim,
+            "text_embed_dim": int(getattr(config, "text_embed_dim", 4096)),
             "config": rdt_config,
             "x_pos_emb_config": rdt_x_pos_emb_config,
             "lang_pos_emb_config": None,
@@ -494,8 +497,8 @@ class Trainer:
         for name, param in self.transformer.named_parameters():
             total_params += param.numel()
             if self.use_lora:
-                if param.requires_grad:
-                    continue
+                should_train = ("lora_" in name) or name.endswith("action_query_tokens")
+                param.requires_grad = should_train
             else:
                 param.requires_grad = True
 
@@ -706,7 +709,7 @@ class Trainer:
         action_chunk_dict['noisy_latents'] = rearrange(action_chunk_dict['noisy_latents'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
         action_chunk_dict['latent'] = rearrange(action_chunk_dict['latent'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
 
-        # RDT expects language conditioning as token sequences [B, L_lang, D].
+        # Keep raw language conditioning for learned projection before RDT.
         if text_emb is not None:
             if text_emb.ndim == 2:
                 text_emb = text_emb.unsqueeze(1)
@@ -714,19 +717,6 @@ class Trainer:
                 raise ValueError(
                     f"text_emb must have shape [B, D] or [B, L, D], got {tuple(text_emb.shape)}"
                 )
-            rdt_hidden_size = int(self.config.rdt.hidden_size)
-            if text_emb.shape[-1] != rdt_hidden_size:
-                if not self._warned_lang_dim_mismatch and self.config.rank == 0:
-                    logger.warning(
-                        f"text_emb dim {text_emb.shape[-1]} != RDT hidden_size {rdt_hidden_size}; "
-                        "adapting via adaptive average pooling"
-                    )
-                    self._warned_lang_dim_mismatch = True
-                bsz, lang_len, _ = text_emb.shape
-                text_emb = torch.nn.functional.adaptive_avg_pool1d(
-                    text_emb.reshape(bsz * lang_len, 1, text_emb.shape[-1]),
-                    rdt_hidden_size,
-                ).reshape(bsz, lang_len, rdt_hidden_size)
         
         input_dict = {
             'image_dict': image_dict,
@@ -874,7 +864,7 @@ class Trainer:
             action_pred = self.action_head(
                 action_chunk,
                 timesteps,
-                lang_c=input_dict.get('lang_c', None),
+                lang_c=rdt_conds['rdt_lang_c'],
                 img_c=rdt_conds['rdt_img_c'],
                 act_c=rdt_conds['rdt_act_c'],
                 state_c=state_c,
@@ -996,8 +986,13 @@ class Trainer:
                 options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
             action_head_state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in action_head_state_dict.items()}
+            # Optimizer contains params from both modules; provide both for correct FQN<->param-id mapping.
+            optim_owner = torch.nn.ModuleDict({
+                "transformer": self.transformer,
+                "action_head": self.action_head,
+            })
             optim_state = get_optimizer_state_dict(
-                self.transformer,
+                optim_owner,
                 self.optimizer,
                 options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
@@ -1040,11 +1035,15 @@ class Trainer:
                 with open(action_head_config_file, 'w') as f:
                     json.dump(action_head_config_dict, f, indent=2)
 
-                lora_state_dict = extract_lora_state_dict(self.transformer)
+                lora_state_dict = {
+                    key: value.detach().to(dtype=torch.bfloat16, device="cpu").contiguous().clone()
+                    for key, value in state_dict.items()
+                    if "lora_" in key or key.endswith("action_query_tokens")
+                }
                 if lora_state_dict:
                     lora_file = transformer_dir / "lora_weights.safetensors"
                     logger.info(f"Saving LoRA delta to {lora_file}")
-                    save_file({k: v.to(torch.bfloat16) for k, v in lora_state_dict.items()}, lora_file)
+                    save_file(lora_state_dict, lora_file)
 
                 plain_training_config = _to_plain_config(dict(vars(self.config)))
                 training_config_path = checkpoint_dir / "training_config.json"
@@ -1092,8 +1091,13 @@ class Trainer:
         training_state = torch.load(training_state_path, map_location='cpu', weights_only=False)
 
         # All ranks load optimizer state (required for FSDP)
+        optim_owner = torch.nn.ModuleDict({
+            "transformer": self.transformer,
+            "action_head": self.action_head,
+        })
         set_optimizer_state_dict(
-            self.transformer, self.optimizer,
+            optim_owner,
+            self.optimizer,
             optim_state_dict=training_state['optimizer_state_dict'],
             options=StateDictOptions(full_state_dict=True, strict=False)
         )

@@ -9,18 +9,19 @@ va_vga_robotwin_cfg.update(va_robotwin_cfg)
 va_vga_robotwin_cfg.model_arch = "vga"
 va_vga_robotwin_cfg.dataset_type = "robotwin"
 va_vga_robotwin_cfg.streamvggt_pretrained = "/home/yds/code/StreamVGGT/ckpt/checkpoints.pth"
+va_vga_robotwin_cfg.text_embed_dim = 4096
 
 # VGA training script no longer uses ActionVGGT/RDT pretrained-resume switches.
-va_vga_robotwin_cfg.transformer_resume = False
-va_vga_robotwin_cfg.transformer_resume_from = None
+va_vga_robotwin_cfg.transformer_resume = True
+va_vga_robotwin_cfg.transformer_resume_from = '/home/yds/code/StreamVGGT/src/train_out/train_log_20260426_145202/ckpt/checkpoint_step_58000/transformer/diffusion_pytorch_model.safetensors'
 va_vga_robotwin_cfg.transformer_pretrained = None
 va_vga_robotwin_cfg.action_head_resume = False
-va_vga_robotwin_cfg.action_head_resume_from = None
-va_vga_robotwin_cfg.action_head_pretrained = None
+va_vga_robotwin_cfg.action_head_resume_from = '/home/yds/code/StreamVGGT/src/train_out/train_log_20260426_145202/ckpt/checkpoint_step_58000/action_head/diffusion_pytorch_model.safetensors'
+va_vga_robotwin_cfg.action_head_pretrained = '/home/yds/code/StreamVGGT/ckpt/RDT.pth'
 
 # LoRA settings for the pretrained VGA backbone.
 va_vga_robotwin_cfg.use_lora = True
-va_vga_robotwin_cfg.lora_rank = 8
+va_vga_robotwin_cfg.lora_rank = 64
 va_vga_robotwin_cfg.lora_alpha = 16.0
 va_vga_robotwin_cfg.lora_dropout = 0.05
 va_vga_robotwin_cfg.lora_target_modules = ("qkv", "proj", "fc1", "fc2")
