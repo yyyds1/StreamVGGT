@@ -30,10 +30,9 @@ va_robotwin_cfg.action_num_inference_steps = 50
 va_robotwin_cfg.multi_view_image_mode = 'vertical'
 va_robotwin_cfg.image_height = 224
 va_robotwin_cfg.image_width = 224
-va_robotwin_cfg.window_size = 3
 va_robotwin_cfg.chunk_size = 8
 va_robotwin_cfg.image_frame_stride = 4
-va_robotwin_cfg.actionvggt_depth = 12
+va_robotwin_cfg.actionvggt_depth = 24
 
 # Separate checkpoint controls
 # Priority per model in train_va.py:

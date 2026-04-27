@@ -438,8 +438,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
 
     def _sample_window_and_chunk(self, images, actions):
-        """Sample prediction timestep and return fixed-size window/chunk for stable batching."""
-        window_size = int(getattr(self.config, 'window_size', 1))
+        """Sample one frame and one future action chunk for VGA training."""
         chunk_size = int(getattr(self.config, 'chunk_size', 1))
 
         c_img, f_total, h, w = images.shape
@@ -450,7 +449,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             raise ValueError("No valid frames available after preprocessing")
 
         required_frames_for_chunk = max(1, (chunk_size + n - 1) // n)
-        min_t = max(window_size - 1, 0)
+        min_t = 0
         max_t = f_total - required_frames_for_chunk
 
         if max_t >= min_t:
@@ -459,29 +458,14 @@ class LatentLeRobotDataset(LeRobotDataset):
             data_timestep = max(0, f_total - 1)
 
         window_end = data_timestep + 1
-        window_start = max(0, window_end - window_size)
+        window_start = data_timestep
 
         images_window = images[:, window_start:window_end]
         actions_window = actions[:, window_start:window_end]
 
-        local_data_timestep = data_timestep - window_start
+        local_data_timestep = 0
         images_mask = torch.ones_like(images_window, dtype=torch.bool)
         actions_mask = torch.zeros_like(actions_window, dtype=torch.bool)
-        if local_data_timestep > 0:
-            actions_mask[:, :local_data_timestep] = True
-
-        pad_frames = window_size - images_window.shape[1]
-        if pad_frames > 0:
-            image_pad = torch.zeros((c_img, pad_frames, h, w), dtype=images_window.dtype)
-            action_pad = torch.zeros((c_act, pad_frames, n, one), dtype=actions_window.dtype)
-            image_mask_pad = torch.zeros_like(image_pad, dtype=torch.bool)
-            action_mask_pad = torch.zeros_like(action_pad, dtype=torch.bool)
-
-            images_window = torch.cat([image_pad, images_window], dim=1)
-            actions_window = torch.cat([action_pad, actions_window], dim=1)
-            images_mask = torch.cat([image_mask_pad, images_mask], dim=1)
-            actions_mask = torch.cat([action_mask_pad, actions_mask], dim=1)
-            local_data_timestep += pad_frames
 
         action_flat = rearrange(actions, 'c f n 1 -> c (f n)')
         chunk_start = data_timestep * n
@@ -502,7 +486,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             'action_chunk': action_chunk,
             'state': state,
             'pred_frame_idx': torch.tensor(local_data_timestep, dtype=torch.long),
-            'num_frames': torch.tensor(window_size, dtype=torch.long),
+            'num_frames': torch.tensor(1, dtype=torch.long),
         }
 
     def __getitem__(self, idx) -> dict:

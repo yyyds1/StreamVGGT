@@ -12,7 +12,7 @@ va_vga_robotwin_cfg.streamvggt_pretrained = "/home/yds/code/StreamVGGT/ckpt/chec
 va_vga_robotwin_cfg.text_embed_dim = 4096
 
 # VGA training script no longer uses ActionVGGT/RDT pretrained-resume switches.
-va_vga_robotwin_cfg.transformer_resume = True
+va_vga_robotwin_cfg.transformer_resume = False
 va_vga_robotwin_cfg.transformer_resume_from = '/home/yds/code/StreamVGGT/src/train_out/train_log_20260426_145202/ckpt/checkpoint_step_58000/transformer/diffusion_pytorch_model.safetensors'
 va_vga_robotwin_cfg.transformer_pretrained = None
 va_vga_robotwin_cfg.action_head_resume = False

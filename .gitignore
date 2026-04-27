@@ -23,3 +23,5 @@ src/train_out**/**
 src/train_out/**
 
 src/logs/**
+
+dataset/

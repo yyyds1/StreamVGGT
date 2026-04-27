@@ -13,6 +13,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 from safetensors.torch import load_file
+from safetensors import safe_open
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -118,6 +119,21 @@ def _adapt_rdt_state_for_depth(state, target_depth):
     return adapted
 
 
+CHECKPOINT_SUCCESS_MARKER = "_SUCCESS"
+
+
+def _is_valid_safetensors(path):
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    try:
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            _ = list(f.keys())
+        return True
+    except Exception:
+        return False
+
+
 def _resize_1d_positional_embedding(src_emb, dst_emb):
     if src_emb.ndim != 3 or dst_emb.ndim != 3:
         return None
@@ -168,7 +184,7 @@ class VA_Server:
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
 
-        self.window_size = int(getattr(job_config, "window_size", 4))
+        self.num_input_frames = 1
         self.chunk_size = int(getattr(job_config, "chunk_size", 24))
         self.image_frame_stride = int(getattr(job_config, "image_frame_stride", 8))
         self.action_dim = int(job_config.action_dim)
@@ -202,7 +218,7 @@ class VA_Server:
             rdt_img_cond_mode=getattr(job_config, "rdt_img_cond_mode", "full"),
             rdt_img_pool_size=getattr(job_config, "rdt_img_pool_size", 1),
             rdt_img_keep_summary_tokens=getattr(job_config, "rdt_img_keep_summary_tokens", False),
-            window_size=self.window_size,
+            window_size=self.num_input_frames,
             chunk_size=self.chunk_size,
             action_dim=self.action_dim,
             aggregator_depth=int(getattr(job_config, "actionvggt_depth", 24)),
@@ -228,20 +244,20 @@ class VA_Server:
             img_tokens_per_frame = pooled_tokens_per_view * effective_num_image_views
             if self.transformer.rdt_img_keep_summary_tokens:
                 img_tokens_per_frame += effective_num_image_views
-                rdt_img_pos_emb_config = [("image", self.window_size * img_tokens_per_frame)]
+                rdt_img_pos_emb_config = [("image", self.num_input_frames * img_tokens_per_frame)]
             else:
                 rdt_img_pos_emb_config = [
-                    ("image", (self.window_size * effective_num_image_views, pooled_patch_h, pooled_patch_w))
+                    ("image", (self.num_input_frames * effective_num_image_views, pooled_patch_h, pooled_patch_w))
                 ]
         else:
             img_tokens_per_frame = patch_h * patch_w * effective_num_image_views
             rdt_img_pos_emb_config = [
-                ("image", (self.window_size * effective_num_image_views, patch_h, patch_w))
+                ("image", (self.num_input_frames * effective_num_image_views, patch_h, patch_w))
             ]
 
         rdt_horizon = self.chunk_size
         rdt_x_pos_emb_config = [("act", rdt_horizon + self.job_config.rdt.num_register_tokens)]
-        rdt_act_pos_emb_config = [("action", (self.window_size, self.image_frame_stride))]
+        rdt_act_pos_emb_config = [("action", (self.num_input_frames, self.image_frame_stride))]
 
         self.action_head = RDT(
             horizon=rdt_horizon,
@@ -251,9 +267,9 @@ class VA_Server:
             lang_pos_emb_config=None,
             max_lang_len=0,
             img_pos_emb_config=rdt_img_pos_emb_config,
-            max_img_len=self.window_size * img_tokens_per_frame,
+            max_img_len=self.num_input_frames * img_tokens_per_frame,
             act_pos_emb_config=rdt_act_pos_emb_config,
-            max_act_len=self.window_size * self.image_frame_stride,
+            max_act_len=self.num_input_frames * self.image_frame_stride,
             dtype=self.dtype,
         )
         self.action_head.to(self.device)
@@ -274,11 +290,21 @@ class VA_Server:
 
     def _load_checkpoint_state(self, path):
         if str(path).endswith(".safetensors"):
-            return load_file(path, device=str(self.device))
+            try:
+                return load_file(path, device=str(self.device))
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load safetensors checkpoint: {path}") from exc
         state = torch.load(path, map_location=self.device)
         if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
             return state["state_dict"]
         return state
+
+    def _is_complete_checkpoint_dir(self, checkpoint_dir):
+        checkpoint_dir = Path(checkpoint_dir)
+        marker = checkpoint_dir / CHECKPOINT_SUCCESS_MARKER
+        transformer_path = checkpoint_dir / "transformer" / "diffusion_pytorch_model.safetensors"
+        action_head_path = checkpoint_dir / "action_head" / "diffusion_pytorch_model.safetensors"
+        return marker.exists() and _is_valid_safetensors(transformer_path) and _is_valid_safetensors(action_head_path)
 
     def _resize_pos_embed_tensor(self, src_pos_embed, dst_pos_embed):
         if src_pos_embed.ndim != 3 or dst_pos_embed.ndim != 3:
@@ -341,8 +367,7 @@ class VA_Server:
     def _resolve_latest_ckpt(self, root_dir, subdir_name):
         ckpt_dir = Path(root_dir)
         pattern = re.compile(r"checkpoint_step_(\d+)$")
-        latest = None
-        latest_step = -1
+        candidates = []
         if ckpt_dir.exists():
             print(f"Looking for checkpoints in {ckpt_dir}")
             for p in ckpt_dir.rglob("checkpoint_step_*"):
@@ -351,22 +376,35 @@ class VA_Server:
                 m = pattern.match(p.name)
                 if not m:
                     continue
-                step = int(m.group(1))
-                if step > latest_step:
-                    latest_step = step
-                    latest = p
-        if latest is None:
-            return None
-        return latest / subdir_name / "diffusion_pytorch_model.safetensors"
+                candidates.append((int(m.group(1)), p))
+
+        for _, checkpoint_dir in sorted(candidates, key=lambda x: x[0], reverse=True):
+            if not self._is_complete_checkpoint_dir(checkpoint_dir):
+                continue
+            candidate = checkpoint_dir / subdir_name / "diffusion_pytorch_model.safetensors"
+            if _is_valid_safetensors(candidate):
+                return candidate
+        return None
 
     def _load_checkpoints(self):
         transformer_path = None
+        ckpt_root = getattr(self.job_config, "ckpt_root", None)
         if getattr(self.job_config, "transformer_resume", False):
             transformer_resume_from = getattr(self.job_config, "transformer_resume_from", None)
             if transformer_resume_from:
-                transformer_path = Path(transformer_resume_from)
+                candidate = Path(transformer_resume_from)
+                if _is_valid_safetensors(candidate):
+                    transformer_path = candidate
+                else:
+                    logger.warning(f"Configured transformer resume checkpoint is invalid/corrupt: {candidate}")
             else:
-                transformer_path = self._resolve_latest_ckpt(self.job_config.ckpt_root, "transformer")
+                if ckpt_root:
+                    transformer_path = self._resolve_latest_ckpt(ckpt_root, "transformer")
+            if transformer_path is None and ckpt_root:
+                fallback = self._resolve_latest_ckpt(ckpt_root, "transformer")
+                if fallback is not None:
+                    logger.warning(f"Falling back to latest valid transformer checkpoint: {fallback}")
+                    transformer_path = fallback
         if transformer_path is None:
             transformer_pretrained = getattr(self.job_config, "transformer_pretrained", None)
             transformer_path = Path(transformer_pretrained) if transformer_pretrained else None
@@ -383,9 +421,19 @@ class VA_Server:
         if getattr(self.job_config, "action_head_resume", False):
             action_head_resume_from = getattr(self.job_config, "action_head_resume_from", None)
             if action_head_resume_from:
-                action_head_path = Path(action_head_resume_from)
+                candidate = Path(action_head_resume_from)
+                if _is_valid_safetensors(candidate):
+                    action_head_path = candidate
+                else:
+                    logger.warning(f"Configured action-head resume checkpoint is invalid/corrupt: {candidate}")
             else:
-                action_head_path = self._resolve_latest_ckpt(self.job_config.ckpt_root, "action_head")
+                if ckpt_root:
+                    action_head_path = self._resolve_latest_ckpt(ckpt_root, "action_head")
+            if action_head_path is None and ckpt_root:
+                fallback = self._resolve_latest_ckpt(ckpt_root, "action_head")
+                if fallback is not None:
+                    logger.warning(f"Falling back to latest valid action-head checkpoint: {fallback}")
+                    action_head_path = fallback
         if action_head_path is None:
             action_head_pretrained = getattr(self.job_config, "action_head_pretrained", None)
             action_head_path = Path(action_head_pretrained) if action_head_pretrained else None
@@ -404,10 +452,7 @@ class VA_Server:
     def _reset_runtime_buffers(self, prompt=None):
         self.prompt = prompt
         self.runtime_text_emb = None
-        self.frame_history = []
         self.action_history = []
-        self.rdt_img_cond_history = []
-        self.rdt_act_cond_history = []
         self.transformer_past_key_values = [None] * self.transformer.aggregator.depth
         self.frame_st_id = 0
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
@@ -418,7 +463,7 @@ class VA_Server:
         if not isinstance(past_key_values, (list, tuple)):
             return past_key_values
 
-        max_frames = max(int(self.window_size), 1)
+        max_frames = 1
         trimmed = []
         for block_kv in past_key_values:
             if (
@@ -500,28 +545,19 @@ class VA_Server:
 
     def _build_model_input(self, current_obs):
         current_frames = self._preprocess_obs_to_frames([current_obs])
-        combined_frames = self.frame_history + current_frames
-        combined_frames = combined_frames[-self.window_size:]
-
-        num_real = len(combined_frames)
-        if num_real < self.window_size:
-            pad_frames = [torch.zeros_like(current_frames[0]) for _ in range(self.window_size - num_real)]
-            combined_frames = pad_frames + combined_frames
-
-        images = torch.stack(combined_frames, dim=0).unsqueeze(0).to(self.device, dtype=self.dtype)
-        image_mask = torch.zeros_like(images, dtype=torch.bool)
-        image_mask[:, :, -num_real:] = True
+        images = torch.stack(current_frames[-1:], dim=0).unsqueeze(0).to(self.device, dtype=self.dtype)
+        image_mask = torch.ones_like(images, dtype=torch.bool)
 
         actions = torch.zeros(
-            (1, self.action_dim, self.window_size, self.image_frame_stride, 1),
+            (1, self.action_dim, self.num_input_frames, self.image_frame_stride, 1),
             device=self.device,
             dtype=self.dtype,
         )
         actions_mask = torch.zeros_like(actions, dtype=torch.bool)
 
-        past_actions = self.action_history[-(self.window_size - 1):]
+        past_actions = self.action_history[-(self.num_input_frames - 1):]
         for i, action_frame in enumerate(past_actions):
-            target_idx = self.window_size - 1 - len(past_actions) + i
+            target_idx = self.num_input_frames - 1 - len(past_actions) + i
             frame_action = action_frame
             if frame_action.shape[1] != self.image_frame_stride:
                 frame_action = F.interpolate(
@@ -548,7 +584,7 @@ class VA_Server:
         image_grid_id = image_grid_id[None].repeat(b, 1, 1)
 
         action_grid_id = get_mesh_id(
-            self.window_size,
+            self.num_input_frames,
             self.image_frame_stride,
             1,
             t=1,
@@ -573,7 +609,7 @@ class VA_Server:
         pred_action_chunk_dict = {
             "noised_latent": torch.zeros((1, self.action_dim, self.chunk_size), device=self.device, dtype=self.dtype),
             "timesteps": torch.zeros((1,), device=self.device, dtype=torch.float32),
-            "pred_frame_idx": torch.full((1,), self.window_size - 1, device=self.device, dtype=torch.long),
+            "pred_frame_idx": torch.zeros((1,), device=self.device, dtype=torch.long),
             "latent": torch.zeros((1, self.action_dim, self.chunk_size), device=self.device, dtype=self.dtype),
         }
 
@@ -581,7 +617,6 @@ class VA_Server:
             "image_dict": image_dict,
             "action_dict": action_dict,
             "pred_action_chunk_dict": pred_action_chunk_dict,
-            "window_size": self.window_size,
             "chunk_size": self.chunk_size,
         }
 
@@ -632,36 +667,18 @@ class VA_Server:
         with torch.cuda.amp.autocast(enabled=False):
             transformer_out = self.transformer.inference(
                 [frame_payload],
-                past_key_values=self.transformer_past_key_values,
+                past_key_values=None,
             )
         conds = transformer_out.ress
-        if "past_key_values" in conds:
-            self.transformer_past_key_values = self._trim_transformer_kv_cache(conds["past_key_values"])
         return conds
 
     def _append_rdt_condition_history(self, conds):
-        self.rdt_img_cond_history.append(conds["rdt_img_c"])
-        self.rdt_act_cond_history.append(conds["rdt_act_c"])
-        self.rdt_img_cond_history = self.rdt_img_cond_history[-self.window_size:]
-        self.rdt_act_cond_history = self.rdt_act_cond_history[-self.window_size:]
+        del conds
 
-    def _build_windowed_rdt_conds(self):
-        if len(self.rdt_img_cond_history) == 0 or len(self.rdt_act_cond_history) == 0:
-            raise RuntimeError("RDT condition history is empty")
-
-        img_hist = list(self.rdt_img_cond_history)
-        act_hist = list(self.rdt_act_cond_history)
-
-        if len(img_hist) < self.window_size:
-            img_pad = [torch.zeros_like(img_hist[0]) for _ in range(self.window_size - len(img_hist))]
-            img_hist = img_pad + img_hist
-        if len(act_hist) < self.window_size:
-            act_pad = [torch.zeros_like(act_hist[0]) for _ in range(self.window_size - len(act_hist))]
-            act_hist = act_pad + act_hist
-
+    def _build_windowed_rdt_conds(self, frame_conds):
         return {
-            "rdt_img_c": torch.cat(img_hist, dim=1).to(self.device, dtype=self.dtype),
-            "rdt_act_c": torch.cat(act_hist, dim=1).to(self.device, dtype=self.dtype),
+            "rdt_img_c": frame_conds["rdt_img_c"].to(self.device, dtype=self.dtype),
+            "rdt_act_c": frame_conds["rdt_act_c"].to(self.device, dtype=self.dtype),
         }
 
     def _predict_actions(self, current_obs):
@@ -669,8 +686,7 @@ class VA_Server:
             current_frames = self._preprocess_obs_to_frames([current_obs])
             frame_tensor = current_frames[-1].to(self.device, dtype=self.dtype)
             frame_conds = self._update_transformer_cache_with_frame(frame_tensor)
-            self._append_rdt_condition_history(frame_conds)
-            conds = self._build_windowed_rdt_conds()
+            conds = self._build_windowed_rdt_conds(frame_conds)
             action_head_dtype = next(self.action_head.parameters()).dtype
             conds_img_c = conds["rdt_img_c"].to(self.device, dtype=action_head_dtype)
             conds_act_c = conds["rdt_act_c"].to(self.device, dtype=action_head_dtype)
@@ -697,7 +713,6 @@ class VA_Server:
 
             timesteps = self.train_scheduler_action.timesteps.to(self.device)
             for i, t in enumerate(timesteps):
-                last_step = i == len(timesteps) - 1
                 x_in = rearrange(action_sample, "b c f n 1 -> b (f n) c").to(self.device, dtype=action_head_dtype)
                 t_batch = torch.full((x_in.shape[0],), float(t.item()), device=self.device, dtype=torch.float32)
                 noise_pred = self.action_head(
@@ -710,8 +725,7 @@ class VA_Server:
                     decode_output=True,
                 )
                 noise_pred = rearrange(noise_pred, "b (f n) c -> b c f n 1", f=self.pred_frames, n=self.tokens_per_frame)
-                if not last_step:
-                    action_sample = self.train_scheduler_action.step(noise_pred, t, action_sample)
+                action_sample = self.train_scheduler_action.step(noise_pred, t, action_sample)
 
         action_sample[:, ~self.action_mask.to(action_sample.device)] *= 0
         return self.postprocess_action(action_sample)
@@ -742,22 +756,13 @@ class VA_Server:
             merged_frames = self._preprocess_obs_to_frames(key_frames) if len(key_frames) > 0 else []
             num_action_frames = 0 if action_state_norm is None else int(action_state_norm.shape[1])
 
-            for i, frame in enumerate(merged_frames):
-                frame_tensor = frame.to(self.device, dtype=self.dtype)
-                frame_conds = self._update_transformer_cache_with_frame(frame_tensor)
-                self._append_rdt_condition_history(frame_conds)
-                self.frame_history.append(frame)
-                self.frame_history = self.frame_history[-(self.window_size - 1):]
+            if len(merged_frames) > 0:
+                frame_tensor = merged_frames[-1].to(self.device, dtype=self.dtype)
+                _ = self._update_transformer_cache_with_frame(frame_tensor)
                 self.frame_st_id += 1
 
-                if action_state_norm is not None and i < num_action_frames:
-                    self.action_history.append(action_state_norm[:, i])
-                    self.action_history = self.action_history[-(self.window_size - 1):]
-
-            if action_state_norm is not None and num_action_frames > len(merged_frames):
-                for i in range(len(merged_frames), num_action_frames):
-                    self.action_history.append(action_state_norm[:, i])
-                    self.action_history = self.action_history[-(self.window_size - 1):]
+            if action_state_norm is not None and num_action_frames > 0:
+                self.action_history = [action_state_norm[:, num_action_frames - 1]]
             return {}
 
         current_obs = obs.get("obs", None)
@@ -770,11 +775,8 @@ class VA_Server:
 
         logger.info("################# Infer One Chunk (ActionVGGT + RDT) #################")
         action = self._predict_actions(current_obs)
-        self.frame_history.extend(self._preprocess_obs_to_frames([current_obs]))
-        self.frame_history = self.frame_history[-(self.window_size - 1):]
         action_state_norm = self.preprocess_action(action)[0, :, :, :, 0].float()
-        self.action_history.append(action_state_norm[:, 0])
-        self.action_history = self.action_history[-(self.window_size - 1):]
+        self.action_history = [action_state_norm[:, 0]]
         self.frame_st_id += 1
         return {"action": action}
 

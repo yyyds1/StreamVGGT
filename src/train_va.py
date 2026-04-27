@@ -4,6 +4,7 @@ import math
 import os
 import sys
 import re
+import shutil
 from pathlib import Path
 
 from datetime import datetime
@@ -25,6 +26,7 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
 )
 from safetensors.torch import save_file, load_file
+from safetensors import safe_open
 import json
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -76,6 +78,80 @@ def _to_plain_config(value):
     if isinstance(value, torch.dtype):
         return str(value)
     return value
+
+
+CHECKPOINT_SUCCESS_MARKER = "_SUCCESS"
+
+
+def _atomic_json_dump(payload, dst_path):
+    dst_path = Path(dst_path)
+    tmp_path = dst_path.with_name(f".{dst_path.name}.tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, dst_path)
+
+
+def _atomic_torch_save(payload, dst_path):
+    dst_path = Path(dst_path)
+    tmp_path = dst_path.with_name(f".{dst_path.name}.tmp")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, dst_path)
+
+
+def _is_valid_safetensors(path):
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    try:
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            _ = list(f.keys())
+        return True
+    except Exception:
+        return False
+
+
+def _atomic_safetensors_save(state_dict, dst_path):
+    dst_path = Path(dst_path)
+    tmp_path = dst_path.with_name(f".{dst_path.name}.tmp")
+    save_file(state_dict, str(tmp_path))
+    if not _is_valid_safetensors(tmp_path):
+        raise RuntimeError(f"Saved invalid safetensors artifact: {tmp_path}")
+    os.replace(tmp_path, dst_path)
+
+
+def _is_complete_checkpoint_dir(checkpoint_dir):
+    checkpoint_dir = Path(checkpoint_dir)
+    marker = checkpoint_dir / CHECKPOINT_SUCCESS_MARKER
+    transformer_path = checkpoint_dir / "transformer" / "diffusion_pytorch_model.safetensors"
+    action_head_path = checkpoint_dir / "action_head" / "diffusion_pytorch_model.safetensors"
+    training_state_path = checkpoint_dir / "training_state.pt"
+    return (
+        marker.exists()
+        and _is_valid_safetensors(transformer_path)
+        and _is_valid_safetensors(action_head_path)
+        and training_state_path.exists()
+    )
+
+
+def _find_latest_valid_checkpoint_dir(ckpt_root):
+    ckpt_root = Path(ckpt_root)
+    if not ckpt_root.exists():
+        return None
+
+    pattern = re.compile(r"checkpoint_step_(\d+)$")
+    candidates = []
+    for p in ckpt_root.glob("checkpoint_step_*"):
+        if not p.is_dir():
+            continue
+        m = pattern.match(p.name)
+        if not m:
+            continue
+        candidates.append((int(m.group(1)), p))
+
+    for _, checkpoint_dir in sorted(candidates, key=lambda x: x[0], reverse=True):
+        if _is_complete_checkpoint_dir(checkpoint_dir):
+            return checkpoint_dir
+    return None
 
 
 def _extract_modulelist_indices_from_state(state, prefix):
@@ -250,7 +326,7 @@ class Trainer:
             rdt_img_pool_size=getattr(config, "rdt_img_pool_size", 1),
             rdt_img_keep_summary_tokens=getattr(config, "rdt_img_keep_summary_tokens", False),
             aggregator_depth=int(getattr(config, "actionvggt_depth", 24)),
-            window_size=int(getattr(config, "window_size", 4)),
+            window_size=1,
             chunk_size=int(getattr(config, "chunk_size", 24)),
             action_dim=int(getattr(config, "action_dim", 30)),
             image_frame_stride=int(getattr(config, "image_frame_stride", 8)),
@@ -269,7 +345,6 @@ class Trainer:
             "patch_size": self.transformer.patch_size,
             "embed_dim": self.transformer.embed_dim,
             "action_dim": self.transformer.action_dim,
-            "window_size": self.transformer.window_size,
             "chunk_size": self.transformer.chunk_size,
             "num_image_views": self.transformer.num_image_views,
             "text_embed_dim": self.transformer.text_embed_dim,
@@ -288,6 +363,7 @@ class Trainer:
         self.transformer.to(self.device)
 
         rdt_config = config.rdt
+        num_input_frames = 1
         effective_num_image_views = get_effective_num_image_views(self.config)
         patch_h = self.transformer.img_height // self.transformer.patch_size
         patch_w = self.transformer.img_width // self.transformer.patch_size
@@ -298,20 +374,20 @@ class Trainer:
             img_tokens_per_frame = pooled_tokens_per_view * effective_num_image_views
             if self.transformer.rdt_img_keep_summary_tokens:
                 img_tokens_per_frame += effective_num_image_views
-                rdt_img_pos_emb_config = [("image", self.config.window_size * img_tokens_per_frame)]
+                rdt_img_pos_emb_config = [("image", num_input_frames * img_tokens_per_frame)]
             else:
                 rdt_img_pos_emb_config = [
-                    ("image", (self.config.window_size * effective_num_image_views, pooled_patch_h, pooled_patch_w))
+                    ("image", (num_input_frames * effective_num_image_views, pooled_patch_h, pooled_patch_w))
                 ]
         else:
             img_tokens_per_frame = patch_h * patch_w * effective_num_image_views
             rdt_img_pos_emb_config = [
-                ("image", (self.config.window_size * effective_num_image_views, patch_h, patch_w))
+                ("image", (num_input_frames * effective_num_image_views, patch_h, patch_w))
             ]
         act_tokens_per_frame = self.config.image_frame_stride
         rdt_horizon = self.config.chunk_size
         rdt_x_pos_emb_config = [("act", rdt_horizon + self.config.rdt.num_register_tokens)]
-        rdt_act_pos_emb_config = [("action", (self.config.window_size, act_tokens_per_frame))]
+        rdt_act_pos_emb_config = [("action", (num_input_frames, act_tokens_per_frame))]
 
         self.action_head = RDT(
             horizon=rdt_horizon,
@@ -321,9 +397,9 @@ class Trainer:
             lang_pos_emb_config=None,
             max_lang_len=0,
             img_pos_emb_config=rdt_img_pos_emb_config,
-            max_img_len=self.config.window_size * img_tokens_per_frame,
+            max_img_len=num_input_frames * img_tokens_per_frame,
             act_pos_emb_config=rdt_act_pos_emb_config,
-            max_act_len=self.config.window_size * act_tokens_per_frame,
+            max_act_len=num_input_frames * act_tokens_per_frame,
             dtype=self.dtype,
         )
         self.action_head.config = _to_plain_config({
@@ -335,16 +411,19 @@ class Trainer:
             "lang_pos_emb_config": None,
             "max_lang_len": 0,
             "img_pos_emb_config": rdt_img_pos_emb_config,
-            "max_img_len": self.config.window_size * img_tokens_per_frame,
+            "max_img_len": num_input_frames * img_tokens_per_frame,
             "act_pos_emb_config": rdt_act_pos_emb_config,
-            "max_act_len": self.config.window_size * act_tokens_per_frame,
+            "max_act_len": num_input_frames * act_tokens_per_frame,
             "dtype": self.dtype,
         })
         self.action_head.to(self.device)
 
         def _load_checkpoint_state(path):
             if str(path).endswith('.safetensors'):
-                return load_file(path, device=str(self.device))
+                try:
+                    return load_file(path, device=str(self.device))
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to load safetensors checkpoint: {path}") from exc
             state = torch.load(path, map_location=self.device)
             if isinstance(state, dict):
                 for top_key in ('state_dict', 'model_state_dict', 'model'):
@@ -446,6 +525,19 @@ class Trainer:
         if getattr(config, "transformer_resume", False) and transformer_resume_from:
             transformer_resume_from = Path(transformer_resume_from)
             self._resume_checkpoint_dir = transformer_resume_from.parent.parent
+            if not _is_complete_checkpoint_dir(self._resume_checkpoint_dir):
+                fallback_dir = _find_latest_valid_checkpoint_dir(self._resume_checkpoint_dir.parent)
+                if fallback_dir is None:
+                    raise RuntimeError(
+                        f"Requested resume checkpoint is incomplete/corrupt and no valid fallback found under "
+                        f"{self._resume_checkpoint_dir.parent}: {self._resume_checkpoint_dir}"
+                    )
+                logger.warning(
+                    f"Requested resume checkpoint is incomplete/corrupt: {self._resume_checkpoint_dir}. "
+                    f"Falling back to latest valid checkpoint: {fallback_dir}"
+                )
+                self._resume_checkpoint_dir = fallback_dir
+                transformer_resume_from = self._resume_checkpoint_dir / "transformer" / "diffusion_pytorch_model.safetensors"
             logger.info(f"Resuming VGA transformer from {transformer_resume_from}")
             transformer_state = _load_checkpoint_state(transformer_resume_from)
             transformer_state = _adapt_transformer_state_for_resolution(self.transformer, transformer_state)
@@ -558,7 +650,11 @@ class Trainer:
         self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_action.set_timesteps(1000, training=True)
 
-        self.save_dir = Path(config.save_root) / datetime.now().strftime("train_log_%Y%m%d_%H%M%S") / "ckpt" # Add timestamp YYMMDD_HHMMSS to save directory
+        if self._resume_checkpoint_dir is not None:
+            self.save_dir = self._resume_checkpoint_dir.parent
+            logger.info(f"Resumed run will continue writing checkpoints under existing root: {self.save_dir}")
+        else:
+            self.save_dir = Path(config.save_root) / datetime.now().strftime("train_log_%Y%m%d_%H%M%S") / "ckpt" # Add timestamp YYMMDD_HHMMSS to save directory
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
@@ -724,7 +820,6 @@ class Trainer:
             'pred_action_chunk_dict': action_chunk_dict,
             'lang_c': text_emb,
             'chunk_size': chunk_size,
-            'window_size': F,
         }
         if 'state' in batch_dict:
             state = batch_dict['state']
@@ -975,6 +1070,8 @@ class Trainer:
 
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""
+        checkpoint_dir = None
+        checkpoint_tmp_dir = None
         try:
             state_dict = get_model_state_dict(
                 self.transformer,
@@ -1000,10 +1097,20 @@ class Trainer:
             # Only rank 0 saves the checkpoint
             if self.config.rank == 0:
                 checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
-                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                checkpoint_tmp_dir = self.save_dir / f".checkpoint_step_{self.step}.tmp"
+
+                if checkpoint_tmp_dir.exists():
+                    shutil.rmtree(checkpoint_tmp_dir)
+                checkpoint_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+                if checkpoint_dir.exists() and _is_complete_checkpoint_dir(checkpoint_dir):
+                    logger.warning(f"Checkpoint already complete, skipping save: {checkpoint_dir}")
+                    if dist.is_initialized():
+                        dist.barrier()
+                    return
 
                 # Save transformer in the same format as pretrained model
-                transformer_dir = checkpoint_dir / "transformer"
+                transformer_dir = checkpoint_tmp_dir / "transformer"
                 transformer_dir.mkdir(parents=True, exist_ok=True)
 
                 logger.info(f"Saving transformer to {transformer_dir}")
@@ -1011,29 +1118,27 @@ class Trainer:
                 # Manually save in diffusers format (outside FSDP context to avoid deadlock)
                 # Save model weights
                 model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
-                save_file(state_dict_bf16, model_file)
+                _atomic_safetensors_save(state_dict_bf16, model_file)
 
                 # Save config (copy from original transformer config and update _name_or_path)
                 config_file = transformer_dir / "config.json"
                 config_dict = dict(self.transformer.config)
                 config_dict.pop('_name_or_path', None)
-                with open(config_file, 'w') as f:
-                    json.dump(config_dict, f, indent=2)
+                _atomic_json_dump(config_dict, config_file)
 
                 # Save action head in the same format as pretrained model
-                action_head_dir = checkpoint_dir / "action_head"
+                action_head_dir = checkpoint_tmp_dir / "action_head"
                 action_head_dir.mkdir(parents=True, exist_ok=True)
 
                 logger.info(f"Saving action head to {action_head_dir}")
 
                 action_head_file = action_head_dir / "diffusion_pytorch_model.safetensors"
-                save_file(action_head_state_dict_bf16, action_head_file)
+                _atomic_safetensors_save(action_head_state_dict_bf16, action_head_file)
 
                 action_head_config_file = action_head_dir / "config.json"
                 action_head_config_dict = dict(self.action_head.config)
                 action_head_config_dict.pop('_name_or_path', None)
-                with open(action_head_config_file, 'w') as f:
-                    json.dump(action_head_config_dict, f, indent=2)
+                _atomic_json_dump(action_head_config_dict, action_head_config_file)
 
                 lora_state_dict = {
                     key: value.detach().to(dtype=torch.bfloat16, device="cpu").contiguous().clone()
@@ -1043,21 +1148,32 @@ class Trainer:
                 if lora_state_dict:
                     lora_file = transformer_dir / "lora_weights.safetensors"
                     logger.info(f"Saving LoRA delta to {lora_file}")
-                    save_file(lora_state_dict, lora_file)
+                    _atomic_safetensors_save(lora_state_dict, lora_file)
 
                 plain_training_config = _to_plain_config(dict(vars(self.config)))
-                training_config_path = checkpoint_dir / "training_config.json"
+                training_config_path = checkpoint_tmp_dir / "training_config.json"
                 logger.info(f"Saving training config to {training_config_path}")
-                with open(training_config_path, 'w') as f:
-                    json.dump(plain_training_config, f, indent=2)
+                _atomic_json_dump(plain_training_config, training_config_path)
 
-                training_state_path = checkpoint_dir / "training_state.pt"
+                training_state_path = checkpoint_tmp_dir / "training_state.pt"
                 logger.info(f"Saving training state to {training_state_path}")
-                torch.save({
+                _atomic_torch_save({
                     'step': self.step,
                     'optimizer_state_dict': optim_state,
                     'config': plain_training_config,
                 }, training_state_path)
+
+                _atomic_json_dump(
+                    {
+                        "step": int(self.step),
+                        "created_at": datetime.utcnow().isoformat() + "Z",
+                    },
+                    checkpoint_tmp_dir / CHECKPOINT_SUCCESS_MARKER,
+                )
+
+                if checkpoint_dir.exists():
+                    shutil.rmtree(checkpoint_dir)
+                os.replace(checkpoint_tmp_dir, checkpoint_dir)
 
                 logger.info(f"Checkpoint saved successfully at step {self.step}")
 
@@ -1070,6 +1186,8 @@ class Trainer:
                 logger.error(f"Failed to save checkpoint: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
+                if checkpoint_tmp_dir is not None and Path(checkpoint_tmp_dir).exists():
+                    shutil.rmtree(checkpoint_tmp_dir, ignore_errors=True)
             # Ensure all processes stay synchronized even on error
             if dist.is_initialized():
                 dist.barrier()
@@ -1088,7 +1206,10 @@ class Trainer:
             logger.info(f"Loading training state from {training_state_path}")
 
         # All ranks load the training state directly
-        training_state = torch.load(training_state_path, map_location='cpu', weights_only=False)
+        try:
+            training_state = torch.load(training_state_path, map_location='cpu', weights_only=False)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load training_state.pt from {training_state_path}") from exc
 
         # All ranks load optimizer state (required for FSDP)
         optim_owner = torch.nn.ModuleDict({
