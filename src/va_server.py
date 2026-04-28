@@ -229,6 +229,17 @@ class VA_Server:
                 enable_camera_depth_heads=bool(getattr(job_config, "enable_geometry_heads_eval", False)),
                 **common_kwargs,
             )
+            if getattr(job_config, "use_lora", False):
+                lora_rank = int(getattr(job_config, "lora_rank", 8))
+                lora_alpha = float(getattr(job_config, "lora_alpha", 16.0))
+                lora_dropout = float(getattr(job_config, "lora_dropout", 0.05))
+                lora_target_modules = tuple(getattr(job_config, "lora_target_modules", ("qkv", "proj", "fc1", "fc2")))
+                self.transformer.enable_lora(
+                    rank=lora_rank,
+                    alpha=lora_alpha,
+                    dropout=lora_dropout,
+                    target_modules=lora_target_modules,
+                )
         else:
             self.transformer = ActionVGGT(**common_kwargs)
         self.transformer.to(self.device)
@@ -415,7 +426,7 @@ class VA_Server:
         logger.info(f"Loading transformer checkpoint from: {transformer_path}")
         transformer_state = self._load_checkpoint_state(transformer_path)
         transformer_state = self._adapt_transformer_state_for_resolution(self.transformer, transformer_state)
-        logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
+        logger.info(self.transformer.load_state_dict(transformer_state, strict=True))
 
         action_head_path = None
         if getattr(self.job_config, "action_head_resume", False):
