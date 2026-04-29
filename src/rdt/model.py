@@ -40,7 +40,7 @@ class RDT(nn.Module):
             RDTBlock(layer_idx, config=config)
             for layer_idx in range(self.depth)
         ])
-        # self.final_layer = FinalLayer(output_size, config=config)
+        self.final_layer = FinalLayer(output_size, config=config)
 
         # Append learnable tokens to the input action sequence
         self.num_register_tokens = config.get(
@@ -79,7 +79,6 @@ class RDT(nn.Module):
             1, self.horizon + self.num_register_tokens, self.hidden_size))
         
         self.action_embedder = nn.Linear(config["action_dim"], self.hidden_size)
-        self.action_decoder = nn.Linear(self.hidden_size, config["action_dim"])
 
         self.initialize_weights()
 
@@ -142,10 +141,10 @@ class RDT(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers
-        # nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        # nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        # nn.init.constant_(self.final_layer.ffn.fc2.weight, 0)
-        # nn.init.constant_(self.final_layer.ffn.fc2.bias, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.ffn.fc2.weight, 0)
+        nn.init.constant_(self.final_layer.ffn.fc2.bias, 0)
 
         # Move all the params to given data type
         self.to(self.dtype)
@@ -249,6 +248,6 @@ class RDT(nn.Module):
         x = x[:, :-self.num_register_tokens]
 
         if decode_output:
-            x = self.action_decoder(x)
+            x = self.final_layer(x, t)
 
         return x

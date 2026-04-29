@@ -303,6 +303,8 @@ class Trainer:
         self.loss_weight_camera = float(getattr(config, "loss_weight_camera", 0.0))
         self.loss_weight_depth = float(getattr(config, "loss_weight_depth", 0.0))
         self.loss_weight_action = float(getattr(config, "loss_weight_action", 1.0))
+        self.state_noise_std = float(getattr(config, "state_noise_std", 0.0))
+        self.state_noise_clip = bool(getattr(config, "state_noise_clip", True))
         self.use_lora = bool(getattr(config, "use_lora", True))
         self.lora_rank = int(getattr(config, "lora_rank", 8))
         self.lora_alpha = float(getattr(config, "lora_alpha", 16.0))
@@ -675,7 +677,7 @@ class Trainer:
         noise = torch.zeros_like(latent).normal_()
         timesteps = train_scheduler.timesteps[timestep_ids].to(device=self.device)
         noisy_latents = train_scheduler.add_noise(latent, noise, timesteps, t_dim=0)
-        targets =train_scheduler.training_target(latent, noise, timesteps)
+        targets = train_scheduler.training_target(latent, noise, timesteps)
 
         patch_f, patch_h, patch_w = self.patch_size
         if action_mode:
@@ -955,6 +957,10 @@ class Trainer:
             if state_c is None:
                 state_c = input_dict['pred_action_chunk_dict']['latent'][:, :, 0:1]  # [B, C_latent, 1]
                 state_c = state_c.permute(0, 2, 1)  # [B, 1, C_latent]
+            if self.state_noise_std > 0.0:
+                state_c = state_c + torch.randn_like(state_c) * self.state_noise_std
+                if self.state_noise_clip:
+                    state_c = state_c.clamp(-1.0, 1.0)
 
             action_pred = self.action_head(
                 action_chunk,

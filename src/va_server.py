@@ -6,6 +6,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -296,8 +297,88 @@ class VA_Server:
         self.actions_q01 = torch.tensor(self.job_config.norm_stat["q01"], dtype=torch.float32).reshape(-1, 1, 1)
         self.actions_q99 = torch.tensor(self.job_config.norm_stat["q99"], dtype=torch.float32).reshape(-1, 1, 1)
         self.action_norm_method = self.job_config.action_norm_method
+        self._text_emb_cache = {}
+        self._text_emb_search_files = None
 
         self._reset_runtime_buffers(prompt=None)
+
+    def _normalize_prompt_text(self, prompt: Optional[str]) -> Optional[str]:
+        if prompt is None:
+            return None
+        return str(prompt).strip()
+
+    def _get_dataset_root(self) -> Optional[Path]:
+        dataset_path = getattr(self.job_config, "dataset_path", None)
+        if dataset_path:
+            root = Path(dataset_path)
+            if root.exists():
+                return root
+        fallback = Path(__file__).resolve().parent.parent / "dataset"
+        if fallback.exists():
+            return fallback
+        return None
+
+    def _build_text_emb_search_files(self):
+        if self._text_emb_search_files is not None:
+            return
+        self._text_emb_search_files = []
+
+        dataset_root = self._get_dataset_root()
+        if dataset_root is None:
+            logger.warning("No dataset root found for text embedding lookup.")
+            return
+
+        cam_key = self.job_config.obs_cam_keys[0]
+        pattern = f"**/latents/chunk-*/{cam_key}/episode_*.pth"
+        self._text_emb_search_files = sorted(dataset_root.glob(pattern))
+        logger.info(
+            f"Prepared text embedding search index with {len(self._text_emb_search_files)} latent files "
+            f"from {dataset_root}"
+        )
+
+    def _resolve_text_emb_from_dataset(self, prompt: Optional[str]) -> Optional[torch.Tensor]:
+        prompt_norm = self._normalize_prompt_text(prompt)
+        if not prompt_norm:
+            return None
+
+        if prompt_norm in self._text_emb_cache:
+            return self._text_emb_cache[prompt_norm]
+
+        self._build_text_emb_search_files()
+        for latent_file in self._text_emb_search_files:
+            try:
+                payload = torch.load(latent_file, map_location="cpu", weights_only=False)
+            except Exception:
+                continue
+
+            if not isinstance(payload, dict):
+                continue
+
+            text = self._normalize_prompt_text(payload.get("text", None))
+            if text != prompt_norm:
+                continue
+
+            text_emb = payload.get("text_emb", None)
+            if text_emb is None:
+                continue
+            if not torch.is_tensor(text_emb):
+                text_emb = torch.as_tensor(text_emb)
+            if text_emb.ndim == 2:
+                text_emb = text_emb.unsqueeze(0)
+            elif text_emb.ndim != 3:
+                continue
+
+            text_emb = text_emb.to(dtype=self.dtype, device=self.device)
+            self._text_emb_cache[prompt_norm] = text_emb
+            logger.info(f"Loaded text embedding for prompt from {latent_file}")
+            return text_emb
+
+        logger.warning(
+            f"No matching dataset text embedding found for prompt: {prompt_norm!r}. "
+            "Eval will fall back to no-language conditioning."
+        )
+        self._text_emb_cache[prompt_norm] = None
+        return None
 
     def _load_checkpoint_state(self, path):
         if str(path).endswith(".safetensors"):
@@ -462,7 +543,7 @@ class VA_Server:
 
     def _reset_runtime_buffers(self, prompt=None):
         self.prompt = prompt
-        self.runtime_text_emb = None
+        self.runtime_text_emb = self._resolve_text_emb_from_dataset(prompt)
         self.action_history = []
         self.transformer_past_key_values = [None] * self.transformer.aggregator.depth
         self.frame_st_id = 0
@@ -673,7 +754,7 @@ class VA_Server:
             "actions": action_state[:, :, 0, :, 0],
             "image_grid_id": image_grid_id,
             "action_grid_id": action_grid_id,
-            "text_emb": None,
+            "text_emb": self.runtime_text_emb,
         }
         with torch.cuda.amp.autocast(enabled=False):
             transformer_out = self.transformer.inference(
@@ -687,10 +768,13 @@ class VA_Server:
         del conds
 
     def _build_windowed_rdt_conds(self, frame_conds):
-        return {
+        conds = {
             "rdt_img_c": frame_conds["rdt_img_c"].to(self.device, dtype=self.dtype),
             "rdt_act_c": frame_conds["rdt_act_c"].to(self.device, dtype=self.dtype),
         }
+        if "rdt_lang_c" in frame_conds and frame_conds["rdt_lang_c"] is not None:
+            conds["rdt_lang_c"] = frame_conds["rdt_lang_c"].to(self.device, dtype=self.dtype)
+        return conds
 
     def _predict_actions(self, current_obs):
         with torch.no_grad():
@@ -717,7 +801,8 @@ class VA_Server:
                         mode="linear",
                         align_corners=False,
                     )[0]
-                state_c = last_state[:, :1].unsqueeze(0).permute(0, 2, 1).to(self.device, dtype=self.dtype)
+                # Match training: use the latest action token as one-step robot state.
+                state_c = last_state[:, -1:].unsqueeze(0).permute(0, 2, 1).to(self.device, dtype=self.dtype)
             else:
                 state_c = torch.zeros((1, 1, self.action_dim), device=self.device, dtype=self.dtype)
             state_c = state_c.to(self.device, dtype=action_head_dtype)
@@ -729,6 +814,7 @@ class VA_Server:
                 noise_pred = self.action_head(
                     x_in,
                     t_batch,
+                    lang_c=conds.get("rdt_lang_c", None),
                     img_c=conds_img_c,
                     act_c=conds_act_c,
                     state_c=state_c,
@@ -746,6 +832,10 @@ class VA_Server:
         reset = obs.get("reset", False)
         prompt = obs.get("prompt", None)
         compute_kv_cache = obs.get("compute_kv_cache", False)
+
+        if (self.runtime_text_emb is None) and prompt is not None:
+            self.prompt = prompt
+            self.runtime_text_emb = self._resolve_text_emb_from_dataset(prompt)
 
         if reset:
             logger.info("******************* Reset server ******************")
@@ -787,7 +877,8 @@ class VA_Server:
         logger.info("################# Infer One Chunk (ActionVGGT + RDT) #################")
         action = self._predict_actions(current_obs)
         action_state_norm = self.preprocess_action(action)[0, :, :, :, 0].float()
-        self.action_history = [action_state_norm[:, 0]]
+        # Keep the newest predicted frame in history.
+        self.action_history = [action_state_norm[:, -1]]
         self.frame_st_id += 1
         return {"action": action}
 
