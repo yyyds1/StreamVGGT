@@ -192,6 +192,12 @@ class VA_Server:
         self.patch_size = tuple(getattr(job_config, "patch_size", (1, 14, 14)))
         self.multi_view_image_mode = getattr(job_config, "multi_view_image_mode", "vertical")
         self.model_arch = str(getattr(job_config, "model_arch", "actionvggt")).lower()
+        self.state_condition_mode = str(getattr(job_config, "state_condition_mode", "latest")).lower()
+        if self.state_condition_mode not in {"latest", "episode_initial", "null"}:
+            raise ValueError(
+                f"Unsupported state_condition_mode `{self.state_condition_mode}`. "
+                "Expected one of {'latest', 'episode_initial', 'null'}."
+            )
 
         self.image_height = int(getattr(job_config, "image_height", job_config.height))
         self.image_width = int(getattr(job_config, "image_width", job_config.width))
@@ -545,6 +551,7 @@ class VA_Server:
         self.prompt = prompt
         self.runtime_text_emb = self._resolve_text_emb_from_dataset(prompt)
         self.action_history = []
+        self.episode_initial_state = None
         self.transformer_past_key_values = [None] * self.transformer.aggregator.depth
         self.frame_st_id = 0
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
@@ -801,8 +808,13 @@ class VA_Server:
                         mode="linear",
                         align_corners=False,
                     )[0]
-                # Match training: use the latest action token as one-step robot state.
-                state_c = last_state[:, -1:].unsqueeze(0).permute(0, 2, 1).to(self.device, dtype=self.dtype)
+                if self.state_condition_mode == "episode_initial" and self.episode_initial_state is not None:
+                    state_c = self.episode_initial_state.to(self.device, dtype=self.dtype)
+                elif self.state_condition_mode == "null":
+                    state_c = torch.zeros((1, 1, self.action_dim), device=self.device, dtype=self.dtype)
+                else:
+                    # Match training "latest": use the latest action token as one-step robot state.
+                    state_c = last_state[:, -1:].unsqueeze(0).permute(0, 2, 1).to(self.device, dtype=self.dtype)
             else:
                 state_c = torch.zeros((1, 1, self.action_dim), device=self.device, dtype=self.dtype)
             state_c = state_c.to(self.device, dtype=action_head_dtype)
@@ -864,6 +876,9 @@ class VA_Server:
 
             if action_state_norm is not None and num_action_frames > 0:
                 self.action_history = [action_state_norm[:, num_action_frames - 1]]
+                self.episode_initial_state = action_state_norm[:, 0:1].unsqueeze(0).permute(0, 2, 1).to(
+                    self.device, dtype=self.dtype
+                )
             return {}
 
         current_obs = obs.get("obs", None)
@@ -879,6 +894,10 @@ class VA_Server:
         action_state_norm = self.preprocess_action(action)[0, :, :, :, 0].float()
         # Keep the newest predicted frame in history.
         self.action_history = [action_state_norm[:, -1]]
+        if self.episode_initial_state is None:
+            self.episode_initial_state = action_state_norm[:, 0:1].unsqueeze(0).permute(0, 2, 1).to(
+                self.device, dtype=self.dtype
+            )
         self.frame_st_id += 1
         return {"action": action}
 

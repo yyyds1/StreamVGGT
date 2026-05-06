@@ -154,6 +154,26 @@ def _find_latest_valid_checkpoint_dir(ckpt_root):
     return None
 
 
+def _find_latest_valid_checkpoint_from_save_root(save_root):
+    save_root = Path(save_root)
+    if not save_root.exists():
+        return None
+
+    # Preferred layout: <save_root>/train_log_YYYYMMDD_HHMMSS/ckpt/checkpoint_step_*
+    ckpt_roots = sorted(
+        [p / "ckpt" for p in save_root.glob("train_log_*/") if (p / "ckpt").is_dir()],
+        key=lambda p: p.parent.name,
+        reverse=True,
+    )
+    for ckpt_root in ckpt_roots:
+        latest = _find_latest_valid_checkpoint_dir(ckpt_root)
+        if latest is not None:
+            return latest
+
+    # Fallback: support direct checkpoint_step_* under save_root.
+    return _find_latest_valid_checkpoint_dir(save_root)
+
+
 def _extract_modulelist_indices_from_state(state, prefix):
     pattern = re.compile(rf"^{re.escape(prefix)}\.(\d+)\.")
     indices = set()
@@ -305,6 +325,12 @@ class Trainer:
         self.loss_weight_action = float(getattr(config, "loss_weight_action", 1.0))
         self.state_noise_std = float(getattr(config, "state_noise_std", 0.0))
         self.state_noise_clip = bool(getattr(config, "state_noise_clip", True))
+        self.state_condition_mode = str(getattr(config, "state_condition_mode", "latest")).lower()
+        if self.state_condition_mode not in {"latest", "episode_initial", "null"}:
+            raise ValueError(
+                f"Unsupported state_condition_mode `{self.state_condition_mode}`. "
+                "Expected one of {'latest', 'episode_initial', 'null'}."
+            )
         self.use_lora = bool(getattr(config, "use_lora", True))
         self.lora_rank = int(getattr(config, "lora_rank", 8))
         self.lora_alpha = float(getattr(config, "lora_alpha", 16.0))
@@ -499,6 +525,8 @@ class Trainer:
         transformer_resume_from = getattr(config, "transformer_resume_from", None)
         action_head_resume_from = getattr(config, "action_head_resume_from", None)
         self._resume_checkpoint_dir = None
+        self._transformer_resume_checkpoint_dir = None
+        self._action_head_resume_checkpoint_dir = None
 
         logger.info(f"Initializing VGA from StreamVGGT checkpoint: {streamvggt_pretrained}")
         transformer_state = _load_checkpoint_state(streamvggt_pretrained)
@@ -524,37 +552,89 @@ class Trainer:
                     f"dropout={self.lora_dropout}, modules={len(lora_modules)}"
                 )
 
-        if getattr(config, "transformer_resume", False) and transformer_resume_from:
-            transformer_resume_from = Path(transformer_resume_from)
-            self._resume_checkpoint_dir = transformer_resume_from.parent.parent
-            if not _is_complete_checkpoint_dir(self._resume_checkpoint_dir):
-                fallback_dir = _find_latest_valid_checkpoint_dir(self._resume_checkpoint_dir.parent)
-                if fallback_dir is None:
-                    raise RuntimeError(
-                        f"Requested resume checkpoint is incomplete/corrupt and no valid fallback found under "
-                        f"{self._resume_checkpoint_dir.parent}: {self._resume_checkpoint_dir}"
+        # --- Transformer init / resume policy ---
+        if getattr(config, "transformer_resume", False):
+            if transformer_resume_from is not None:
+                transformer_resume_from = Path(transformer_resume_from)
+                self._transformer_resume_checkpoint_dir = transformer_resume_from.parent.parent
+                if not _is_complete_checkpoint_dir(self._transformer_resume_checkpoint_dir):
+                    fallback_dir = _find_latest_valid_checkpoint_dir(self._transformer_resume_checkpoint_dir.parent)
+                    if fallback_dir is None:
+                        raise RuntimeError(
+                            f"Requested transformer resume checkpoint is incomplete/corrupt and no valid fallback found under "
+                            f"{self._transformer_resume_checkpoint_dir.parent}: {self._transformer_resume_checkpoint_dir}"
+                        )
+                    logger.warning(
+                        f"Requested transformer resume checkpoint is incomplete/corrupt: {self._transformer_resume_checkpoint_dir}. "
+                        f"Falling back to latest valid checkpoint: {fallback_dir}"
                     )
-                logger.warning(
-                    f"Requested resume checkpoint is incomplete/corrupt: {self._resume_checkpoint_dir}. "
-                    f"Falling back to latest valid checkpoint: {fallback_dir}"
-                )
-                self._resume_checkpoint_dir = fallback_dir
-                transformer_resume_from = self._resume_checkpoint_dir / "transformer" / "diffusion_pytorch_model.safetensors"
-            logger.info(f"Resuming VGA transformer from {transformer_resume_from}")
+                    self._transformer_resume_checkpoint_dir = fallback_dir
+            else:
+                self._transformer_resume_checkpoint_dir = _find_latest_valid_checkpoint_from_save_root(config.save_root)
+                if self._transformer_resume_checkpoint_dir is None:
+                    raise RuntimeError(
+                        f"transformer_resume=True but no valid checkpoint found under save_root={config.save_root}"
+                    )
+
+            transformer_resume_from = (
+                self._transformer_resume_checkpoint_dir / "transformer" / "diffusion_pytorch_model.safetensors"
+            )
+            logger.info(
+                f"Transformer init method: resume | checkpoint={transformer_resume_from}"
+            )
             transformer_state = _load_checkpoint_state(transformer_resume_from)
             transformer_state = _adapt_transformer_state_for_resolution(self.transformer, transformer_state)
             logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
 
-            lora_state_path = self._resume_checkpoint_dir / "transformer" / "lora_weights.safetensors"
+            self._resume_checkpoint_dir = self._transformer_resume_checkpoint_dir
+            lora_state_path = self._transformer_resume_checkpoint_dir / "transformer" / "lora_weights.safetensors"
             if lora_state_path.exists():
                 logger.info(f"Loading LoRA delta from {lora_state_path}")
                 lora_state = _load_checkpoint_state(lora_state_path)
                 logger.info(load_lora_state_dict(self.transformer, lora_state, strict=False))
-        elif self.use_lora and self.config.rank == 0:
-            logger.info("No transformer resume checkpoint configured; starting LoRA from pretrained backbone.")
+        else:
+            logger.info(
+                f"Transformer init method: pretrained | checkpoint={streamvggt_pretrained}"
+            )
+            if self.use_lora and self.config.rank == 0:
+                logger.info("No transformer resume checkpoint configured; starting LoRA from pretrained backbone.")
 
-        if self.config.rank == 0:
-            logger.info("Initializing RDT action head from scratch (no pretrained load).")
+        # --- Action head init / resume policy ---
+        if getattr(config, "action_head_resume", False):
+            if action_head_resume_from is not None:
+                action_head_resume_from = Path(action_head_resume_from)
+                self._action_head_resume_checkpoint_dir = action_head_resume_from.parent.parent
+                if not _is_complete_checkpoint_dir(self._action_head_resume_checkpoint_dir):
+                    fallback_dir = _find_latest_valid_checkpoint_dir(self._action_head_resume_checkpoint_dir.parent)
+                    if fallback_dir is None:
+                        raise RuntimeError(
+                            f"Requested action_head resume checkpoint is incomplete/corrupt and no valid fallback found under "
+                            f"{self._action_head_resume_checkpoint_dir.parent}: {self._action_head_resume_checkpoint_dir}"
+                        )
+                    logger.warning(
+                        f"Requested action_head resume checkpoint is incomplete/corrupt: {self._action_head_resume_checkpoint_dir}. "
+                        f"Falling back to latest valid checkpoint: {fallback_dir}"
+                    )
+                    self._action_head_resume_checkpoint_dir = fallback_dir
+            else:
+                self._action_head_resume_checkpoint_dir = _find_latest_valid_checkpoint_from_save_root(config.save_root)
+                if self._action_head_resume_checkpoint_dir is None:
+                    raise RuntimeError(
+                        f"action_head_resume=True but no valid checkpoint found under save_root={config.save_root}"
+                    )
+
+            action_head_resume_from = (
+                self._action_head_resume_checkpoint_dir / "action_head" / "diffusion_pytorch_model.safetensors"
+            )
+            logger.info(
+                f"Action head init method: resume | checkpoint={action_head_resume_from}"
+            )
+            action_head_state = _load_checkpoint_state(action_head_resume_from)
+            logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
+            if self._resume_checkpoint_dir is None:
+                self._resume_checkpoint_dir = self._action_head_resume_checkpoint_dir
+        else:
+            logger.info("Action head init method: scratch")
 
         if config.gradient_checkpointing:
             logger.info("Enabling activation checkpointing on transformer and action head...")
@@ -660,14 +740,11 @@ class Trainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
-        if getattr(config, "transformer_resume", False) and self._resume_checkpoint_dir is not None:
-            self._load_training_state(self._resume_checkpoint_dir)
-            action_head_resume_from = action_head_resume_from or (self._resume_checkpoint_dir / "action_head" / "diffusion_pytorch_model.safetensors")
-        if getattr(config, "action_head_resume", False) and action_head_resume_from:
-            action_head_resume_from = Path(action_head_resume_from)
-            logger.info(f"Resuming action head from {action_head_resume_from}")
-            action_head_state = _load_checkpoint_state(action_head_resume_from)
-            logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
+        if getattr(config, "transformer_resume", False) and self._transformer_resume_checkpoint_dir is not None:
+            logger.info(
+                f"Loading optimizer/scheduler training state from: {self._transformer_resume_checkpoint_dir / 'training_state.pt'}"
+            )
+            self._load_training_state(self._transformer_resume_checkpoint_dir)
     
     @torch.no_grad()
     def _add_noise(self, latent, train_scheduler, action_mask=False, action_mode=False, noisy_cond_prob=0.):
@@ -823,6 +900,8 @@ class Trainer:
             'lang_c': text_emb,
             'chunk_size': chunk_size,
         }
+        episode_initial_state = actions[:, :, 0, 0, 0]  # [B, C_action], first token of current sequence
+        input_dict['episode_initial_state_c'] = episode_initial_state.unsqueeze(1)  # [B, 1, C_action]
         if 'state' in batch_dict:
             state = batch_dict['state']
             if state.ndim == 2:
@@ -953,10 +1032,22 @@ class Trainer:
             action_chunk = input_dict['pred_action_chunk_dict']['noisy_latents']  # [B, C_action, chunk_size]
             action_chunk = action_chunk.permute(0, 2, 1) # [B, chunk_size, C_action]
             timesteps = input_dict['pred_action_chunk_dict']['timesteps'][:, 0]
-            state_c = input_dict.get('state_c', None)
-            if state_c is None:
-                state_c = input_dict['pred_action_chunk_dict']['latent'][:, :, 0:1]  # [B, C_latent, 1]
-                state_c = state_c.permute(0, 2, 1)  # [B, 1, C_latent]
+            if self.state_condition_mode == "null":
+                state_c = torch.zeros(
+                    (action_chunk.shape[0], 1, self.transformer.action_dim),
+                    device=self.device,
+                    dtype=action_chunk.dtype,
+                )
+            elif self.state_condition_mode == "episode_initial":
+                state_c = input_dict.get('episode_initial_state_c', None)
+                if state_c is None:
+                    state_c = input_dict['pred_action_chunk_dict']['latent'][:, :, 0:1]  # [B, C_latent, 1]
+                    state_c = state_c.permute(0, 2, 1)  # [B, 1, C_latent]
+            else:
+                state_c = input_dict.get('state_c', None)
+                if state_c is None:
+                    state_c = input_dict['pred_action_chunk_dict']['latent'][:, :, 0:1]  # [B, C_latent, 1]
+                    state_c = state_c.permute(0, 2, 1)  # [B, 1, C_latent]
             if self.state_noise_std > 0.0:
                 state_c = state_c + torch.randn_like(state_c) * self.state_noise_std
                 if self.state_noise_clip:
@@ -1217,21 +1308,36 @@ class Trainer:
         except Exception as exc:
             raise RuntimeError(f"Failed to load training_state.pt from {training_state_path}") from exc
 
-        # All ranks load optimizer state (required for FSDP)
+        # All ranks load optimizer state (required for FSDP when param groups match).
         optim_owner = torch.nn.ModuleDict({
             "transformer": self.transformer,
             "action_head": self.action_head,
         })
-        set_optimizer_state_dict(
-            optim_owner,
-            self.optimizer,
-            optim_state_dict=training_state['optimizer_state_dict'],
-            options=StateDictOptions(full_state_dict=True, strict=False)
-        )
+        optimizer_loaded = True
+        try:
+            set_optimizer_state_dict(
+                optim_owner,
+                self.optimizer,
+                optim_state_dict=training_state['optimizer_state_dict'],
+                options=StateDictOptions(full_state_dict=True, strict=False)
+            )
+        except Exception as exc:
+            optimizer_loaded = False
+            if self.config.rank == 0:
+                logger.warning(
+                    "Failed to load optimizer state from checkpoint. "
+                    "This usually means parameter groups changed (e.g., LoRA config mismatch). "
+                    "Continuing with freshly initialized optimizer.\n"
+                    f"Reason: {exc}"
+                )
+
         self.step = training_state.get('step', 0)
 
         if self.config.rank == 0:
-            logger.info(f"Training state loaded, resuming from step {self.step}")
+            if optimizer_loaded:
+                logger.info(f"Training state loaded (model + optimizer), resuming from step {self.step}")
+            else:
+                logger.info(f"Training state partially loaded (model only), resuming from step {self.step}")
 
         # Synchronize all ranks
         if dist.is_initialized():
