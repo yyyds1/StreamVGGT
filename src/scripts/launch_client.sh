@@ -20,8 +20,10 @@ train_config_name=0
 model_name=0
 seed=0
 HOST='127.0.0.1'
-PORT=29056
+PORT=29055
 HEADLESS=${HEADLESS:-1}
+SINGLE_TRAJECTORY=${SINGLE_TRAJECTORY:-"1"}
+SINGLE_TRAJECTORY_EPISODE_INDEX=${SINGLE_TRAJECTORY_EPISODE_INDEX:-"12"}
 
 headless_flag=""
 if [[ "${HEADLESS}" == "1" ]]; then
@@ -31,6 +33,8 @@ fi
 PYTHONWARNINGS=ignore::UserWarning \
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_client_openpi --config policy/$policy_name/deploy_policy.yml \
   ${headless_flag} \
+    $(if [ "${SINGLE_TRAJECTORY}" = "1" ]; then printf '%s' "--single_trajectory"; fi) \
+    $(if [ -n "${SINGLE_TRAJECTORY_EPISODE_INDEX}" ]; then printf '%s' "--single_trajectory_episode_index ${SINGLE_TRAJECTORY_EPISODE_INDEX}"; fi) \
     --host ${HOST} \
     --port ${PORT} \
     --overrides \
@@ -45,5 +49,4 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_cli
     --video_guidance_scale 5 \
     --action_guidance_scale 1 \
     --test_num 100
-
 

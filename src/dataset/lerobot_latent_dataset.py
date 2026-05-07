@@ -166,7 +166,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
         self._hf_action_view = self.hf_dataset.with_format(
-            columns=['action'],
+            columns=['action', 'observation.state'],
             output_all_columns=False,
         )
         self.parse_meta()
@@ -238,7 +238,20 @@ class LatentLeRobotDataset(LeRobotDataset):
             action_tensor = actions
         else:
             action_tensor = torch.as_tensor(np.asarray(actions))
-        return {'action': action_tensor}
+
+        states = batch.get('observation.state', None)
+        if states is not None:
+            if isinstance(states, torch.Tensor):
+                state_tensor = states
+            else:
+                state_tensor = torch.as_tensor(np.asarray(states))
+        else:
+            state_tensor = None
+
+        out = {'action': action_tensor}
+        if state_tensor is not None:
+            out['observation.state'] = state_tensor
+        return out
 
     def _flatten_latent_dict(self, latent_dict):
         out = {}
@@ -458,7 +471,34 @@ class LatentLeRobotDataset(LeRobotDataset):
         action_aligned *= action_mask_aligned
         return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
 
-    def _sample_window_and_chunk(self, images, actions):
+    def _state_post_process(self, local_start_frame, local_end_frame, image_frame_ids, state):
+        del local_end_frame
+        if state is None:
+            return None
+
+        act_shift = int(image_frame_ids[0] - local_start_frame)
+        state = state[act_shift:]
+        left_state = get_relative_pose(state[:, :7])
+        right_state = get_relative_pose(state[:, 8:15])
+        state = np.concatenate([left_state, state[:, 7:8], right_state, state[:, 15:16]], axis=1)
+
+        image_frame_num = (len(image_frame_ids) - 1) // self.config.image_frame_stride + 1
+        state = state[::self.config.image_frame_stride][:image_frame_num]
+        if state.shape[0] < image_frame_num:
+            pad = np.repeat(state[-1:], image_frame_num - state.shape[0], axis=0)
+            state = np.concatenate([state, pad], axis=0)
+
+        state_padded = np.pad(state, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+        state_aligned = state_padded[:, self.config.inverse_used_action_channel_ids]
+        state_aligned = (state_aligned - self.q01) / (
+                self.q99 - self.q01 + 1e-6) * 2. - 1.
+
+        state_mask = np.zeros((self.config.action_dim,), dtype=bool)
+        state_mask[self.config.used_action_channel_ids] = True
+        state_aligned *= state_mask[None]
+        return torch.from_numpy(state_aligned).float().transpose(0, 1)  # [C_action, F]
+
+    def _sample_window_and_chunk(self, images, actions, states=None):
         """Sample one frame and one future action chunk for VGA training."""
         chunk_size = int(getattr(self.config, 'chunk_size', 1))
 
@@ -496,8 +536,11 @@ class LatentLeRobotDataset(LeRobotDataset):
             chunk_pad = torch.zeros((c_act, chunk_size - action_chunk.shape[-1]), dtype=action_chunk.dtype)
             action_chunk = torch.cat([action_chunk, chunk_pad], dim=1)
 
-        # Use the latest action token at sampled frame as one-frame robot state.
-        state = actions[:, data_timestep, -1, 0]  # [C_action]
+        if states is not None:
+            state = states[:, data_timestep]
+        else:
+            # Fallback for legacy datasets without observation.state.
+            state = actions[:, data_timestep, -1, 0]  # [C_action]
 
         return {
             'images': images_window,
@@ -547,6 +590,12 @@ class LatentLeRobotDataset(LeRobotDataset):
             image_frame_ids,
             ori_data_dict['action'],
         )
+        out_dict['state_seq'] = self._state_post_process(
+            local_start_frame,
+            local_end_frame,
+            image_frame_ids,
+            ori_data_dict.get('observation.state', None),
+        )
         out_dict['actions'], out_dict['actions_mask'] = self._align_actions_with_multi_view_mode(
             out_dict['actions'],
             out_dict['actions_mask'],
@@ -556,6 +605,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         sampled_dict = self._sample_window_and_chunk(
             images=out_dict['images'],
             actions=out_dict['actions'],
+            states=out_dict.get('state_seq', None),
         )
         sampled_dict['text_emb'] = out_dict['text_emb']
 

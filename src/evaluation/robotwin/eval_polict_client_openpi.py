@@ -43,6 +43,9 @@ from pathlib import Path
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
 
 
+DATASET_ROOT = Path("/home/yds/code/StreamVGGT/dataset")
+
+
 def configure_headless_sapien_renderer() -> None:
     """Force a non-raytracing renderer path for headless stability.
 
@@ -411,6 +414,7 @@ def main(usr_args):
 
     print(f"Connecting to policy server at ws://{usr_args.get('host', '127.0.0.1')}:{usr_args['port']} ...")
     model = WebsocketClientPolicy(host=usr_args.get('host', '127.0.0.1'), port=usr_args['port'])
+    text_emb_lookup = DatasetTextEmbLookup(DATASET_ROOT)
 
     TASK_ENV = class_decorator(args["task_name"])
     args["policy_name"] = policy_name
@@ -427,6 +431,7 @@ def main(usr_args):
                                    TASK_ENV,
                                    args,
                                    model,
+                                   text_emb_lookup,
                                    st_seed,
                                    test_num=test_num,
                                    video_size=video_size,
@@ -485,10 +490,107 @@ def sanitize_ee_action(ee_action):
         ee_action[11:15] = safe_normalize_quat(ee_action[11:15])
     return ee_action
 
+
+class DatasetTextEmbLookup:
+    def __init__(self, dataset_root: Path):
+        self.dataset_root = Path(dataset_root)
+        self._cache = {}
+        self._index = {}
+
+    @staticmethod
+    def _norm(text):
+        if text is None:
+            return None
+        return str(text).strip()
+
+    def _build_index(self, task_name: str):
+        if task_name in self._index:
+            return self._index[task_name]
+
+        search_root = self.dataset_root / task_name
+        if not search_root.exists():
+            self._index[task_name] = []
+            return self._index[task_name]
+
+        files = sorted(search_root.glob("latents/chunk-*/**/episode_*.pth"))
+        if len(files) == 0:
+            files = sorted(search_root.glob("latents/chunk-*/*/episode_*.pth"))
+        self._index[task_name] = files
+        return files
+
+    def get(self, task_name: str, prompt: str, episode_index: int = None):
+        prompt_norm = self._norm(prompt)
+        if not prompt_norm:
+            return None
+
+        cache_key = (task_name, prompt_norm, episode_index)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        files = self._build_index(task_name)
+        if episode_index is not None:
+            episode_tag = f"episode_{int(episode_index):06d}_"
+            files = [p for p in files if episode_tag in p.name]
+
+        for latent_file in files:
+            try:
+                payload = torch.load(latent_file, map_location="cpu", weights_only=False)
+            except Exception:
+                continue
+
+            if not isinstance(payload, dict):
+                continue
+
+            if self._norm(payload.get("text", None)) != prompt_norm:
+                continue
+
+            text_emb = payload.get("text_emb", None)
+            if text_emb is None:
+                continue
+            if not torch.is_tensor(text_emb):
+                text_emb = torch.as_tensor(text_emb)
+            if text_emb.ndim == 2:
+                text_emb = text_emb.unsqueeze(0)
+            elif text_emb.ndim != 3:
+                continue
+
+            self._cache[cache_key] = text_emb
+            return text_emb
+
+        self._cache[cache_key] = None
+        return None
+
+    def get_episode_entry(self, task_name: str, episode_index: int):
+        """Return (text, text_emb) from the exact trajectory episode if available."""
+        files = self._build_index(task_name)
+        episode_tag = f"episode_{int(episode_index):06d}_"
+        for latent_file in files:
+            if episode_tag not in latent_file.name:
+                continue
+            try:
+                payload = torch.load(latent_file, map_location="cpu", weights_only=False)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            text = self._norm(payload.get("text", None))
+            text_emb = payload.get("text_emb", None)
+            if text_emb is None:
+                continue
+            if not torch.is_tensor(text_emb):
+                text_emb = torch.as_tensor(text_emb)
+            if text_emb.ndim == 2:
+                text_emb = text_emb.unsqueeze(0)
+            elif text_emb.ndim != 3:
+                continue
+            return text, text_emb
+        return None, None
+
 def eval_policy(task_name,
                 TASK_ENV,
                 args,
                 model,
+                text_emb_lookup,
                 st_seed,
                 test_num=100,
                 video_size=None,
@@ -510,25 +612,47 @@ def eval_policy(task_name,
 
     now_seed = st_seed
     clear_cache_freq = args["clear_cache_freq"]
+    single_trajectory = bool(args.get("single_trajectory", False))
+    single_trajectory_episode_index = args.get("single_trajectory_episode_index", None)
+    if single_trajectory_episode_index is not None:
+        single_trajectory_episode_index = int(single_trajectory_episode_index)
+        single_trajectory = True
+
+    if single_trajectory and single_trajectory_episode_index is None:
+        single_trajectory_episode_index = 0
+        print("single_trajectory=True and no episode index provided; defaulting to episode index 0.")
+
+    if single_trajectory and test_num != 1:
+        print(f"single_trajectory=True: forcing test_num=1 (was {test_num}).")
+        test_num = 1
 
     args["eval_mode"] = True
 
     while succ_seed < test_num:
+        current_episode_index = single_trajectory_episode_index if single_trajectory else now_id
+        current_seed = st_seed if single_trajectory else now_seed
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
         if expert_check:
             try:
-                TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+                TASK_ENV.setup_demo(now_ep_num=current_episode_index, seed=current_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
                 TASK_ENV.close_env()
             except UnStableError as e:
                 TASK_ENV.close_env()
+                if single_trajectory:
+                    print(f"Single-trajectory expert check failed with UnStableError: {e}")
+                    break
                 now_seed += 1
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
                 TASK_ENV.close_env()
+                if single_trajectory:
+                    print(f"Single-trajectory expert check failed with exception: {e}")
+                    traceback.print_exc()
+                    break
                 now_seed += 1
                 args["render_freq"] = render_freq
                 print(f"error occurs ! {e}")
@@ -539,16 +663,27 @@ def eval_policy(task_name,
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
+            if single_trajectory:
+                print("Single-trajectory expert check failed; aborting this run.")
+                break
             now_seed += 1
             args["render_freq"] = render_freq
             continue
 
         args["render_freq"] = render_freq
 
-        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+        TASK_ENV.setup_demo(now_ep_num=current_episode_index, seed=current_seed, is_test=True, **args)
         episode_info_list = [episode_info["info"]]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        if single_trajectory:
+            instruction, _traj_text_emb = text_emb_lookup.get_episode_entry(
+                task_name, current_episode_index
+            )
+            if instruction is None:
+                results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
+                instruction = np.random.choice(results[0][instruction_type])
+        else:
+            results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
+            instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:
@@ -583,7 +718,19 @@ def eval_policy(task_name,
         succ = False
 
         prompt = TASK_ENV.get_instruction()
-        ret = model.infer(dict(reset = True, prompt=prompt, save_visualization=save_visualization))
+        episode_index = int(current_episode_index)
+        if single_trajectory:
+            _, prompt_text_emb = text_emb_lookup.get_episode_entry(task_name, episode_index)
+            if prompt_text_emb is None:
+                prompt_text_emb = text_emb_lookup.get(task_name, prompt, episode_index=episode_index)
+        else:
+            prompt_text_emb = text_emb_lookup.get(task_name, prompt, episode_index=episode_index)
+        ret = model.infer(dict(
+            reset=True,
+            prompt=prompt,
+            text_emb=prompt_text_emb,
+            save_visualization=save_visualization,
+        ))
         
         first = True
         full_obs_list = []
@@ -601,8 +748,17 @@ def eval_policy(task_name,
         while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
             observation = TASK_ENV.get_obs()
             current_obs = format_obs(observation, prompt)
+            current_obs["text_emb"] = prompt_text_emb
+            current_obs["episode_index"] = episode_index
 
-            ret = model.infer(dict(obs=current_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
+            ret = model.infer(dict(
+                obs=current_obs,
+                prompt=prompt,
+                text_emb=prompt_text_emb,
+                save_visualization=save_visualization,
+                video_guidance_scale=video_guidance_scale,
+                action_guidance_scale=action_guidance_scale,
+            )) #(TASK_ENV, model, observation)
             action = ret['action']
             if 'video' in ret:
                 imagined_video = ret['video']
@@ -647,7 +803,15 @@ def eval_policy(task_name,
                     
             first = False
 
-            model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
+            model.infer(dict(
+                obs=key_frame_list,
+                compute_kv_cache=True,
+                imagine=False,
+                save_visualization=save_visualization,
+                state=action,
+                prompt=prompt,
+                text_emb=prompt_text_emb,
+            ))
   
             if TASK_ENV.eval_success:
                 succ = True
@@ -695,7 +859,8 @@ def eval_policy(task_name,
             f"\033[93m{task_name}\033[0m | \033[94m{args['policy_name']}\033[0m | \033[92m{args['task_config']}\033[0m | \033[91m{args['ckpt_setting']}\033[0m\n"
             f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
         )
-        now_seed += 1
+        if not single_trajectory:
+            now_seed += 1
 
     return now_seed, TASK_ENV.suc
 
@@ -711,6 +876,8 @@ def parse_args_and_config():
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)
     parser.add_argument("--test_num", type=int, default=100)
+    parser.add_argument("--single_trajectory", action="store_true")
+    parser.add_argument("--single_trajectory_episode_index", type=int, default=None)
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -741,6 +908,11 @@ def parse_args_and_config():
     config["video_guidance_scale"] = args.video_guidance_scale
     config["action_guidance_scale"] = args.action_guidance_scale
     config["test_num"] = args.test_num
+    if args.single_trajectory:
+        config["single_trajectory"] = True
+    if args.single_trajectory_episode_index is not None:
+        config["single_trajectory"] = True
+        config["single_trajectory_episode_index"] = int(args.single_trajectory_episode_index)
 
     return config
 
@@ -754,4 +926,3 @@ if __name__ == "__main__":
         print("Headless mode enabled: skipping render self-test")
         configure_headless_sapien_renderer()
     main(usr_args)
-

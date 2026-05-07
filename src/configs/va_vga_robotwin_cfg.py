@@ -13,10 +13,10 @@ va_vga_robotwin_cfg.text_embed_dim = 4096
 
 # VGA training script no longer uses ActionVGGT/RDT pretrained-resume switches.
 va_vga_robotwin_cfg.transformer_resume = True
-va_vga_robotwin_cfg.transformer_resume_from = None
+va_vga_robotwin_cfg.transformer_resume_from = '/home/yds/code/StreamVGGT/src/train_out/checkpoint_step_2000/transformer/diffusion_pytorch_model.safetensors'
 va_vga_robotwin_cfg.transformer_pretrained = None
 va_vga_robotwin_cfg.action_head_resume = True
-va_vga_robotwin_cfg.action_head_resume_from = None
+va_vga_robotwin_cfg.action_head_resume_from = '/home/yds/code/StreamVGGT/src/train_out/checkpoint_step_2000/action_head/diffusion_pytorch_model.safetensors'
 va_vga_robotwin_cfg.action_head_pretrained = None
 
 # LoRA settings for the pretrained VGA backbone.
@@ -46,7 +46,8 @@ va_vga_robotwin_cfg.depth_loss_grad_weight = 0.1
 va_vga_robotwin_cfg.state_noise_std = 0.02
 va_vga_robotwin_cfg.state_noise_clip = True
 # State condition strategy for RDT: "latest", "episode_initial", or "null".
-va_vga_robotwin_cfg.state_condition_mode = "episode_initial"
+# Use the current observed eef state; using action-chunk token 0 leaks the target during training.
+va_vga_robotwin_cfg.state_condition_mode = "latest"
 
 # RDT condition token composition from VGA backbone outputs.
 va_vga_robotwin_cfg.rdt_condition_tokens = EasyDict()

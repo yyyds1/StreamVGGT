@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from safetensors.torch import load_file
 from safetensors import safe_open
+from scipy.spatial.transform import Rotation as R
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -400,6 +401,17 @@ class VA_Server:
         self._text_emb_cache[prompt_norm] = None
         return None
 
+    def _normalize_text_emb_payload(self, text_emb):
+        if text_emb is None:
+            return None
+        if not torch.is_tensor(text_emb):
+            text_emb = torch.as_tensor(text_emb)
+        if text_emb.ndim == 2:
+            text_emb = text_emb.unsqueeze(0)
+        elif text_emb.ndim != 3:
+            raise ValueError(f"text_emb must be [B, D] or [B, L, D], got shape {tuple(text_emb.shape)}")
+        return text_emb.to(dtype=self.dtype, device=self.device)
+
     def _load_checkpoint_state(self, path):
         if str(path).endswith(".safetensors"):
             try:
@@ -566,6 +578,7 @@ class VA_Server:
         self.runtime_text_emb = self._resolve_text_emb_from_dataset(prompt)
         self.action_history = []
         self.episode_initial_state = None
+        self.initial_abs_state = None
         self.transformer_past_key_values = [None] * self.transformer.aggregator.depth
         self.frame_st_id = 0
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
@@ -644,7 +657,72 @@ class VA_Server:
         else:
             raise NotImplementedError
 
+        action_model_input = action_model_input * self.action_mask.to(action_model_input.device).view(-1, 1, 1)
+
         return action_model_input.unsqueeze(0).unsqueeze(-1)  # [B, C, F, N, 1]
+
+    def preprocess_state(self, state):
+        state = torch.from_numpy(np.asarray(state, dtype=np.float32)).flatten()
+        if state.numel() != len(self.used_action_channel_ids):
+            raise ValueError(
+                f"Expected state with {len(self.used_action_channel_ids)} values, got shape {tuple(state.shape)}"
+            )
+
+        state_padded = torch.zeros(self.action_dim, dtype=torch.float32)
+        state_padded[self.used_action_channel_ids] = state
+        state_aligned = state_padded[self.inverse_used_action_channel_ids]
+
+        if self.action_norm_method == "quantiles":
+            q01 = self.actions_q01[:, 0, 0]
+            q99 = self.actions_q99[:, 0, 0]
+            state_aligned = (state_aligned - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        else:
+            raise NotImplementedError
+
+        state_aligned = state_aligned * self.action_mask.to(state_aligned.device)
+
+        return state_aligned.unsqueeze(0).unsqueeze(1)  # [B, 1, C]
+
+    def _relative_state_16(self, state):
+        current = np.asarray(state, dtype=np.float32).reshape(-1)
+        if current.size != len(self.used_action_channel_ids):
+            raise ValueError(
+                f"Expected state with {len(self.used_action_channel_ids)} values, got shape {tuple(current.shape)}"
+            )
+        if self.initial_abs_state is None:
+            self.initial_abs_state = current.copy()
+
+        initial = self.initial_abs_state
+        left_rot = (R.from_quat(initial[3:7]).inv() * R.from_quat(current[3:7])).as_quat()
+        right_rot = (R.from_quat(initial[11:15]).inv() * R.from_quat(current[11:15])).as_quat()
+        rel_state_16 = np.concatenate(
+            [
+                current[:3] - initial[:3],
+                left_rot,
+                current[7:8],
+                current[8:11] - initial[8:11],
+                right_rot,
+                current[15:16],
+            ]
+        ).astype(np.float32)
+        return torch.from_numpy(rel_state_16)
+
+    def preprocess_relative_state(self, state):
+        rel_state_16 = self._relative_state_16(state)
+
+        state_padded = torch.zeros(self.action_dim, dtype=torch.float32)
+        state_padded[self.used_action_channel_ids] = rel_state_16
+        state_aligned = state_padded[self.inverse_used_action_channel_ids]
+        if self.action_norm_method == "quantiles":
+            q01 = self.actions_q01[:, 0, 0]
+            q99 = self.actions_q99[:, 0, 0]
+            state_aligned = (state_aligned - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        else:
+            raise NotImplementedError
+
+        state_aligned = state_aligned * self.action_mask.to(state_aligned.device)
+
+        return state_aligned.unsqueeze(0).unsqueeze(1)  # [B, 1, C]
 
     def postprocess_action(self, action):
         action = action.cpu()  # [B, C, F, N, 1]
@@ -655,6 +733,22 @@ class VA_Server:
             raise NotImplementedError
         action = action.detach().cpu().numpy()
         return action[self.used_action_channel_ids]
+
+    def _state_token_from_action_tensor(self, action_tensor, use_latest_token=True):
+        """Build state condition token with shape [1, 1, C] from [C, F, N] or [C, N]."""
+        if action_tensor.ndim == 3:
+            # [C, F, N] -> select one frame first.
+            frame_idx = -1 if use_latest_token else 0
+            frame_tokens = action_tensor[:, frame_idx, :]  # [C, N]
+        elif action_tensor.ndim == 2:
+            # [C, N]
+            frame_tokens = action_tensor
+        else:
+            raise ValueError(f"action_tensor must be [C, F, N] or [C, N], got {tuple(action_tensor.shape)}")
+
+        token_idx = -1 if use_latest_token else 0
+        state_vec = frame_tokens[:, token_idx]  # [C]
+        return state_vec.unsqueeze(0).unsqueeze(1)  # [1, 1, C]
 
     def _build_model_input(self, current_obs):
         current_frames = self._preprocess_obs_to_frames([current_obs])
@@ -813,7 +907,12 @@ class VA_Server:
                 dtype=self.dtype,
             )
 
-            if len(self.action_history) > 0:
+            obs_state = current_obs.get("observation.state", None)
+            if self.state_condition_mode == "episode_initial" and obs_state is not None:
+                state_c = self.preprocess_relative_state(obs_state).to(self.device, dtype=self.dtype)
+            elif obs_state is not None and self.state_condition_mode == "latest":
+                state_c = self.preprocess_relative_state(obs_state).to(self.device, dtype=self.dtype)
+            elif len(self.action_history) > 0:
                 last_state = self.action_history[-1]
                 if last_state.shape[1] != self.tokens_per_frame:
                     last_state = F.interpolate(
@@ -827,8 +926,10 @@ class VA_Server:
                 elif self.state_condition_mode == "null":
                     state_c = torch.zeros((1, 1, self.action_dim), device=self.device, dtype=self.dtype)
                 else:
-                    # Match training "latest": use the latest action token as one-step robot state.
-                    state_c = last_state[:, -1:].unsqueeze(0).permute(0, 2, 1).to(self.device, dtype=self.dtype)
+                    # Match training "latest": use one-step state token with shape [B, 1, C].
+                    state_c = self._state_token_from_action_tensor(last_state, use_latest_token=True).to(
+                        self.device, dtype=self.dtype
+                    )
             else:
                 state_c = torch.zeros((1, 1, self.action_dim), device=self.device, dtype=self.dtype)
             state_c = state_c.to(self.device, dtype=action_head_dtype)
@@ -852,6 +953,7 @@ class VA_Server:
                     noise_pred,
                     t,
                     action_sample,
+                    prev_timestep=timesteps[i + 1] if (i + 1) < len(timesteps) else None,
                     to_final=(i + 1 == len(timesteps)),
                 )
 
@@ -862,9 +964,12 @@ class VA_Server:
     def infer(self, obs):
         reset = obs.get("reset", False)
         prompt = obs.get("prompt", None)
+        text_emb = obs.get("text_emb", None)
         compute_kv_cache = obs.get("compute_kv_cache", False)
 
-        if (self.runtime_text_emb is None) and prompt is not None:
+        if text_emb is not None:
+            self.runtime_text_emb = self._normalize_text_emb_payload(text_emb)
+        elif (self.runtime_text_emb is None) and prompt is not None:
             self.prompt = prompt
             self.runtime_text_emb = self._resolve_text_emb_from_dataset(prompt)
 
@@ -895,7 +1000,10 @@ class VA_Server:
 
             if action_state_norm is not None and num_action_frames > 0:
                 self.action_history = [action_state_norm[:, num_action_frames - 1]]
-                self.episode_initial_state = action_state_norm[:, 0:1].unsqueeze(0).permute(0, 2, 1).to(
+                # Match training episode-initial state: actions[:, :, 0, 0, 0] -> [B, 1, C].
+                self.episode_initial_state = self._state_token_from_action_tensor(
+                    action_state_norm, use_latest_token=False
+                ).to(
                     self.device, dtype=self.dtype
                 )
             return {}
@@ -914,7 +1022,9 @@ class VA_Server:
         # Keep the newest predicted frame in history.
         self.action_history = [action_state_norm[:, -1]]
         if self.episode_initial_state is None:
-            self.episode_initial_state = action_state_norm[:, 0:1].unsqueeze(0).permute(0, 2, 1).to(
+            self.episode_initial_state = self._state_token_from_action_tensor(
+                action_state_norm, use_latest_token=False
+            ).to(
                 self.device, dtype=self.dtype
             )
         self.frame_st_id += 1
