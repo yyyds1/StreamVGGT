@@ -26,6 +26,11 @@ va_robotwin_cfg.num_inference_steps = 25
 va_robotwin_cfg.video_exec_step = -1
 va_robotwin_cfg.action_num_inference_steps = 50
 
+# Debug mode: restrict data usage to a single trajectory (episode).
+va_robotwin_cfg.single_trajectory = False
+# Optional explicit episode index. If None and single_trajectory=True, use first available episode.
+va_robotwin_cfg.single_trajectory_episode_index = None
+
 # Shared by both training and online evaluation (va_server.py + train_va.py)
 va_robotwin_cfg.multi_view_image_mode = 'vertical'
 va_robotwin_cfg.image_height = 224
@@ -37,11 +42,11 @@ va_robotwin_cfg.actionvggt_depth = 24
 # Separate checkpoint controls
 # Priority per model in train_va.py:
 # 1) *_resume_from, 2) *_pretrained, 3) random init
-va_robotwin_cfg.transformer_resume = True
+va_robotwin_cfg.transformer_resume = False
 va_robotwin_cfg.transformer_resume_from = '/home/yds/code/StreamVGGT/src/train_out/train_log_20260417_162133/ckpt/checkpoint_step_2500/transformer/diffusion_pytorch_model.safetensors'
 va_robotwin_cfg.transformer_pretrained = '/mnt/nas/share/home/yds/actionvggt.pth'
 
-va_robotwin_cfg.action_head_resume = True
+va_robotwin_cfg.action_head_resume = False
 va_robotwin_cfg.action_head_resume_from = '/home/yds/code/StreamVGGT/src/train_out/train_log_20260417_162133/ckpt/checkpoint_step_2500/action_head/diffusion_pytorch_model.safetensors'
 va_robotwin_cfg.action_head_pretrained = '/mnt/nas/share/home/yds/RDT.pth'
 

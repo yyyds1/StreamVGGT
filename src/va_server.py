@@ -23,7 +23,7 @@ from vga.models.vga import VGA
 from configs import VA_CONFIGS
 from rdt.model import RDT
 from utils import (
-    FlowMatchScheduler,
+    DiffusionScheduler,
     get_mesh_id,
     init_logger,
     logger,
@@ -210,10 +210,10 @@ class VA_Server:
             self.pred_frames = 1
             self.tokens_per_frame = self.chunk_size
 
-        self.train_scheduler_action = FlowMatchScheduler(
-            shift=self.job_config.action_snr_shift,
-            sigma_min=0.0,
-            extra_one_step=True,
+        self.train_scheduler_action = DiffusionScheduler(
+            num_train_timesteps=1000,
+            beta_start=getattr(self.job_config, "action_beta_start", 1e-4),
+            beta_end=getattr(self.job_config, "action_beta_end", 2e-2),
         )
         action_steps = int(getattr(self.job_config, "action_num_inference_steps", 50))
         self.train_scheduler_action.set_timesteps(action_steps)
@@ -335,7 +335,21 @@ class VA_Server:
             return
 
         cam_key = self.job_config.obs_cam_keys[0]
-        pattern = f"**/latents/chunk-*/{cam_key}/episode_*.pth"
+        if bool(getattr(self.job_config, "single_trajectory", False)):
+            episode_index = getattr(self.job_config, "single_trajectory_episode_index", None)
+            if episode_index is None:
+                logger.info(
+                    "single_trajectory=True for eval, but single_trajectory_episode_index is None; "
+                    "text embedding lookup will scan all episodes and cache first prompt match."
+                )
+                pattern = f"**/latents/chunk-*/{cam_key}/episode_*.pth"
+            else:
+                pattern = f"**/latents/chunk-*/{cam_key}/episode_{int(episode_index):06d}_*.pth"
+                logger.info(
+                    f"single_trajectory=True for eval; restricting text embedding search to episode_index={int(episode_index)}"
+                )
+        else:
+            pattern = f"**/latents/chunk-*/{cam_key}/episode_*.pth"
         self._text_emb_search_files = sorted(dataset_root.glob(pattern))
         logger.info(
             f"Prepared text embedding search index with {len(self._text_emb_search_files)} latent files "
@@ -834,7 +848,12 @@ class VA_Server:
                     decode_output=True,
                 )
                 noise_pred = rearrange(noise_pred, "b (f n) c -> b c f n 1", f=self.pred_frames, n=self.tokens_per_frame)
-                action_sample = self.train_scheduler_action.step(noise_pred, t, action_sample)
+                action_sample = self.train_scheduler_action.step(
+                    noise_pred,
+                    t,
+                    action_sample,
+                    to_final=(i + 1 == len(timesteps)),
+                )
 
         action_sample[:, ~self.action_mask.to(action_sample.device)] *= 0
         return self.postprocess_action(action_sample)
@@ -919,6 +938,11 @@ def run(args):
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
+    if args.single_trajectory:
+        config.single_trajectory = True
+    if args.single_trajectory_episode_index is not None:
+        config.single_trajectory_episode_index = int(args.single_trajectory_episode_index)
+        config.single_trajectory = True
 
     model = VA_Server(config)
     run_async_server_mode(model, local_rank, config.host, port)
@@ -944,6 +968,17 @@ def main():
         type=str,
         default=None,
         help="save root",
+    )
+    parser.add_argument(
+        "--single-trajectory",
+        action="store_true",
+        help="Enable single trajectory (single episode) debug mode during evaluation.",
+    )
+    parser.add_argument(
+        "--single-trajectory-episode-index",
+        type=int,
+        default=None,
+        help="Episode index used when --single-trajectory is enabled. If omitted, first available episode is used.",
     )
     args = parser.parse_args()
     run(args)

@@ -11,6 +11,8 @@ TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 CONFIG_NAME=${CONFIG_NAME:-"vga_robotwin_train"}
 SAVE_ROOT=${SAVE_ROOT:-"./train_out"}
 SINGLE_TASK=${SINGLE_TASK:-"adjust_bottle"}
+SINGLE_TRAJECTORY=${SINGLE_TRAJECTORY:-"1"}
+SINGLE_TRAJECTORY_EPISODE_INDEX=${SINGLE_TRAJECTORY_EPISODE_INDEX:-"12"}
 
 overrides=""
 if [ $# -ne 0 ]; then
@@ -34,4 +36,6 @@ python -m torch.distributed.run \
     --tee 3 \
     -m train_va --config-name ${config_name} ${overrides} \
     $(if [ -n "${SAVE_ROOT}" ]; then printf '%s' "--save-root ${SAVE_ROOT}"; fi) \
-    $(if [ -n "${SINGLE_TASK}" ]; then printf '%s' "--single-task ${SINGLE_TASK}"; fi)
+    $(if [ -n "${SINGLE_TASK}" ]; then printf '%s' "--single-task ${SINGLE_TASK}"; fi) \
+    $(if [ "${SINGLE_TRAJECTORY}" = "1" ]; then printf '%s' "--single-trajectory"; fi) \
+    $(if [ -n "${SINGLE_TRAJECTORY_EPISODE_INDEX}" ]; then printf '%s' "--single-trajectory-episode-index ${SINGLE_TRAJECTORY_EPISODE_INDEX}"; fi)

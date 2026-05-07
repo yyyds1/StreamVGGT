@@ -49,7 +49,7 @@ from utils import (
     get_mesh_id,
     sample_timestep_id,
     warmup_constant_lambda,
-    FlowMatchScheduler,
+    DiffusionScheduler,
 )
 from vga.models.vga import VGA
 from rdt.model import RDT
@@ -729,7 +729,11 @@ class Trainer:
             sampler=train_sampler,
         )
 
-        self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
+        self.train_scheduler_action = DiffusionScheduler(
+            num_train_timesteps=1000,
+            beta_start=getattr(self.config, "action_beta_start", 1e-4),
+            beta_end=getattr(self.config, "action_beta_end", 2e-2),
+        )
         self.train_scheduler_action.set_timesteps(1000, training=True)
 
         if self._resume_checkpoint_dir is not None:
@@ -752,9 +756,10 @@ class Trainer:
 
         timestep_ids = sample_timestep_id(batch_size=B, num_train_timesteps=train_scheduler.num_train_timesteps)
         noise = torch.zeros_like(latent).normal_()
-        timesteps = train_scheduler.timesteps[timestep_ids].to(device=self.device)
+        timesteps = timestep_ids.to(device=self.device)
         noisy_latents = train_scheduler.add_noise(latent, noise, timesteps, t_dim=0)
         targets = train_scheduler.training_target(latent, noise, timesteps)
+        loss_weights = train_scheduler.training_weight(timesteps).view(B, 1, 1, 1, 1)
 
         patch_f, patch_h, patch_w = self.patch_size
         if action_mode:
@@ -779,7 +784,7 @@ class Trainer:
                     num_train_timesteps=train_scheduler.num_train_timesteps,
                 )
             noise = torch.zeros_like(latent).normal_()
-            cond_timesteps = train_scheduler.timesteps[cond_timestep_ids].to(device=self.device)
+            cond_timesteps = cond_timestep_ids.to(device=self.device)
             latent = train_scheduler.add_noise(latent, noise, cond_timesteps, t_dim=0)
         else:
             cond_timesteps = torch.zeros_like(timesteps)
@@ -790,11 +795,12 @@ class Trainer:
             latent *= action_mask.float()
 
         return dict(
-            timesteps=timesteps[:, None].repeat(1, F),
+            timesteps=timesteps,
             noisy_latents=noisy_latents,
             targets=targets,
             latent=latent,
-            cond_timesteps=cond_timesteps[:, None].repeat(1, F),
+            cond_timesteps=cond_timesteps,
+            loss_weights=loss_weights,
             grid_id=latent_grid_id,
         )
 
@@ -933,24 +939,16 @@ class Trainer:
     def compute_loss(self, input_dict, pred):
         action_pred = pred
         action_pred = rearrange(action_pred, 'b f c -> b c f')
-        Bn, Fn = input_dict['pred_action_chunk_dict']['timesteps'].shape
-        action_loss_weight = self.train_scheduler_action.training_weight(input_dict['pred_action_chunk_dict']['timesteps'].flatten()).reshape(Bn, Fn)
+        action_target = input_dict['pred_action_chunk_dict']['targets'].float().detach()
+        action_loss_weight = input_dict['pred_action_chunk_dict']['loss_weights']
+        action_loss_weight = rearrange(action_loss_weight, 'b 1 f 1 1 -> b 1 f').to(action_pred.dtype)
+        action_mask = torch.ones_like(action_target, dtype=action_pred.dtype, device=action_pred.device)
 
-        # Frame-wise action loss calculation
-        action_loss = F.mse_loss(action_pred.float(), input_dict['pred_action_chunk_dict']['targets'].float().detach(), reduction='none')
-        action_loss = action_loss * action_loss_weight[:, None, :]
-        # action_loss = action_loss * input_dict['action_dict']['actions_mask'].float()
-        # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
-        action_loss = action_loss.permute(0, 2, 1)  # (B, C, F) -> (B, F, C)
-        # action_mask = input_dict['action_dict']['actions_mask'].float().permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
-        action_loss = action_loss.flatten(0, 1).flatten(1)  # (B, F, C) -> (B*F, C)
-        # action_mask = action_mask.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        # Sum per frame and normalize by mask per frame
-        action_loss_per_frame = action_loss.sum(dim=1)  # (B*F,)
-        # action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
-        # action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
+        squared_error = (action_pred.float() - action_target).pow(2) * action_loss_weight.float()
+        denom = action_mask.sum().clamp_min(1.0)
+        action_loss = (squared_error * action_mask).sum() / denom
 
-        return action_loss_per_frame.mean() / self.gradient_accumulation_steps
+        return action_loss / self.gradient_accumulation_steps
 
     def _compute_camera_depth_losses(self, batch, model_output):
         zero = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -1031,7 +1029,7 @@ class Trainer:
 
             action_chunk = input_dict['pred_action_chunk_dict']['noisy_latents']  # [B, C_action, chunk_size]
             action_chunk = action_chunk.permute(0, 2, 1) # [B, chunk_size, C_action]
-            timesteps = input_dict['pred_action_chunk_dict']['timesteps'][:, 0]
+            timesteps = input_dict['pred_action_chunk_dict']['timesteps']
             if self.state_condition_mode == "null":
                 state_c = torch.zeros(
                     (action_chunk.shape[0], 1, self.transformer.action_dim),
@@ -1356,7 +1354,7 @@ class Trainer:
         logger.info("Training completed!")
 
 
-def run(args): 
+def run(args):
     """Main entry point."""
     config = VA_CONFIGS[args.config_name]
 
@@ -1375,12 +1373,21 @@ def run(args):
 
     if args.single_task is not None:
         config.single_task = args.single_task
+    if args.single_trajectory:
+        config.single_trajectory = True
+    if args.single_trajectory_episode_index is not None:
+        config.single_trajectory_episode_index = int(args.single_trajectory_episode_index)
+        config.single_trajectory = True
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
         if getattr(config, "single_task", None):
             logger.info(f"Single-task training enabled: {config.single_task}")
+        if getattr(config, "single_trajectory", False):
+            logger.info(
+                f"Single-trajectory training enabled: episode_index={getattr(config, 'single_trajectory_episode_index', None)}"
+            )
 
     trainer = Trainer(config)
     trainer.train()
@@ -1407,6 +1414,17 @@ def main():
         type=str,
         default=None,
         help="Train on a single task only (same semantics as evaluation task_name)",
+    )
+    parser.add_argument(
+        "--single-trajectory",
+        action="store_true",
+        help="Enable single trajectory (single episode) debug mode for training dataset.",
+    )
+    parser.add_argument(
+        "--single-trajectory-episode-index",
+        type=int,
+        default=None,
+        help="Episode index for --single-trajectory. If omitted, first available episode is used.",
     )
 
     args = parser.parse_args()

@@ -192,6 +192,27 @@ class LatentLeRobotDataset(LeRobotDataset):
 
                 if check_statu:
                     out.append(cur_meta)
+
+        if bool(getattr(self.config, "single_trajectory", False)) and len(out) > 0:
+            requested_ep = getattr(self.config, "single_trajectory_episode_index", None)
+            if requested_ep is None:
+                target_episode = int(out[0]["episode_index"])
+            else:
+                target_episode = int(requested_ep)
+            filtered = [m for m in out if int(m["episode_index"]) == target_episode]
+            if len(filtered) == 0:
+                fallback_episode = int(out[0]["episode_index"])
+                logger.warning(
+                    f"single_trajectory=True but episode_index={target_episode} not found in repo {self.repo_id}; "
+                    f"fallback to first available episode_index={fallback_episode}."
+                )
+                target_episode = fallback_episode
+                filtered = [m for m in out if int(m["episode_index"]) == target_episode]
+            logger.info(
+                f"Dataset {self.repo_id}: single-trajectory mode enabled, selected episode_index={target_episode}, "
+                f"segments={len(filtered)}"
+            )
+            out = filtered
         self.new_metas = out
 
     def _check_meta(self, start_frame, end_frame, episode_index):
