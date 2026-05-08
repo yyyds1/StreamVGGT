@@ -114,6 +114,8 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         elif text_emb.ndim != 3:
             raise ValueError(f"text_emb must be [B,D] or [B,L,D], got shape {tuple(text_emb.shape)}")
 
+        proj_param = next(self.text_token_proj.parameters())
+        text_emb = text_emb.to(device=proj_param.device, dtype=proj_param.dtype)
         text_token = text_emb.mean(dim=1, keepdim=True)
         text_token = self.text_token_proj(text_token)
         return text_token.to(dtype=dtype)
@@ -146,7 +148,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         """Freeze pretrained backbone weights and keep LoRA + new action-query tokens trainable."""
         self.aggregator.requires_grad_(False)
         for name, param in self.aggregator.named_parameters():
-            if "lora_" in name or name.endswith("action_query_tokens"):
+            if "lora_" in name or name.endswith("action_query_tokens") or name.startswith("action_embedder."):
                 param.requires_grad = True
         return self
 
@@ -162,8 +164,9 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         return pooled.reshape(bsz, seq_len, dim)
 
     def _build_rdt_act_tokens(self, act_tokens: torch.Tensor) -> torch.Tensor:
-        # RDT act positional embedding expects `image_frame_stride` action tokens per frame.
-        tokens_per_frame = int(self.image_frame_stride)
+        # RDT act condition is [current_state_token, action_query_tokens...],
+        # aligned one-to-one with the RDT noised action horizon.
+        tokens_per_frame = int(self.chunk_size)
         if act_tokens.shape[2] < tokens_per_frame:
             raise ValueError(
                 f"Not enough action tokens per frame: got {act_tokens.shape[2]}, "
@@ -206,6 +209,9 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         text_emb = image_dict.get("text_emb", input_dict.get("action_dict", {}).get("text_emb", None))
 
         image_mask = image_dict.get("images_mask", None)
+        action_dict = input_dict.get("action_dict", {})
+        actions = action_dict.get("actions", None)
+        actions_mask = action_dict.get("actions_mask", action_dict.get("action_mask", None))
 
         if image_mask is not None:
             images = images * image_mask
@@ -216,6 +222,8 @@ class VGA(nn.Module, PyTorchModelHubMixin):
 
         aggregated_tokens_list, token_idx = self.aggregator(
             images=images,
+            actions=actions,
+            actions_mask=actions_mask,
             text_emb=text_token,
             return_all_layers=True,
         )
@@ -234,6 +242,10 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         img_tokens = rdt_tokens[:, :, token_idx["image"][0] : token_idx["image"][1]]
         act_tokens = rdt_tokens[:, :, token_idx["action"][0] : token_idx["action"][1]]
         lang_tokens = rdt_tokens[:, :, token_idx["lang"][0] : token_idx["lang"][1]]
+        current_frame_idx = -1
+        img_tokens = img_tokens[:, current_frame_idx:]
+        act_tokens = act_tokens[:, current_frame_idx:]
+        lang_tokens = lang_tokens[:, current_frame_idx:]
 
         img_tokens = self._build_rdt_img_tokens(img_tokens)
         act_tokens = self._build_rdt_act_tokens(act_tokens)
@@ -279,12 +291,48 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             images = torch.stack([frame["img"] for frame in frames], dim=0).unsqueeze(0)
         elif first_img.dim() == 4:
             images = torch.stack([frame["img"] for frame in frames], dim=1)
+        elif first_img.dim() == 5:
+            if len(frames) != 1:
+                raise ValueError("Pre-batched 5D frame payload expects a single frame item")
+            images = first_img
         else:
-            raise ValueError(f"Expected frame['img'] to have 3 or 4 dims, got {tuple(first_img.shape)}")
+            raise ValueError(f"Expected frame['img'] to have 3, 4, or 5 dims, got {tuple(first_img.shape)}")
 
         text_emb = frames[0].get("text_emb", None)
+        action_dict = {"text_emb": text_emb}
+        first_action = frames[0].get("actions", None)
+        if len(frames) == 1 and first_action is not None and first_action.dim() == 4:
+            mask = frames[0].get("actions_mask", torch.ones_like(first_action, dtype=torch.bool))
+            action_dict.update(
+                {
+                    "actions": first_action.unsqueeze(-1),
+                    "actions_mask": mask.unsqueeze(-1),
+                }
+            )
+        else:
+            action_frames = []
+            action_mask_frames = []
+            for frame in frames:
+                action = frame.get("actions", None)
+                if action is None:
+                    continue
+                if action.dim() == 2:
+                    action = action.unsqueeze(0)
+                action_frames.append(action)
+                mask = frame.get("actions_mask", None)
+                if mask is None:
+                    mask = torch.ones_like(action, dtype=torch.bool)
+                elif mask.dim() == 2:
+                    mask = mask.unsqueeze(0)
+                action_mask_frames.append(mask)
+
+            if len(action_frames) == len(frames):
+                actions = torch.stack(action_frames, dim=2).unsqueeze(-1)
+                actions_mask = torch.stack(action_mask_frames, dim=2).unsqueeze(-1)
+                action_dict.update({"actions": actions, "actions_mask": actions_mask})
+
         input_dict = {
             "image_dict": {"images": images.permute(0, 2, 1, 3, 4), "text_emb": text_emb},
-            "action_dict": {"text_emb": text_emb},
+            "action_dict": action_dict,
         }
         return self.forward(input_dict=input_dict, predict_geometry=False)

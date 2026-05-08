@@ -24,7 +24,7 @@ va_robotwin_cfg.action_guidance_scale = 1
 
 va_robotwin_cfg.num_inference_steps = 25
 va_robotwin_cfg.video_exec_step = -1
-va_robotwin_cfg.action_num_inference_steps = 50
+va_robotwin_cfg.action_num_inference_steps = 100
 
 # Debug mode: restrict data usage to a single trajectory (episode).
 va_robotwin_cfg.single_trajectory = False
@@ -36,8 +36,11 @@ va_robotwin_cfg.multi_view_image_mode = 'vertical'
 va_robotwin_cfg.image_height = 224
 va_robotwin_cfg.image_width = 224
 va_robotwin_cfg.chunk_size = 8
-va_robotwin_cfg.image_frame_stride = 4
-va_robotwin_cfg.actionvggt_depth = 24
+# Keep image/action time aligned: one decoded image frame corresponds to one action token.
+va_robotwin_cfg.image_frame_stride = 1
+va_robotwin_cfg.history_len = 4
+va_robotwin_cfg.history_frame_stride = 1
+va_robotwin_cfg.actionvggt_depth = 12
 
 # Separate checkpoint controls
 # Priority per model in train_va.py:
@@ -65,6 +68,16 @@ va_robotwin_cfg.rdt.ffn_dim_multiplier = None
 va_robotwin_cfg.rdt.num_kv_heads = 4
 va_robotwin_cfg.rdt.use_flash_attn = True
 va_robotwin_cfg.rdt.action_dim = va_robotwin_cfg.action_dim
+va_robotwin_cfg.rdt.num_train_timesteps = 1000
+va_robotwin_cfg.rdt.num_inference_steps = 100
+va_robotwin_cfg.rdt.flow_match_shift = 3.0
+va_robotwin_cfg.rdt.sigma_max = 1.0
+va_robotwin_cfg.rdt.sigma_min = 0.003 / 1.002
+va_robotwin_cfg.rdt.extra_one_step = True
+va_robotwin_cfg.rdt.action_condition_noise_std = 0.01
+va_robotwin_cfg.rdt.warm_start_blend = 0.85
+va_robotwin_cfg.rdt.warm_start_noise_std = 0.03
+va_robotwin_cfg.rdt.action_smoothing_alpha = 0.35
 
 va_robotwin_cfg.snr_shift = 5.0
 va_robotwin_cfg.action_snr_shift = 1.0

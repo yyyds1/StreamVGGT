@@ -449,12 +449,23 @@ def main(usr_args):
 
     print(f"Data has been saved to {file_path}")
 
+def format_eef_state(observation):
+    endpose = observation["endpose"]
+    return np.array(
+        endpose["left_endpose"]
+        + [endpose["left_gripper"]]
+        + endpose["right_endpose"]
+        + [endpose["right_gripper"]],
+        dtype=np.float32,
+    )
+
+
 def format_obs(observation, prompt):
     return {
                 "observation.images.cam_high": observation["observation"]["head_camera"]["rgb"], # H,W,3
                 "observation.images.cam_left_wrist": observation["observation"]["left_camera"]["rgb"],
                 "observation.images.cam_right_wrist": observation["observation"]["right_camera"]["rgb"],
-                "observation.state": observation["joint_action"]["vector"],
+                "observation.state": format_eef_state(observation),
                 "task": prompt,
             }
 
@@ -719,12 +730,9 @@ def eval_policy(task_name,
 
         prompt = TASK_ENV.get_instruction()
         episode_index = int(current_episode_index)
-        if single_trajectory:
-            _, prompt_text_emb = text_emb_lookup.get_episode_entry(task_name, episode_index)
-            if prompt_text_emb is None:
-                prompt_text_emb = text_emb_lookup.get(task_name, prompt, episode_index=episode_index)
-        else:
-            prompt_text_emb = text_emb_lookup.get(task_name, prompt, episode_index=episode_index)
+        # StreamVGGT now follows p2p and encodes the prompt on the policy server with
+        # EmbeddingGemma. Do not send legacy dataset text_emb tensors from the client.
+        prompt_text_emb = None
         ret = model.infer(dict(
             reset=True,
             prompt=prompt,
@@ -732,7 +740,6 @@ def eval_policy(task_name,
             save_visualization=save_visualization,
         ))
         
-        first = True
         full_obs_list = []
         gen_video_list = []
         full_action_history = []
@@ -748,7 +755,6 @@ def eval_policy(task_name,
         while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
             observation = TASK_ENV.get_obs()
             current_obs = format_obs(observation, prompt)
-            current_obs["text_emb"] = prompt_text_emb
             current_obs["episode_index"] = episode_index
 
             ret = model.infer(dict(
@@ -759,59 +765,41 @@ def eval_policy(task_name,
                 video_guidance_scale=video_guidance_scale,
                 action_guidance_scale=action_guidance_scale,
             )) #(TASK_ENV, model, observation)
-            action = ret['action']
+            has_absolute_action = 'action_absolute' in ret
+            action = ret['action_absolute'] if has_absolute_action else ret['action']
             if 'video' in ret:
                 imagined_video = ret['video']
                 gen_video_list.append(imagined_video)
-            key_frame_list = []
+            raw_action_step = action[:, 0, 0].flatten()
+            full_action_history.append(raw_action_step)
 
-            action_per_frame = action.shape[2]
+            ee_action = action[:, 0, 0]
+            if action.shape[0] == 14:
+                ee_action = np.concatenate([
+                    ee_action[:3],
+                    euler2quat(ee_action[3], ee_action[4], ee_action[5]),
+                    ee_action[6:10],
+                    euler2quat(ee_action[10], ee_action[11], ee_action[12]),
+                    ee_action[13:14]
+                ])
+            elif action.shape[0] == 16:
+                if not has_absolute_action:
+                    action_reference = ret.get('action_reference', inint_eef_pose)
+                    ee_action = add_init_pose(ee_action, action_reference)
+                ee_action = np.concatenate([
+                    ee_action[:3],
+                    safe_normalize_quat(ee_action[3:7]),
+                    ee_action[7:11],
+                    safe_normalize_quat(ee_action[11:15]),
+                    ee_action[15:16]
+                ])
+            else:
+                raise NotImplementedError
+            ee_action = sanitize_ee_action(ee_action)
+            TASK_ENV.take_action(ee_action, action_type='ee')
 
-            start_idx = 1 if first else 0
-            for i in range(start_idx, action.shape[1]):
-                for j in range(action.shape[2]):
-                    raw_action_step = action[:, i, j].flatten() 
-                    full_action_history.append(raw_action_step)
-
-                    ee_action = action[:, i, j]
-                    if action.shape[0] == 14:
-                        ee_action = np.concatenate([
-                            ee_action[:3],
-                            euler2quat(ee_action[3], ee_action[4], ee_action[5]),
-                            ee_action[6:10],
-                            euler2quat(ee_action[10], ee_action[11], ee_action[12]),
-                            ee_action[13:14]
-                        ])
-                    elif action.shape[0] == 16:
-                        ee_action =  add_init_pose(ee_action, inint_eef_pose)
-                        ee_action = np.concatenate([
-                            ee_action[:3],
-                            safe_normalize_quat(ee_action[3:7]),
-                            ee_action[7:11],
-                            safe_normalize_quat(ee_action[11:15]),
-                            ee_action[15:16]
-                        ])
-                    else:
-                        raise NotImplementedError
-                    ee_action = sanitize_ee_action(ee_action)
-                    TASK_ENV.take_action(ee_action, action_type='ee')
-                   
-                    if (j+1) % action_per_frame == 0:
-                        obs = format_obs(TASK_ENV.get_obs(), prompt)
-                        full_obs_list.append(obs)
-                        key_frame_list.append(obs)
-                    
-            first = False
-
-            model.infer(dict(
-                obs=key_frame_list,
-                compute_kv_cache=True,
-                imagine=False,
-                save_visualization=save_visualization,
-                state=action,
-                prompt=prompt,
-                text_emb=prompt_text_emb,
-            ))
+            obs = format_obs(TASK_ENV.get_obs(), prompt)
+            full_obs_list.append(obs)
   
             if TASK_ENV.eval_success:
                 succ = True

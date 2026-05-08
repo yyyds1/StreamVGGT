@@ -16,6 +16,7 @@ from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
 
 from utils import logger
+from utils.text_embedding import encode_prompt
 def recursive_find_file(directory, filename='info.json'):
     result = []
     try:
@@ -55,6 +56,11 @@ def construct_lerobot_multi_processor(config,
         ]
         logger.info(f"Found {len(repo_list)} repositories with info.json in {config.dataset_path} for task {config.single_task}.")
     # repo_list = repo_list[:2]
+    if num_init_worker is None or int(num_init_worker) <= 1:
+        for repo in repo_list:
+            datasets_out_lst.append(construct_func(repo))
+        return datasets_out_lst
+
     mp_start_method = getattr(config, 'dataset_mp_start_method', 'spawn')
     pool_context = get_context(mp_start_method)
     with pool_context.Pool(num_init_worker) as pool:
@@ -64,20 +70,40 @@ def construct_lerobot_multi_processor(config,
                 
     return datasets_out_lst
 
-def get_relative_pose(pose):
+def get_relative_pose(pose, anchor_pose=None):
     if torch.is_tensor(pose):
         pose = pose.detach().cpu().numpy()
-    
+    if anchor_pose is None:
+        anchor_pose = pose[0]
+    if torch.is_tensor(anchor_pose):
+        anchor_pose = anchor_pose.detach().cpu().numpy()
+
     rot = R.from_quat(pose[:, 3:7])
-    first_rot = R.from_quat(np.tile(pose[:1, 3:7], (pose.shape[0], 1)))
+    first_rot = R.from_quat(np.tile(anchor_pose[None, 3:7], (pose.shape[0], 1)))
     trans = pose[:, :3]
-    relative_trans = trans - trans[0:1]
+    relative_trans = trans - anchor_pose[None, :3]
 
     relative_rot = first_rot.inv() * rot
     relative_quat = relative_rot.as_quat()
 
     relative_pose = np.concatenate([relative_trans, relative_quat], axis=1)
     return torch.from_numpy(relative_pose)
+
+
+def get_relative_compact_action(action_16d, anchor_pose_16d):
+    if torch.is_tensor(action_16d):
+        action_16d = action_16d.detach().cpu().numpy()
+    if torch.is_tensor(anchor_pose_16d):
+        anchor_pose_16d = anchor_pose_16d.detach().cpu().numpy()
+    action_16d = np.asarray(action_16d, dtype=np.float32).reshape(-1, 16)
+    anchor_pose_16d = np.asarray(anchor_pose_16d, dtype=np.float32).reshape(16)
+
+    left_action = get_relative_pose(action_16d[:, :7], anchor_pose_16d[:7]).numpy()
+    right_action = get_relative_pose(action_16d[:, 8:15], anchor_pose_16d[8:15]).numpy()
+    return np.concatenate(
+        [left_action, action_16d[:, 7:8], right_action, action_16d[:, 15:16]],
+        axis=1,
+    )
 
 class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
@@ -158,7 +184,6 @@ class LatentLeRobotDataset(LeRobotDataset):
         
         self.latent_path = Path(repo_id) / 'latents'
         self.image_path = Path(repo_id) / 'videos'
-        self.empty_emb = torch.load(config.empty_emb_path, weights_only=False)
         self.config = config
         self.cfg_prob = config.cfg_prob
         self.used_video_keys = config.obs_cam_keys
@@ -169,6 +194,15 @@ class LatentLeRobotDataset(LeRobotDataset):
             columns=['action', 'observation.state'],
             output_all_columns=False,
         )
+        self._text_embedding_cache = {}
+        self._empty_text_embedding = None
+        self.prefer_raw_text_for_text_embeddings = bool(
+            getattr(config, "prefer_raw_text_for_text_embeddings", True)
+        )
+        self.encode_text_in_dataloader = bool(
+            getattr(config, "encode_text_in_dataloader", False)
+        )
+        self._raw_text_warning_emitted = False
         self.parse_meta()
 
     def parse_meta(self):
@@ -280,7 +314,6 @@ class LatentLeRobotDataset(LeRobotDataset):
         episode_chunk = self.meta.get_episode_chunk(episode_index)
         image_path = Path(self.image_path) / f"chunk-{episode_chunk:03d}"
         latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
-        frame_stride = max(1, int(getattr(self.config, 'image_frame_stride', 1)))
         out = {}
         for key in self.used_video_keys:
             cur_path = image_path / key
@@ -298,8 +331,6 @@ class LatentLeRobotDataset(LeRobotDataset):
                             continue
                         if frame_idx >= end_frame:
                             break
-                        if (frame_idx - start_frame) % frame_stride != 0:
-                            continue
                         frames.append(frame.to_ndarray(format='rgb24'))
             except Exception as e:
                 raise RuntimeError(
@@ -328,12 +359,121 @@ class LatentLeRobotDataset(LeRobotDataset):
                 "video_num_frames": num_frames,
                 "video_height": height,
                 "video_width": width,
-                "video_already_downsampled": True,
-                "frame_ids": torch.arange(start_frame, end_frame, dtype=torch.long),
+                "frame_ids": torch.arange(start_frame, start_frame + num_frames, dtype=torch.long),
                 "text_emb": latent_data.get("text_emb", None)
             }
         
         return self._flatten_latent_dict(out)
+
+    def _resolve_raw_text(self, meta: dict) -> str | None:
+        action_text = str(meta.get('action_text', '') or '').strip()
+        if action_text:
+            return action_text
+
+        for task in meta.get('tasks', []) or []:
+            task_text = str(task or '').strip()
+            if task_text:
+                return task_text
+        return None
+
+    def _pool_text_embedding_tokens(self, text_emb):
+        text_emb = torch.as_tensor(text_emb)
+        if text_emb.ndim == 2 and text_emb.shape[0] > 1:
+            return text_emb.mean(dim=0, keepdim=True)
+        if text_emb.ndim == 3 and text_emb.shape[-2] > 1:
+            return text_emb.mean(dim=-2, keepdim=True)
+        return text_emb
+
+    def _encode_raw_text_embedding(self, text: str):
+        cached = self._text_embedding_cache.get(text)
+        if cached is not None:
+            return cached
+
+        text_embedding = encode_prompt(text, self.config, device="cpu", dtype=torch.float32)
+        if text_embedding is None:
+            return None
+        if text_embedding.ndim != 3:
+            raise ValueError(
+                f"Expected encoded text embedding [B, L, D], got {tuple(text_embedding.shape)} for text `{text}`."
+            )
+        text_embedding = text_embedding.squeeze(0).cpu().float().contiguous()
+        self._text_embedding_cache[text] = text_embedding
+        return text_embedding
+
+    def _expand_text_embedding_like(self, source_embedding, target_embedding: torch.Tensor):
+        if source_embedding is None:
+            return None
+        source_embedding = torch.as_tensor(source_embedding)
+        target_embedding = torch.as_tensor(target_embedding)
+        if tuple(source_embedding.shape) == tuple(target_embedding.shape):
+            return source_embedding.to(dtype=target_embedding.dtype)
+        if (
+            source_embedding.ndim + 1 == target_embedding.ndim
+            and tuple(source_embedding.shape) == tuple(target_embedding.shape[1:])
+        ):
+            return source_embedding.unsqueeze(0).expand(*target_embedding.shape).contiguous().to(
+                dtype=target_embedding.dtype
+            )
+        if (
+            source_embedding.ndim == target_embedding.ndim
+            and source_embedding.shape[0] == 1
+            and tuple(source_embedding.shape[1:]) == tuple(target_embedding.shape[1:])
+        ):
+            return source_embedding.expand(*target_embedding.shape).contiguous().to(
+                dtype=target_embedding.dtype
+            )
+        return None
+
+    def _get_empty_text_embedding(self, template_text_embedding: torch.Tensor):
+        if self._empty_text_embedding is None:
+            self._empty_text_embedding = self._encode_raw_text_embedding('')
+        return self._expand_text_embedding_like(self._empty_text_embedding, template_text_embedding)
+
+    def _get_cfg_text_embedding(self, text_emb):
+        text_emb = self._pool_text_embedding_tokens(text_emb).float()
+        if torch.rand(1).item() >= self.cfg_prob:
+            return text_emb
+
+        matched_encoded_empty = self._get_empty_text_embedding(text_emb)
+        if matched_encoded_empty is not None:
+            return matched_encoded_empty.float()
+
+        return torch.zeros_like(text_emb)
+
+    def _get_selected_text_embedding(self, meta: dict, data_dict: dict):
+        raw_text = self._resolve_raw_text(meta)
+        if self.prefer_raw_text_for_text_embeddings and raw_text:
+            try:
+                raw_text_embedding = self._encode_raw_text_embedding(raw_text)
+            except Exception as exc:
+                if not self._raw_text_warning_emitted:
+                    logger.warning(
+                        f"Failed to encode raw text `{raw_text}` for repo {self.repo_id}; "
+                        f"falling back to precomputed text_emb. Error: {exc}"
+                    )
+                    self._raw_text_warning_emitted = True
+            else:
+                if raw_text_embedding is not None:
+                    return self._get_cfg_text_embedding(raw_text_embedding)
+
+        fallback_text_embedding = data_dict.get(f"{self.used_video_keys[0]}.text_emb")
+        if fallback_text_embedding is None:
+            if raw_text:
+                raw_text_embedding = self._encode_raw_text_embedding(raw_text)
+                if raw_text_embedding is not None:
+                    return self._get_cfg_text_embedding(raw_text_embedding)
+            raise ValueError(
+                f"No text embedding source found for repo {self.repo_id}, episode {meta.get('episode_index')}."
+            )
+
+        return self._get_cfg_text_embedding(fallback_text_embedding)
+
+    def _get_selected_text(self, meta: dict, data_dict: dict) -> str:
+        raw_text = self._resolve_raw_text(meta)
+        if raw_text:
+            return raw_text
+        fallback_text = data_dict.get(f"{self.used_video_keys[0]}.text", "")
+        return str(fallback_text or "")
     
         
     def _cat_video_latents(self,
@@ -354,13 +494,9 @@ class LatentLeRobotDataset(LeRobotDataset):
         wrist_latent = torch.cat(latent_lst[1:], dim=2)
         cat_latent = torch.cat([wrist_latent, latent_lst[0]], dim=1)
 
-        text_emb = data_dict[f"{self.used_video_keys[0]}.text_emb"]
-        if torch.rand(1).item() < self.cfg_prob:
-            text_emb = self.empty_emb
-
         out_dict = dict(
             latents = cat_latent,
-            text_emb = text_emb,
+            text_emb = self._get_selected_text_embedding({}, data_dict),
         )
         print(f"lactent shape: {cat_latent.shape}")
         return out_dict
@@ -394,22 +530,16 @@ class LatentLeRobotDataset(LeRobotDataset):
             image_num_frames = data_dict[f"{key}.video_num_frames"]
             image_height = data_dict[f"{key}.video_height"]
             image_width = data_dict[f"{key}.video_width"]
-            already_downsampled = bool(data_dict.get(f"{key}.video_already_downsampled", False))
             image = rearrange(image, 
                                  '(f h w) c -> f c h w ', 
                                  f= image_num_frames, 
                                  h= image_height, 
                                  w= image_width)
-            # Downsample only when decode path did not already subsample frames.
-            if not already_downsampled:
-                image = image[::self.config.image_frame_stride]
             # resize and padding image to self.image_height and self.image_width, Does not distort the image content
             import torch.nn.functional as F
 
             # Resize and pad image to self.image_height and self.image_width without distortion
             # image: [num_frames * image_height * image_width, channels] -> [num_frames, channels, image_height, image_width]
-            num_frames = image_num_frames
-            c = image.shape[1]
             h = image_height
             w = image_width
 
@@ -432,44 +562,29 @@ class LatentLeRobotDataset(LeRobotDataset):
             image_lst.append(image)
 
         cat_image = self._merge_multi_view_images(image_lst)
-        text_emb = data_dict[f"{self.used_video_keys[0]}.text_emb"]
-        if torch.rand(1).item() < self.cfg_prob:
-            text_emb = self.empty_emb
 
         out_dict = dict(
             images = cat_image,
-            text_emb = text_emb,
         )
         return out_dict
     
     def _action_post_process(self, local_start_frame, local_end_frame, image_frame_ids, action):
+        del local_end_frame
         act_shift = int(image_frame_ids[0] - local_start_frame)
-        frame_stride = image_frame_ids[1] - image_frame_ids[0]
-        action = action[act_shift:]
-        left_action = get_relative_pose(action[:, :7])
-        right_action = get_relative_pose(action[:, 8:15])
-        action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
-        action = np.pad(action, pad_width=((frame_stride * self.config.image_frame_stride, 0), (0, 0)), mode='constant', constant_values=0)
+        action = np.asarray(action[act_shift:], dtype=np.float32)
 
-        image_frame_num = (len(image_frame_ids) - 1) // self.config.image_frame_stride + 1
-        required_action_num = image_frame_num * frame_stride * self.config.image_frame_stride
-
-        action = action[:required_action_num]
+        image_frame_num = len(image_frame_ids)
+        if action.shape[0] < image_frame_num:
+            raise ValueError(
+                f"Not enough actions for image frames: actions={action.shape[0]}, images={image_frame_num}"
+            )
+        action = action[:image_frame_num]
         action_mask = np.ones_like(action, dtype='bool')
-        assert action.shape[0] == required_action_num
+        assert action.shape[0] == image_frame_num
 
-
-        action_paded = np.pad(action, ((0, 0), (0, 1)), mode='constant', constant_values=0)
-        action_mask_padded = np.pad(action_mask, ((0, 0), (0, 1)), mode='constant', constant_values=0)
-
-        action_aligned = action_paded[:, self.config.inverse_used_action_channel_ids]
-        action_mask_aligned = action_mask_padded[:, self.config.inverse_used_action_channel_ids]
-        action_aligned = (action_aligned - self.q01) / (
-                self.q99 - self.q01 + 1e-6) * 2. - 1.
-        action_aligned = rearrange(action_aligned, "(f n) c -> c f n 1", f=image_frame_num)
-        action_mask_aligned = rearrange(action_mask_aligned, "(f n) c -> c f n 1", f=image_frame_num)
-        action_aligned *= action_mask_aligned
-        return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
+        action_abs = rearrange(action, "f c -> c f 1 1")
+        action_mask = rearrange(action_mask, "f c -> c f 1 1")
+        return torch.from_numpy(action_abs).float(), torch.from_numpy(action_mask).bool()
 
     def _state_post_process(self, local_start_frame, local_end_frame, image_frame_ids, state):
         del local_end_frame
@@ -477,40 +592,56 @@ class LatentLeRobotDataset(LeRobotDataset):
             return None
 
         act_shift = int(image_frame_ids[0] - local_start_frame)
-        state = state[act_shift:]
-        left_state = get_relative_pose(state[:, :7])
-        right_state = get_relative_pose(state[:, 8:15])
-        state = np.concatenate([left_state, state[:, 7:8], right_state, state[:, 15:16]], axis=1)
+        state = np.asarray(state[act_shift:], dtype=np.float32)
 
-        image_frame_num = (len(image_frame_ids) - 1) // self.config.image_frame_stride + 1
-        state = state[::self.config.image_frame_stride][:image_frame_num]
+        image_frame_num = len(image_frame_ids)
         if state.shape[0] < image_frame_num:
-            pad = np.repeat(state[-1:], image_frame_num - state.shape[0], axis=0)
-            state = np.concatenate([state, pad], axis=0)
+            raise ValueError(
+                f"Not enough states for image frames: states={state.shape[0]}, images={image_frame_num}"
+            )
+        state = state[:image_frame_num]
 
-        state_padded = np.pad(state, ((0, 0), (0, 1)), mode='constant', constant_values=0)
-        state_aligned = state_padded[:, self.config.inverse_used_action_channel_ids]
-        state_aligned = (state_aligned - self.q01) / (
+        return torch.from_numpy(state).float().transpose(0, 1)  # [16, F]
+
+    def _align_state_with_multi_view_mode(self, states):
+        if states is None or getattr(self.config, 'multi_view_image_mode', 'vertical') != 'frame':
+            return states
+        num_views = len(self.used_video_keys)
+        return states.repeat_interleave(num_views, dim=1)
+
+    def _normalize_relative_compact_action(self, relative_action_16d):
+        relative_action_16d = np.asarray(relative_action_16d, dtype=np.float32).reshape(-1, 16)
+        action_mask = np.ones_like(relative_action_16d, dtype=bool)
+        action_padded = np.pad(relative_action_16d, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+        action_mask_padded = np.pad(action_mask, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+
+        action_aligned = action_padded[:, self.config.inverse_used_action_channel_ids]
+        action_mask_aligned = action_mask_padded[:, self.config.inverse_used_action_channel_ids]
+        action_aligned = (action_aligned - self.q01) / (
                 self.q99 - self.q01 + 1e-6) * 2. - 1.
-
-        state_mask = np.zeros((self.config.action_dim,), dtype=bool)
-        state_mask[self.config.used_action_channel_ids] = True
-        state_aligned *= state_mask[None]
-        return torch.from_numpy(state_aligned).float().transpose(0, 1)  # [C_action, F]
+        action_aligned *= action_mask_aligned
+        return (
+            torch.from_numpy(action_aligned).float(),
+            torch.from_numpy(action_mask_aligned).bool(),
+        )
 
     def _sample_window_and_chunk(self, images, actions, states=None):
-        """Sample one frame and one future action chunk for VGA training."""
+        """Sample one image frame and an action chunk starting at the same timestep."""
         chunk_size = int(getattr(self.config, 'chunk_size', 1))
+        history_len = max(1, int(getattr(self.config, 'history_len', 1)))
+        history_stride = max(1, int(getattr(self.config, 'history_frame_stride', 1)))
 
         c_img, f_total, h, w = images.shape
-        c_act, f_total_action, n, one = actions.shape
+        c_abs, f_total_action, n, one = actions.shape
         if f_total != f_total_action:
             raise ValueError(f"images/actions frame count mismatch: {f_total} vs {f_total_action}")
+        if c_abs != 16:
+            raise ValueError(f"Expected absolute compact 16D action sequence, got {c_abs} channels")
         if f_total <= 0:
             raise ValueError("No valid frames available after preprocessing")
 
         required_frames_for_chunk = max(1, (chunk_size + n - 1) // n)
-        min_t = 0
+        min_t = min(f_total - 1, (history_len - 1) * history_stride)
         max_t = f_total - required_frames_for_chunk
 
         if max_t >= min_t:
@@ -518,29 +649,68 @@ class LatentLeRobotDataset(LeRobotDataset):
         else:
             data_timestep = max(0, f_total - 1)
 
-        window_end = data_timestep + 1
-        window_start = data_timestep
+        raw_indices = [
+            data_timestep - (history_len - 1 - i) * history_stride
+            for i in range(history_len)
+        ]
+        history_indices = torch.as_tensor(
+            [max(0, min(f_total - 1, idx)) for idx in raw_indices],
+            dtype=torch.long,
+        )
 
-        images_window = images[:, window_start:window_end]
-        actions_window = actions[:, window_start:window_end]
+        images_window = images.index_select(1, history_indices)
 
-        local_data_timestep = 0
+        anchor_idx = int(history_indices[0].item())
+        if states is not None:
+            anchor_pose = states[:, anchor_idx]
+        else:
+            anchor_pose = actions[:, anchor_idx, 0, 0]
+
+        action_abs_flat = rearrange(actions, 'c f n 1 -> (f n) c')
+        rel_action_flat = get_relative_compact_action(action_abs_flat, anchor_pose)
+        rel_action_norm_flat, rel_action_mask_flat = self._normalize_relative_compact_action(rel_action_flat)
+        actions = rearrange(rel_action_norm_flat, '(f n) c -> c f n 1', f=f_total, n=n)
+        base_action_mask = rearrange(rel_action_mask_flat, '(f n) c -> c f n 1', f=f_total, n=n)
+        c_act = actions.shape[0]
+        actions_window = actions.index_select(1, history_indices).clone()
+
+        local_data_timestep = history_len - 1
         images_mask = torch.ones_like(images_window, dtype=torch.bool)
-        actions_mask = torch.zeros_like(actions_window, dtype=torch.bool)
-
-        action_flat = rearrange(actions, 'c f n 1 -> c (f n)')
-        chunk_start = data_timestep * n
-        chunk_end = min(chunk_start + chunk_size, action_flat.shape[-1])
-        action_chunk = action_flat[:, chunk_start:chunk_end]
-        if action_chunk.shape[-1] < chunk_size:
-            chunk_pad = torch.zeros((c_act, chunk_size - action_chunk.shape[-1]), dtype=action_chunk.dtype)
-            action_chunk = torch.cat([action_chunk, chunk_pad], dim=1)
+        actions_mask = base_action_mask.index_select(1, history_indices).clone()
+        actions_mask[:, local_data_timestep:] = False
 
         if states is not None:
-            state = states[:, data_timestep]
+            state_abs = states[:, data_timestep]
         else:
             # Fallback for legacy datasets without observation.state.
-            state = actions[:, data_timestep, -1, 0]  # [C_action]
+            state_abs = action_abs_flat[data_timestep * n]
+        state_rel = get_relative_compact_action(state_abs[None], anchor_pose)
+        state, state_mask = self._normalize_relative_compact_action(state_rel)
+        state = state[0]
+        state_mask = state_mask[0]
+        # Current-frame VGA action branch uses the real robot state as token 0;
+        # the remaining padded slots stay learned action-query tokens.
+        actions_window[:, local_data_timestep, 0, 0] = state.to(actions_window.dtype)
+        actions_mask[:, local_data_timestep, 0, 0] = state_mask.to(actions_mask.device)
+
+        action_flat = rearrange(actions, 'c f n 1 -> c (f n)')
+        action_mask_flat = rearrange(base_action_mask, 'c f n 1 -> c (f n)')
+        chunk_start = data_timestep * n
+        chunk_end = min(chunk_start + chunk_size, action_flat.shape[-1])
+        future_action_chunk = action_flat[:, chunk_start:chunk_end]
+        future_action_chunk_mask = action_mask_flat[:, chunk_start:chunk_end]
+        if future_action_chunk.shape[-1] < chunk_size:
+            chunk_pad = torch.zeros((c_act, chunk_size - future_action_chunk.shape[-1]), dtype=future_action_chunk.dtype)
+            chunk_mask_pad = torch.zeros(
+                (c_act, chunk_size - future_action_chunk_mask.shape[-1]),
+                dtype=torch.bool,
+            )
+            future_action_chunk = torch.cat([future_action_chunk, chunk_pad], dim=1)
+            future_action_chunk_mask = torch.cat([future_action_chunk_mask, chunk_mask_pad], dim=1)
+
+        # RDT denoises [current_state, future_action_0, ..., future_action_{chunk_size-1}].
+        action_chunk = torch.cat([state.unsqueeze(-1), future_action_chunk], dim=1)
+        action_chunk_mask = torch.cat([state_mask.unsqueeze(-1), future_action_chunk_mask], dim=1)
 
         return {
             'images': images_window,
@@ -548,9 +718,10 @@ class LatentLeRobotDataset(LeRobotDataset):
             'images_mask': images_mask,
             'actions_mask': actions_mask,
             'action_chunk': action_chunk,
+            'action_chunk_mask': action_chunk_mask,
             'state': state,
             'pred_frame_idx': torch.tensor(local_data_timestep, dtype=torch.long),
-            'num_frames': torch.tensor(1, dtype=torch.long),
+            'num_frames': torch.tensor(history_len, dtype=torch.long),
         }
 
     def __getitem__(self, idx) -> dict:
@@ -583,6 +754,9 @@ class LatentLeRobotDataset(LeRobotDataset):
         hf_data_frames = self._get_range_hf_data(start_frame, end_frame)
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_images(ori_data_dict)
+        out_dict['text'] = self._get_selected_text(cur_meta, ori_data_dict)
+        if self.encode_text_in_dataloader:
+            out_dict['text_emb'] = self._get_selected_text_embedding(cur_meta, ori_data_dict)
 
         out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(
             local_start_frame,
@@ -600,6 +774,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             out_dict['actions'],
             out_dict['actions_mask'],
         )
+        out_dict['state_seq'] = self._align_state_with_multi_view_mode(out_dict.get('state_seq', None))
         out_dict['images'] = out_dict['images'].permute(1, 0, 2, 3) # [C, F, H, W]
 
         sampled_dict = self._sample_window_and_chunk(
@@ -607,7 +782,9 @@ class LatentLeRobotDataset(LeRobotDataset):
             actions=out_dict['actions'],
             states=out_dict.get('state_seq', None),
         )
-        sampled_dict['text_emb'] = out_dict['text_emb']
+        sampled_dict['text'] = out_dict['text']
+        if self.encode_text_in_dataloader:
+            sampled_dict['text_emb'] = out_dict['text_emb']
 
         return sampled_dict
 

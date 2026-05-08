@@ -54,6 +54,7 @@ class VGAAggregator(nn.Module):
         self.patch_size = patch_size
         self.depth = int(depth)
         self.action_chunk_size = int(action_chunk_size)
+        self.action_dim = int(action_dim)
 
         self.__build_patch_embed__(
             patch_embed,
@@ -67,6 +68,7 @@ class VGAAggregator(nn.Module):
         # Learnable action query tokens [C, D], where C is action chunk size.
         self.action_query_tokens = nn.Parameter(torch.randn(self.action_chunk_size, embed_dim))
         nn.init.normal_(self.action_query_tokens, std=1e-6)
+        self.action_embedder = nn.Linear(self.action_dim, embed_dim)
 
         self.frame_blocks_image = nn.ModuleList(
             [
@@ -192,6 +194,7 @@ class VGAAggregator(nn.Module):
         self,
         images: torch.Tensor,
         actions: Optional[torch.Tensor] = None,
+        actions_mask: Optional[torch.Tensor] = None,
         text_emb: Optional[torch.Tensor] = None,
         image_grid_id=None,
         action_grid_id=None,
@@ -217,8 +220,52 @@ class VGAAggregator(nn.Module):
         patch_tokens = patch_tokens.reshape(bsz, seq_len, num_views, patch_tokens.shape[1], patch_tokens.shape[2])
         patches_per_view = patch_tokens.shape[3]
 
-        del actions
-        action_tokens = self.action_query_tokens[None, None].expand(bsz, seq_len, -1, -1)
+        action_query_tokens = self.action_query_tokens[None, None].expand(bsz, seq_len, -1, -1)
+        if actions is None:
+            action_tokens = action_query_tokens
+        else:
+            if actions.ndim != 5:
+                raise ValueError(
+                    f"actions must be [B,C,F,N,1], got shape {tuple(actions.shape)}"
+                )
+            if actions.shape[0] != bsz or actions.shape[1] != self.action_dim or actions.shape[2] != seq_len:
+                raise ValueError(
+                    f"actions shape {tuple(actions.shape)} is incompatible with images "
+                    f"{(bsz, seq_len)} and action_dim={self.action_dim}"
+                )
+            action_values = actions[..., 0].permute(0, 2, 3, 1).contiguous()  # [B,S,N,C]
+            action_tokens = self.action_embedder(action_values.to(self.action_embedder.weight.dtype)).to(images.dtype)
+            if action_tokens.shape[2] < self.action_chunk_size:
+                pad_tokens = action_query_tokens[:, :, action_tokens.shape[2] :]
+                action_tokens = torch.cat([action_tokens, pad_tokens], dim=2)
+            elif action_tokens.shape[2] > self.action_chunk_size:
+                action_tokens = action_tokens[:, :, : self.action_chunk_size]
+
+            if actions_mask is not None:
+                if actions_mask.shape != actions.shape:
+                    raise ValueError(
+                        f"actions_mask shape {tuple(actions_mask.shape)} must match actions shape {tuple(actions.shape)}"
+                    )
+                token_mask = actions_mask[..., 0].permute(0, 2, 3, 1).any(dim=-1, keepdim=True)
+                if token_mask.shape[2] < self.action_chunk_size:
+                    pad_mask = torch.zeros(
+                        bsz,
+                        seq_len,
+                        self.action_chunk_size - token_mask.shape[2],
+                        1,
+                        device=token_mask.device,
+                        dtype=torch.bool,
+                    )
+                    token_mask = torch.cat([token_mask, pad_mask], dim=2)
+                elif token_mask.shape[2] > self.action_chunk_size:
+                    token_mask = token_mask[:, :, : self.action_chunk_size]
+                action_tokens = torch.where(token_mask.to(action_tokens.device), action_tokens, action_query_tokens)
+            else:
+                current_mask = torch.ones(
+                    bsz, seq_len, 1, 1, device=action_tokens.device, dtype=torch.bool
+                )
+                current_mask[:, -1:] = False
+                action_tokens = torch.where(current_mask, action_tokens, action_query_tokens)
         n_action_tokens = action_tokens.shape[2]
 
         if text_emb is None:
@@ -270,7 +317,8 @@ class VGAAggregator(nn.Module):
 
             p_total = merged.shape[2]
             global_in = merged.reshape(bsz, seq_len * p_total, -1)
-            global_out = self.global_blocks[layer_idx](global_in)
+            causal_mask = make_frame_causal_mask(seq_len, p_total, global_in.device, global_in.dtype)
+            global_out = self.global_blocks[layer_idx](global_in, attn_mask=causal_mask)
             global_out = global_out.reshape(bsz, seq_len, p_total, -1)
 
             # Keep StreamVGGT-compatible geometry feature format: [frame || global].
@@ -300,3 +348,12 @@ def slice_expand_and_flatten(token_tensor, bsz, seq_len):
     others = token_tensor[:, 1:seq_len, ...].expand(bsz, max(seq_len - 1, 0), *token_tensor.shape[2:])
     combined = torch.cat([query, others], dim=1)
     return combined.reshape(bsz * seq_len, *combined.shape[2:])
+
+
+def make_frame_causal_mask(seq_len, tokens_per_frame, device, dtype):
+    if seq_len <= 1:
+        return None
+    frame_ids = torch.arange(seq_len, device=device).repeat_interleave(tokens_per_frame)
+    blocked = frame_ids[:, None] < frame_ids[None, :]
+    mask = torch.zeros((seq_len * tokens_per_frame, seq_len * tokens_per_frame), device=device, dtype=dtype)
+    return mask.masked_fill(blocked, torch.finfo(dtype).min)

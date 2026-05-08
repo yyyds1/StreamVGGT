@@ -24,12 +24,13 @@ from vga.models.vga import VGA
 from configs import VA_CONFIGS
 from rdt.model import RDT
 from utils import (
-    DiffusionScheduler,
+    FlowMatchScheduler,
     get_mesh_id,
     init_logger,
     logger,
     run_async_server_mode,
 )
+from utils.text_embedding import encode_prompt
 
 
 def get_effective_num_image_views(config):
@@ -187,47 +188,58 @@ class VA_Server:
         self.device = torch.device(f"cuda:{job_config.local_rank}")
 
         self.num_input_frames = 1
+        self.history_len = max(1, int(getattr(job_config, "history_len", 1)))
+        self.history_frame_stride = max(1, int(getattr(job_config, "history_frame_stride", 1)))
         self.chunk_size = int(getattr(job_config, "chunk_size", 24))
+        self.rdt_horizon = self.chunk_size + 1
         self.image_frame_stride = int(getattr(job_config, "image_frame_stride", 8))
         self.action_dim = int(job_config.action_dim)
         self.patch_size = tuple(getattr(job_config, "patch_size", (1, 14, 14)))
         self.multi_view_image_mode = getattr(job_config, "multi_view_image_mode", "vertical")
         self.model_arch = str(getattr(job_config, "model_arch", "actionvggt")).lower()
         self.state_condition_mode = str(getattr(job_config, "state_condition_mode", "latest")).lower()
-        if self.state_condition_mode not in {"latest", "episode_initial", "null"}:
+        if self.state_condition_mode not in {"first_action", "latest", "episode_initial", "null"}:
             raise ValueError(
                 f"Unsupported state_condition_mode `{self.state_condition_mode}`. "
-                "Expected one of {'latest', 'episode_initial', 'null'}."
+                "Expected one of {'first_action', 'latest', 'episode_initial', 'null'}."
             )
 
         self.image_height = int(getattr(job_config, "image_height", job_config.height))
         self.image_width = int(getattr(job_config, "image_width", job_config.width))
 
         # If chunk size is not divisible by stride, keep one frame with full chunk tokens.
-        if self.chunk_size % self.image_frame_stride == 0:
-            self.pred_frames = self.chunk_size // self.image_frame_stride
+        if self.rdt_horizon % self.image_frame_stride == 0:
+            self.pred_frames = self.rdt_horizon // self.image_frame_stride
             self.tokens_per_frame = self.image_frame_stride
         else:
             self.pred_frames = 1
-            self.tokens_per_frame = self.chunk_size
+            self.tokens_per_frame = self.rdt_horizon
 
-        self.train_scheduler_action = DiffusionScheduler(
-            num_train_timesteps=1000,
-            beta_start=getattr(self.job_config, "action_beta_start", 1e-4),
-            beta_end=getattr(self.job_config, "action_beta_end", 2e-2),
+        rdt_cfg = self.job_config.rdt
+        self.train_scheduler_action = FlowMatchScheduler(
+            num_inference_steps=int(getattr(rdt_cfg, "num_inference_steps", 100)),
+            num_train_timesteps=int(getattr(rdt_cfg, "num_train_timesteps", 1000)),
+            shift=float(getattr(rdt_cfg, "flow_match_shift", 3.0)),
+            sigma_max=float(getattr(rdt_cfg, "sigma_max", 1.0)),
+            sigma_min=float(getattr(rdt_cfg, "sigma_min", 0.003 / 1.002)),
+            extra_one_step=bool(getattr(rdt_cfg, "extra_one_step", True)),
         )
-        action_steps = int(getattr(self.job_config, "action_num_inference_steps", 50))
+        action_steps = int(getattr(rdt_cfg, "num_inference_steps", getattr(self.job_config, "action_num_inference_steps", 100)))
         self.train_scheduler_action.set_timesteps(action_steps)
+        self.warm_start_blend = float(max(0.0, min(1.0, getattr(rdt_cfg, "warm_start_blend", 0.85))))
+        self.warm_start_noise_std = float(max(0.0, getattr(rdt_cfg, "warm_start_noise_std", 0.03)))
+        self.action_smoothing_alpha = float(max(0.0, min(1.0, getattr(rdt_cfg, "action_smoothing_alpha", 0.35))))
 
         common_kwargs = dict(
             img_height=self.image_height,
             img_width=self.image_width,
             num_image_views=get_effective_num_image_views(self.job_config),
+            text_embed_dim=int(getattr(job_config, "text_embed_dim", 4096)),
             rdt_img_cond_mode=getattr(job_config, "rdt_img_cond_mode", "full"),
             rdt_img_pool_size=getattr(job_config, "rdt_img_pool_size", 1),
             rdt_img_keep_summary_tokens=getattr(job_config, "rdt_img_keep_summary_tokens", False),
-            window_size=self.num_input_frames,
-            chunk_size=self.chunk_size,
+            window_size=self.history_len,
+            chunk_size=self.rdt_horizon,
             action_dim=self.action_dim,
             aggregator_depth=int(getattr(job_config, "actionvggt_depth", 24)),
             image_frame_stride=self.image_frame_stride,
@@ -274,9 +286,9 @@ class VA_Server:
                 ("image", (self.num_input_frames * effective_num_image_views, patch_h, patch_w))
             ]
 
-        rdt_horizon = self.chunk_size
+        rdt_horizon = self.rdt_horizon
         rdt_x_pos_emb_config = [("act", rdt_horizon + self.job_config.rdt.num_register_tokens)]
-        rdt_act_pos_emb_config = [("action", (self.num_input_frames, self.image_frame_stride))]
+        rdt_act_pos_emb_config = [("action", (self.num_input_frames, rdt_horizon))]
 
         self.action_head = RDT(
             horizon=rdt_horizon,
@@ -288,7 +300,7 @@ class VA_Server:
             img_pos_emb_config=rdt_img_pos_emb_config,
             max_img_len=self.num_input_frames * img_tokens_per_frame,
             act_pos_emb_config=rdt_act_pos_emb_config,
-            max_act_len=self.num_input_frames * self.image_frame_stride,
+            max_act_len=self.num_input_frames * rdt_horizon,
             dtype=self.dtype,
         )
         self.action_head.to(self.device)
@@ -358,6 +370,9 @@ class VA_Server:
         )
 
     def _resolve_text_emb_from_dataset(self, prompt: Optional[str]) -> Optional[torch.Tensor]:
+        return self._encode_prompt_text_emb(prompt)
+
+    def _encode_prompt_text_emb(self, prompt: Optional[str]) -> Optional[torch.Tensor]:
         prompt_norm = self._normalize_prompt_text(prompt)
         if not prompt_norm:
             return None
@@ -365,41 +380,16 @@ class VA_Server:
         if prompt_norm in self._text_emb_cache:
             return self._text_emb_cache[prompt_norm]
 
-        self._build_text_emb_search_files()
-        for latent_file in self._text_emb_search_files:
-            try:
-                payload = torch.load(latent_file, map_location="cpu", weights_only=False)
-            except Exception:
-                continue
-
-            if not isinstance(payload, dict):
-                continue
-
-            text = self._normalize_prompt_text(payload.get("text", None))
-            if text != prompt_norm:
-                continue
-
-            text_emb = payload.get("text_emb", None)
-            if text_emb is None:
-                continue
-            if not torch.is_tensor(text_emb):
-                text_emb = torch.as_tensor(text_emb)
-            if text_emb.ndim == 2:
-                text_emb = text_emb.unsqueeze(0)
-            elif text_emb.ndim != 3:
-                continue
-
-            text_emb = text_emb.to(dtype=self.dtype, device=self.device)
-            self._text_emb_cache[prompt_norm] = text_emb
-            logger.info(f"Loaded text embedding for prompt from {latent_file}")
-            return text_emb
-
-        logger.warning(
-            f"No matching dataset text embedding found for prompt: {prompt_norm!r}. "
-            "Eval will fall back to no-language conditioning."
-        )
-        self._text_emb_cache[prompt_norm] = None
-        return None
+        text_emb = encode_prompt(prompt_norm, self.job_config, device=self.device, dtype=self.dtype)
+        if text_emb is None:
+            logger.warning(
+                f"No text tokenizer configured for prompt: {prompt_norm!r}. "
+                "Eval will fall back to no-language conditioning."
+            )
+        else:
+            logger.info(f"Encoded prompt with p2p-compatible text tokenizer: {prompt_norm!r}")
+        self._text_emb_cache[prompt_norm] = text_emb
+        return text_emb
 
     def _normalize_text_emb_payload(self, text_emb):
         if text_emb is None:
@@ -410,6 +400,13 @@ class VA_Server:
             text_emb = text_emb.unsqueeze(0)
         elif text_emb.ndim != 3:
             raise ValueError(f"text_emb must be [B, D] or [B, L, D], got shape {tuple(text_emb.shape)}")
+        expected_dim = int(getattr(self.job_config, "text_embed_dim", text_emb.shape[-1]))
+        if int(text_emb.shape[-1]) != expected_dim:
+            logger.warning(
+                f"Ignoring provided text_emb with dim {int(text_emb.shape[-1])}; "
+                f"expected p2p-compatible dim {expected_dim}."
+            )
+            return None
         return text_emb.to(dtype=self.dtype, device=self.device)
 
     def _load_checkpoint_state(self, path):
@@ -577,8 +574,12 @@ class VA_Server:
         self.prompt = prompt
         self.runtime_text_emb = self._resolve_text_emb_from_dataset(prompt)
         self.action_history = []
+        self.frame_history = []
+        self.pose_history = []
+        self.prev_absolute_action_chunk = None
+        self.prev_executed_absolute_action_16d = None
         self.episode_initial_state = None
-        self.initial_abs_state = None
+        self.current_anchor_abs_state = None
         self.transformer_past_key_values = [None] * self.transformer.aggregator.depth
         self.frame_st_id = 0
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
@@ -683,32 +684,52 @@ class VA_Server:
 
         return state_aligned.unsqueeze(0).unsqueeze(1)  # [B, 1, C]
 
-    def _relative_state_16(self, state):
+    @staticmethod
+    def _safe_quat(quat):
+        quat = np.asarray(quat, dtype=np.float32).reshape(4)
+        norm = np.linalg.norm(quat)
+        if not np.isfinite(norm) or norm < 1e-8:
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        return quat / norm
+
+    def _relative_state_16(self, state, anchor_state=None):
         current = np.asarray(state, dtype=np.float32).reshape(-1)
         if current.size != len(self.used_action_channel_ids):
             raise ValueError(
                 f"Expected state with {len(self.used_action_channel_ids)} values, got shape {tuple(current.shape)}"
             )
-        if self.initial_abs_state is None:
-            self.initial_abs_state = current.copy()
+        if anchor_state is None:
+            anchor_state = self.current_anchor_abs_state
+        if anchor_state is None:
+            anchor_state = current
+        anchor_state = np.asarray(anchor_state, dtype=np.float32).reshape(-1)
+        if anchor_state.size != len(self.used_action_channel_ids):
+            raise ValueError(
+                f"Expected anchor state with {len(self.used_action_channel_ids)} values, got shape {tuple(anchor_state.shape)}"
+            )
 
-        initial = self.initial_abs_state
-        left_rot = (R.from_quat(initial[3:7]).inv() * R.from_quat(current[3:7])).as_quat()
-        right_rot = (R.from_quat(initial[11:15]).inv() * R.from_quat(current[11:15])).as_quat()
+        left_rot = (
+            R.from_quat(self._safe_quat(anchor_state[3:7])[None]).inv()
+            * R.from_quat(self._safe_quat(current[3:7])[None])
+        ).as_quat().reshape(-1)
+        right_rot = (
+            R.from_quat(self._safe_quat(anchor_state[11:15])[None]).inv()
+            * R.from_quat(self._safe_quat(current[11:15])[None])
+        ).as_quat().reshape(-1)
         rel_state_16 = np.concatenate(
             [
-                current[:3] - initial[:3],
+                current[:3] - anchor_state[:3],
                 left_rot,
                 current[7:8],
-                current[8:11] - initial[8:11],
+                current[8:11] - anchor_state[8:11],
                 right_rot,
                 current[15:16],
             ]
         ).astype(np.float32)
         return torch.from_numpy(rel_state_16)
 
-    def preprocess_relative_state(self, state):
-        rel_state_16 = self._relative_state_16(state)
+    def preprocess_relative_state(self, state, anchor_state=None):
+        rel_state_16 = self._relative_state_16(state, anchor_state=anchor_state)
 
         state_padded = torch.zeros(self.action_dim, dtype=torch.float32)
         state_padded[self.used_action_channel_ids] = rel_state_16
@@ -723,6 +744,162 @@ class VA_Server:
         state_aligned = state_aligned * self.action_mask.to(state_aligned.device)
 
         return state_aligned.unsqueeze(0).unsqueeze(1)  # [B, 1, C]
+
+    def _compose_relative_pose(self, relative_pose, anchor_pose):
+        relative_pose = np.asarray(relative_pose, dtype=np.float32).reshape(8)
+        anchor_pose = np.asarray(anchor_pose, dtype=np.float32).reshape(8)
+        rel_rot = R.from_quat(self._safe_quat(relative_pose[3:7])[None])
+        anchor_rot = R.from_quat(self._safe_quat(anchor_pose[3:7])[None])
+        abs_rot = (anchor_rot * rel_rot).as_quat().reshape(-1)
+        abs_rot = self._safe_quat(abs_rot)
+        abs_trans = relative_pose[:3] + anchor_pose[:3]
+        return np.concatenate([abs_trans, abs_rot, relative_pose[7:8]]).astype(np.float32)
+
+    def _compose_relative_compact_action(self, relative_action, anchor_state):
+        relative_action = np.asarray(relative_action, dtype=np.float32)
+        original_shape = relative_action.shape
+        if relative_action.shape[0] != len(self.used_action_channel_ids):
+            raise ValueError(
+                f"Expected relative action with first dim {len(self.used_action_channel_ids)}, "
+                f"got shape {relative_action.shape}"
+            )
+        flat_actions = relative_action.reshape(len(self.used_action_channel_ids), -1).T
+        anchor_state = np.asarray(anchor_state, dtype=np.float32).reshape(len(self.used_action_channel_ids))
+        absolute_actions = []
+        for rel_action in flat_actions:
+            left = self._compose_relative_pose(rel_action[:8], anchor_state[:8])
+            right = self._compose_relative_pose(rel_action[8:], anchor_state[8:])
+            absolute_actions.append(np.concatenate([left, right]).astype(np.float32))
+        return np.stack(absolute_actions, axis=0).T.reshape(original_shape)
+
+    def _slerp_quat(self, start_quat, end_quat, alpha):
+        start_quat = self._safe_quat(start_quat)
+        end_quat = self._safe_quat(end_quat)
+        dot = float(np.dot(start_quat, end_quat))
+        if dot < 0.0:
+            end_quat = -end_quat
+            dot = -dot
+        dot = float(np.clip(dot, -1.0, 1.0))
+        if dot > 0.9995:
+            return self._safe_quat((1.0 - alpha) * start_quat + alpha * end_quat)
+
+        theta_0 = float(np.arccos(dot))
+        sin_theta_0 = float(np.sin(theta_0))
+        theta = theta_0 * alpha
+        s0 = float(np.sin(theta_0 - theta) / sin_theta_0)
+        s1 = float(np.sin(theta) / sin_theta_0)
+        return self._safe_quat(s0 * start_quat + s1 * end_quat)
+
+    def _smooth_absolute_pose(self, previous_pose, current_pose, alpha):
+        previous_pose = np.asarray(previous_pose, dtype=np.float32).reshape(8)
+        current_pose = np.asarray(current_pose, dtype=np.float32).reshape(8)
+        blended_translation = (1.0 - alpha) * previous_pose[:3] + alpha * current_pose[:3]
+        blended_rotation = self._slerp_quat(previous_pose[3:7], current_pose[3:7], alpha)
+        blended_gripper = (1.0 - alpha) * previous_pose[7:8] + alpha * current_pose[7:8]
+        return np.concatenate([blended_translation, blended_rotation, blended_gripper]).astype(np.float32)
+
+    def _smooth_absolute_compact_action(self, previous_action_16d, current_action_16d, alpha):
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        previous_action_16d = np.asarray(previous_action_16d, dtype=np.float32).reshape(16)
+        current_action_16d = np.asarray(current_action_16d, dtype=np.float32).reshape(16)
+        if alpha <= 0.0:
+            return previous_action_16d.copy()
+        if alpha >= 1.0:
+            return current_action_16d.copy()
+        left = self._smooth_absolute_pose(previous_action_16d[:8], current_action_16d[:8], alpha)
+        right = self._smooth_absolute_pose(previous_action_16d[8:], current_action_16d[8:], alpha)
+        return np.concatenate([left, right]).astype(np.float32)
+
+    def _relative_action_chunk_to_normalized_tensor(self, absolute_action_chunk, anchor_state):
+        absolute_action_chunk = np.asarray(absolute_action_chunk, dtype=np.float32)
+        if absolute_action_chunk.ndim == 3:
+            absolute_action_chunk = absolute_action_chunk[:, :, 0]
+        if absolute_action_chunk.shape[0] != len(self.used_action_channel_ids):
+            raise ValueError(
+                f"Expected absolute action chunk with first dim {len(self.used_action_channel_ids)}, "
+                f"got shape {absolute_action_chunk.shape}"
+            )
+        rel_tokens = []
+        for token_idx in range(absolute_action_chunk.shape[1]):
+            rel_token = self.preprocess_relative_state(
+                absolute_action_chunk[:, token_idx],
+                anchor_state=anchor_state,
+            )[0, 0]
+            rel_tokens.append(rel_token)
+        norm_chunk = torch.stack(rel_tokens, dim=1)  # [C, T]
+        return norm_chunk.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)  # [1, C, T, 1, 1]
+
+    def _build_warm_start_action_sample(self, current_obs, dtype):
+        if self.prev_absolute_action_chunk is None or self.warm_start_blend <= 0.0:
+            return None
+        if self.current_anchor_abs_state is None:
+            return None
+        obs_state = current_obs.get("observation.state", None)
+        if obs_state is None:
+            return None
+
+        prev_chunk = np.asarray(self.prev_absolute_action_chunk, dtype=np.float32)
+        if prev_chunk.ndim == 2:
+            prev_chunk = prev_chunk[:, :, None]
+        if prev_chunk.shape[0] != len(self.used_action_channel_ids) or prev_chunk.shape[1] < 1:
+            return None
+
+        shifted_chunk = np.empty_like(prev_chunk)
+        if prev_chunk.shape[1] > 1:
+            shifted_chunk[:, :-1, :] = prev_chunk[:, 1:, :]
+        shifted_chunk[:, -1:, :] = prev_chunk[:, -1:, :]
+
+        future_x0 = self._relative_action_chunk_to_normalized_tensor(
+            shifted_chunk,
+            anchor_state=self.current_anchor_abs_state,
+        ).to(self.device, dtype=dtype)
+        current_state_x0 = self.preprocess_relative_state(
+            obs_state,
+            anchor_state=self.current_anchor_abs_state,
+        ).to(self.device, dtype=dtype)
+        current_state_x0 = current_state_x0.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)
+        x0_tokens = torch.cat(
+            [
+                current_state_x0,
+                future_x0,
+            ],
+            dim=2,
+        )
+        if x0_tokens.shape[2] != self.rdt_horizon:
+            return None
+        x0_tokens = x0_tokens.reshape(
+            1,
+            self.action_dim,
+            self.pred_frames,
+            self.tokens_per_frame,
+            1,
+        )
+        noise = torch.randn_like(x0_tokens)
+        sigma_start = self.train_scheduler_action.sigmas[0].to(self.device, dtype=dtype)
+        sample = (1.0 - sigma_start) * x0_tokens + sigma_start * noise
+        if self.warm_start_blend < 1.0:
+            sample = self.warm_start_blend * sample + (1.0 - self.warm_start_blend) * torch.randn_like(sample)
+        if self.warm_start_noise_std > 0.0:
+            sample = sample + self.warm_start_noise_std * torch.randn_like(sample)
+        return sample
+
+    def _apply_action_smoothing(self, absolute_action, relative_action, anchor_state):
+        if self.prev_executed_absolute_action_16d is None or self.action_smoothing_alpha >= 1.0:
+            return absolute_action, relative_action
+
+        smoothed_action_16d = self._smooth_absolute_compact_action(
+            self.prev_executed_absolute_action_16d,
+            absolute_action[:, 0, 0],
+            self.action_smoothing_alpha,
+        )
+        absolute_action = absolute_action.copy()
+        relative_action = relative_action.copy()
+        absolute_action[:, 0, 0] = smoothed_action_16d
+        relative_action[:, 0, 0] = self._relative_state_16(
+            smoothed_action_16d,
+            anchor_state=anchor_state,
+        ).numpy()
+        return absolute_action, relative_action
 
     def postprocess_action(self, action):
         action = action.cpu()  # [B, C, F, N, 1]
@@ -749,6 +926,35 @@ class VA_Server:
         token_idx = -1 if use_latest_token else 0
         state_vec = frame_tokens[:, token_idx]  # [C]
         return state_vec.unsqueeze(0).unsqueeze(1)  # [1, 1, C]
+
+    def _state_condition_from_current_obs(self, current_obs, dtype):
+        obs_state = current_obs.get("observation.state", None)
+        if obs_state is not None:
+            return self.preprocess_relative_state(
+                obs_state,
+                anchor_state=self.current_anchor_abs_state,
+            ).to(self.device, dtype=dtype)
+        return torch.zeros((1, 1, self.action_dim), device=self.device, dtype=dtype)
+
+    def _first_action_state_condition(self, pred_frames, tokens_per_frame, dtype, current_obs=None):
+        action_source = torch.zeros(
+            (1, self.action_dim, pred_frames, tokens_per_frame, 1),
+            device=self.device,
+            dtype=dtype,
+        )
+        if current_obs is not None:
+            action_source[:, :, 0, 0, 0] = self._state_condition_from_current_obs(current_obs, dtype)[:, 0]
+        elif len(self.action_history) > 0:
+            latest_action = self.action_history[-1]
+            if latest_action.shape[1] != tokens_per_frame:
+                latest_action = F.interpolate(
+                    latest_action.unsqueeze(0),
+                    size=tokens_per_frame,
+                    mode="linear",
+                    align_corners=False,
+                )[0]
+            action_source[:, :, 0, :, 0] = latest_action.to(self.device, dtype=dtype)
+        return rearrange(action_source, "b c f n 1 -> b (f n) c")[:, :1]
 
     def _build_model_input(self, current_obs):
         current_frames = self._preprocess_obs_to_frames([current_obs])
@@ -814,39 +1020,101 @@ class VA_Server:
             "text_emb": None,
         }
         pred_action_chunk_dict = {
-            "noised_latent": torch.zeros((1, self.action_dim, self.chunk_size), device=self.device, dtype=self.dtype),
+            "noised_latent": torch.zeros((1, self.action_dim, self.rdt_horizon), device=self.device, dtype=self.dtype),
             "timesteps": torch.zeros((1,), device=self.device, dtype=torch.float32),
             "pred_frame_idx": torch.zeros((1,), device=self.device, dtype=torch.long),
-            "latent": torch.zeros((1, self.action_dim, self.chunk_size), device=self.device, dtype=self.dtype),
+            "latent": torch.zeros((1, self.action_dim, self.rdt_horizon), device=self.device, dtype=self.dtype),
         }
 
         return {
             "image_dict": image_dict,
             "action_dict": action_dict,
             "pred_action_chunk_dict": pred_action_chunk_dict,
-            "chunk_size": self.chunk_size,
+            "chunk_size": self.rdt_horizon,
+            "future_action_chunk_size": self.chunk_size,
         }
 
-    def _update_transformer_cache_with_frame(self, frame_tensor):
+    def _select_history_indices(self, length):
+        if length <= 0:
+            return []
+        indices = [
+            length - 1 - (self.history_len - 1 - i) * self.history_frame_stride
+            for i in range(self.history_len)
+        ]
+        return [max(0, min(length - 1, idx)) for idx in indices]
+
+    def _update_transformer_cache_with_frame(self, frame_tensor, current_obs=None):
         transformer_dtype = next(self.transformer.aggregator.patch_embed.parameters()).dtype
         frame_tensor = frame_tensor.to(self.device, dtype=transformer_dtype)
+        current_pose = None
+        if current_obs is not None and current_obs.get("observation.state", None) is not None:
+            current_pose = np.asarray(current_obs["observation.state"], dtype=np.float32).reshape(-1)
+        self.frame_history.append(
+            {
+                "frame": frame_tensor.detach().cpu(),
+                "action_abs": None,
+                "pose": None if current_pose is None else current_pose.copy(),
+            }
+        )
+        if current_pose is not None:
+            self.pose_history.append(current_pose.copy())
+        elif len(self.pose_history) > 0:
+            self.pose_history.append(self.pose_history[-1].copy())
+        else:
+            self.pose_history.append(np.zeros(len(self.used_action_channel_ids), dtype=np.float32))
+        self._trim_rolling_history()
 
-        action_state = torch.zeros((1, self.action_dim, 1, self.image_frame_stride, 1), device=self.device, dtype=transformer_dtype)
-        if len(self.action_history) > 0:
-            last_state = self.action_history[-1]
-            if last_state.shape[1] != self.image_frame_stride:
-                last_state = F.interpolate(
-                    last_state.unsqueeze(0),
+        history_indices = self._select_history_indices(len(self.frame_history))
+        if len(self.pose_history) != len(self.frame_history):
+            raise ValueError(
+                f"pose/frame history mismatch: poses={len(self.pose_history)}, frames={len(self.frame_history)}"
+            )
+        anchor_abs_state = self.pose_history[history_indices[0]].copy()
+        self.current_anchor_abs_state = anchor_abs_state
+        selected_frames = [
+            self.frame_history[idx]["frame"].to(self.device, dtype=transformer_dtype)
+            for idx in history_indices
+        ]
+        action_state = torch.zeros(
+            (1, self.action_dim, len(selected_frames), self.image_frame_stride, 1),
+            device=self.device,
+            dtype=transformer_dtype,
+        )
+        action_mask = torch.zeros_like(action_state, dtype=torch.bool)
+        current_local_idx = len(selected_frames) - 1
+        for local_idx, frame_hist_idx in enumerate(history_indices):
+            if local_idx == current_local_idx:
+                if current_obs is not None and current_obs.get("observation.state", None) is not None:
+                    current_state = self.preprocess_relative_state(
+                        current_obs["observation.state"],
+                        anchor_state=anchor_abs_state,
+                    ).to(self.device, dtype=transformer_dtype)
+                    action_state[:, :, local_idx, 0, 0] = current_state[:, 0]
+                    action_mask[:, :, local_idx, 0, 0] = True
+                continue
+            frame_action_abs = self.frame_history[frame_hist_idx].get("action_abs", None)
+            if frame_action_abs is None:
+                frame_action_abs = self.pose_history[frame_hist_idx]
+            frame_action = self.preprocess_relative_state(
+                frame_action_abs,
+                anchor_state=anchor_abs_state,
+            )[0, 0].unsqueeze(-1)
+            if frame_action is None:
+                continue
+            if frame_action.shape[1] != self.image_frame_stride:
+                frame_action = F.interpolate(
+                    frame_action.unsqueeze(0),
                     size=self.image_frame_stride,
                     mode="linear",
                     align_corners=False,
                 )[0]
-            action_state[:, :, 0, :, 0] = last_state.to(self.device, dtype=transformer_dtype)
+            action_state[:, :, local_idx, :, 0] = frame_action.to(self.device, dtype=transformer_dtype)
+            action_mask[:, :, local_idx, :, 0] = True
 
         frame_idx = self.frame_st_id
-        _, frame_h, frame_w = frame_tensor.shape
+        _, frame_h, frame_w = selected_frames[-1].shape
         image_grid_id = get_mesh_id(
-            1,
+            len(selected_frames),
             frame_h // self.patch_size[1],
             frame_w // self.patch_size[2],
             t=0,
@@ -855,7 +1123,7 @@ class VA_Server:
             action=False,
         ).to(self.device)[None]
         action_grid_id = get_mesh_id(
-            1,
+            len(selected_frames),
             self.image_frame_stride,
             1,
             t=1,
@@ -865,8 +1133,9 @@ class VA_Server:
         ).to(self.device)[None]
 
         frame_payload = {
-            "img": frame_tensor,
-            "actions": action_state[:, :, 0, :, 0],
+            "img": torch.stack(selected_frames, dim=0).unsqueeze(0),
+            "actions": action_state[:, :, :, :, 0],
+            "actions_mask": action_mask[:, :, :, :, 0],
             "image_grid_id": image_grid_id,
             "action_grid_id": action_grid_id,
             "text_emb": self.runtime_text_emb,
@@ -882,36 +1151,69 @@ class VA_Server:
     def _append_rdt_condition_history(self, conds):
         del conds
 
+    def _trim_rolling_history(self):
+        max_buffer = max(1, self.history_len * self.history_frame_stride)
+        if len(self.frame_history) > max_buffer:
+            self.frame_history = self.frame_history[-max_buffer:]
+        if len(self.action_history) > max_buffer:
+            self.action_history = self.action_history[-max_buffer:]
+        if len(self.pose_history) > max_buffer:
+            self.pose_history = self.pose_history[-max_buffer:]
+
     def _build_windowed_rdt_conds(self, frame_conds):
         conds = {
             "rdt_img_c": frame_conds["rdt_img_c"].to(self.device, dtype=self.dtype),
             "rdt_act_c": frame_conds["rdt_act_c"].to(self.device, dtype=self.dtype),
         }
-        if "rdt_lang_c" in frame_conds and frame_conds["rdt_lang_c"] is not None:
-            conds["rdt_lang_c"] = frame_conds["rdt_lang_c"].to(self.device, dtype=self.dtype)
         return conds
 
     def _predict_actions(self, current_obs):
         with torch.no_grad():
             current_frames = self._preprocess_obs_to_frames([current_obs])
             frame_tensor = current_frames[-1].to(self.device, dtype=self.dtype)
-            frame_conds = self._update_transformer_cache_with_frame(frame_tensor)
+            frame_conds = self._update_transformer_cache_with_frame(frame_tensor, current_obs=current_obs)
             conds = self._build_windowed_rdt_conds(frame_conds)
             action_head_dtype = next(self.action_head.parameters()).dtype
             conds_img_c = conds["rdt_img_c"].to(self.device, dtype=action_head_dtype)
             conds_act_c = conds["rdt_act_c"].to(self.device, dtype=action_head_dtype)
-
-            action_sample = torch.randn(
-                (1, self.action_dim, self.pred_frames, self.tokens_per_frame, 1),
-                device=self.device,
-                dtype=self.dtype,
-            )
+            expected_act_cond_len = self.pred_frames * self.tokens_per_frame
+            if conds_act_c.shape[1] != expected_act_cond_len:
+                raise ValueError(
+                    f"RDT action condition length mismatch: act_c={conds_act_c.shape[1]}, "
+                    f"noisy_action={expected_act_cond_len}"
+                )
 
             obs_state = current_obs.get("observation.state", None)
-            if self.state_condition_mode == "episode_initial" and obs_state is not None:
-                state_c = self.preprocess_relative_state(obs_state).to(self.device, dtype=self.dtype)
+            action_sample = self._build_warm_start_action_sample(
+                current_obs,
+                dtype=self.dtype,
+            )
+            if action_sample is None:
+                action_sample = torch.randn(
+                    (1, self.action_dim, self.pred_frames, self.tokens_per_frame, 1),
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+
+            if self.state_condition_mode == "first_action":
+                # Match p2p+RDT inference: RDT uses state_actions[:, :1, :].
+                # Here state_actions is the clean action-history/source tensor, not the noisy sample.
+                state_c = self._first_action_state_condition(
+                    pred_frames=self.pred_frames,
+                    tokens_per_frame=self.tokens_per_frame,
+                    dtype=self.dtype,
+                    current_obs=current_obs,
+                )
+            elif self.state_condition_mode == "episode_initial" and obs_state is not None:
+                state_c = self.preprocess_relative_state(
+                    obs_state,
+                    anchor_state=self.current_anchor_abs_state,
+                ).to(self.device, dtype=self.dtype)
             elif obs_state is not None and self.state_condition_mode == "latest":
-                state_c = self.preprocess_relative_state(obs_state).to(self.device, dtype=self.dtype)
+                state_c = self.preprocess_relative_state(
+                    obs_state,
+                    anchor_state=self.current_anchor_abs_state,
+                ).to(self.device, dtype=self.dtype)
             elif len(self.action_history) > 0:
                 last_state = self.action_history[-1]
                 if last_state.shape[1] != self.tokens_per_frame:
@@ -938,19 +1240,19 @@ class VA_Server:
             for i, t in enumerate(timesteps):
                 x_in = rearrange(action_sample, "b c f n 1 -> b (f n) c").to(self.device, dtype=action_head_dtype)
                 t_batch = torch.full((x_in.shape[0],), float(t.item()), device=self.device, dtype=torch.float32)
-                noise_pred = self.action_head(
+                flow_pred = self.action_head(
                     x_in,
                     t_batch,
-                    lang_c=conds.get("rdt_lang_c", None),
+                    lang_c=None,
                     img_c=conds_img_c,
                     act_c=conds_act_c,
                     state_c=state_c,
                     embed_input=True,
                     decode_output=True,
                 )
-                noise_pred = rearrange(noise_pred, "b (f n) c -> b c f n 1", f=self.pred_frames, n=self.tokens_per_frame)
+                flow_pred = rearrange(flow_pred, "b (f n) c -> b c f n 1", f=self.pred_frames, n=self.tokens_per_frame)
                 action_sample = self.train_scheduler_action.step(
-                    noise_pred,
+                    flow_pred,
                     t,
                     action_sample,
                     prev_timestep=timesteps[i + 1] if (i + 1) < len(timesteps) else None,
@@ -958,7 +1260,37 @@ class VA_Server:
                 )
 
         action_sample[:, ~self.action_mask.to(action_sample.device)] *= 0
-        return self.postprocess_action(action_sample)
+        action_tokens = rearrange(action_sample, "b c f n 1 -> b c (f n) 1 1")
+        future_action_tokens = action_tokens[:, :, 1 : self.chunk_size + 1]
+        relative_action = self.postprocess_action(future_action_tokens)
+        if self.current_anchor_abs_state is None:
+            raise ValueError("Missing history-window anchor before composing predicted action.")
+        absolute_action = self._compose_relative_compact_action(
+            relative_action,
+            self.current_anchor_abs_state,
+        )
+        absolute_action = np.nan_to_num(
+            absolute_action,
+            nan=0.0,
+            posinf=1e3,
+            neginf=-1e3,
+        ).astype(np.float32)
+        relative_action = np.nan_to_num(
+            relative_action,
+            nan=0.0,
+            posinf=1e3,
+            neginf=-1e3,
+        ).astype(np.float32)
+        absolute_action, relative_action = self._apply_action_smoothing(
+            absolute_action,
+            relative_action,
+            anchor_state=self.current_anchor_abs_state,
+        )
+        return {
+            "relative_action": relative_action,
+            "absolute_action": absolute_action,
+            "action_reference": self.current_anchor_abs_state.astype(np.float32).copy(),
+        }
 
     @torch.no_grad()
     def infer(self, obs):
@@ -968,10 +1300,15 @@ class VA_Server:
         compute_kv_cache = obs.get("compute_kv_cache", False)
 
         if text_emb is not None:
-            self.runtime_text_emb = self._normalize_text_emb_payload(text_emb)
+            normalized_text_emb = self._normalize_text_emb_payload(text_emb)
+            if normalized_text_emb is not None:
+                self.runtime_text_emb = normalized_text_emb
+            elif prompt is not None:
+                self.prompt = prompt
+                self.runtime_text_emb = self._encode_prompt_text_emb(prompt)
         elif (self.runtime_text_emb is None) and prompt is not None:
             self.prompt = prompt
-            self.runtime_text_emb = self._resolve_text_emb_from_dataset(prompt)
+            self.runtime_text_emb = self._encode_prompt_text_emb(prompt)
 
         if reset:
             logger.info("******************* Reset server ******************")
@@ -999,7 +1336,18 @@ class VA_Server:
                 self.frame_st_id += 1
 
             if action_state_norm is not None and num_action_frames > 0:
-                self.action_history = [action_state_norm[:, num_action_frames - 1]]
+                self.action_history = [
+                    action_state_norm[:, idx].detach().cpu()
+                    for idx in range(num_action_frames)
+                ]
+                max_buffer = max(1, self.history_len * self.history_frame_stride)
+                if len(self.action_history) > max_buffer:
+                    self.action_history = self.action_history[-max_buffer:]
+                start = max(0, len(self.frame_history) - len(self.action_history))
+                for local_idx, action_tensor in enumerate(self.action_history[-len(self.frame_history):]):
+                    frame_idx = start + local_idx
+                    if frame_idx < len(self.frame_history):
+                        self.frame_history[frame_idx]["action"] = action_tensor
                 # Match training episode-initial state: actions[:, :, 0, 0, 0] -> [B, 1, C].
                 self.episode_initial_state = self._state_token_from_action_tensor(
                     action_state_norm, use_latest_token=False
@@ -1017,18 +1365,28 @@ class VA_Server:
             current_obs = current_obs[-1]
 
         logger.info("################# Infer One Chunk (ActionVGGT + RDT) #################")
-        action = self._predict_actions(current_obs)
-        action_state_norm = self.preprocess_action(action)[0, :, :, :, 0].float()
-        # Keep the newest predicted frame in history.
-        self.action_history = [action_state_norm[:, -1]]
+        pred = self._predict_actions(current_obs)
+        action = pred["absolute_action"]
+        relative_action = pred["relative_action"]
+        current_action_abs = torch.from_numpy(action[:, 0, 0]).float()
+        self.action_history.append(current_action_abs.detach().cpu())
+        self.prev_absolute_action_chunk = action.astype(np.float32).copy()
+        self.prev_executed_absolute_action_16d = action[:, 0, 0].astype(np.float32).copy()
+        if len(self.frame_history) > 0:
+            self.frame_history[-1]["action_abs"] = action[:, 0, 0].astype(np.float32).copy()
+        self._trim_rolling_history()
         if self.episode_initial_state is None:
-            self.episode_initial_state = self._state_token_from_action_tensor(
-                action_state_norm, use_latest_token=False
-            ).to(
-                self.device, dtype=self.dtype
-            )
+            self.episode_initial_state = self.preprocess_relative_state(
+                action[:, 0, 0],
+                anchor_state=pred["action_reference"],
+            ).to(self.device, dtype=self.dtype)
         self.frame_st_id += 1
-        return {"action": action}
+        return {
+            "action": action,
+            "action_absolute": action,
+            "action_relative": relative_action,
+            "action_reference": pred["action_reference"],
+        }
 
 
 def run(args):

@@ -49,8 +49,9 @@ from utils import (
     get_mesh_id,
     sample_timestep_id,
     warmup_constant_lambda,
-    DiffusionScheduler,
+    FlowMatchScheduler,
 )
+from utils.text_embedding import encode_prompt
 from vga.models.vga import VGA
 from rdt.model import RDT
 from vga.utils.lora import extract_lora_state_dict, load_lora_state_dict
@@ -325,11 +326,15 @@ class Trainer:
         self.loss_weight_action = float(getattr(config, "loss_weight_action", 1.0))
         self.state_noise_std = float(getattr(config, "state_noise_std", 0.0))
         self.state_noise_clip = bool(getattr(config, "state_noise_clip", True))
+        self.rdt_state_token_loss_weight = float(getattr(config, "rdt_state_token_loss_weight", 0.1))
+        self.action_condition_noise_std = float(getattr(config.rdt, "action_condition_noise_std", 0.0))
+        self.vga_action_state_noise_std = float(getattr(config, "vga_action_state_noise_std", 0.0))
+        self.vga_action_state_noise_clip = bool(getattr(config, "vga_action_state_noise_clip", True))
         self.state_condition_mode = str(getattr(config, "state_condition_mode", "latest")).lower()
-        if self.state_condition_mode not in {"latest", "episode_initial", "null"}:
+        if self.state_condition_mode not in {"first_action", "latest", "episode_initial", "null"}:
             raise ValueError(
                 f"Unsupported state_condition_mode `{self.state_condition_mode}`. "
-                "Expected one of {'latest', 'episode_initial', 'null'}."
+                "Expected one of {'first_action', 'latest', 'episode_initial', 'null'}."
             )
         self.use_lora = bool(getattr(config, "use_lora", True))
         self.lora_rank = int(getattr(config, "lora_rank", 8))
@@ -354,8 +359,8 @@ class Trainer:
             rdt_img_pool_size=getattr(config, "rdt_img_pool_size", 1),
             rdt_img_keep_summary_tokens=getattr(config, "rdt_img_keep_summary_tokens", False),
             aggregator_depth=int(getattr(config, "actionvggt_depth", 24)),
-            window_size=1,
-            chunk_size=int(getattr(config, "chunk_size", 24)),
+            window_size=max(1, int(getattr(config, "history_len", 1))),
+            chunk_size=int(getattr(config, "chunk_size", 24)) + 1,
             action_dim=int(getattr(config, "action_dim", 30)),
             image_frame_stride=int(getattr(config, "image_frame_stride", 8)),
         )
@@ -412,8 +417,8 @@ class Trainer:
             rdt_img_pos_emb_config = [
                 ("image", (num_input_frames * effective_num_image_views, patch_h, patch_w))
             ]
-        act_tokens_per_frame = self.config.image_frame_stride
-        rdt_horizon = self.config.chunk_size
+        rdt_horizon = self.config.chunk_size + 1
+        act_tokens_per_frame = rdt_horizon
         rdt_x_pos_emb_config = [("act", rdt_horizon + self.config.rdt.num_register_tokens)]
         rdt_act_pos_emb_config = [("action", (num_input_frames, act_tokens_per_frame))]
 
@@ -727,14 +732,22 @@ class Trainer:
             shuffle=(train_sampler is None), 
             num_workers=config.load_worker,
             sampler=train_sampler,
+            timeout=int(getattr(config, "dataloader_timeout", 0)),
         )
 
-        self.train_scheduler_action = DiffusionScheduler(
-            num_train_timesteps=1000,
-            beta_start=getattr(self.config, "action_beta_start", 1e-4),
-            beta_end=getattr(self.config, "action_beta_end", 2e-2),
+        rdt_cfg = self.config.rdt
+        self.train_scheduler_action = FlowMatchScheduler(
+            num_inference_steps=int(getattr(rdt_cfg, "num_inference_steps", 100)),
+            num_train_timesteps=int(getattr(rdt_cfg, "num_train_timesteps", 1000)),
+            shift=float(getattr(rdt_cfg, "flow_match_shift", 3.0)),
+            sigma_max=float(getattr(rdt_cfg, "sigma_max", 1.0)),
+            sigma_min=float(getattr(rdt_cfg, "sigma_min", 0.003 / 1.002)),
+            extra_one_step=bool(getattr(rdt_cfg, "extra_one_step", True)),
         )
-        self.train_scheduler_action.set_timesteps(1000, training=True)
+        self.train_scheduler_action.set_timesteps(
+            int(getattr(rdt_cfg, "num_train_timesteps", 1000)),
+            training=True,
+        )
 
         if self._resume_checkpoint_dir is not None:
             self.save_dir = self._resume_checkpoint_dir.parent
@@ -744,6 +757,9 @@ class Trainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
+        self.cfg_prob = float(getattr(config, "cfg_prob", 0.0))
+        self._text_embedding_cache = {}
+        self._empty_text_embedding = None
         if getattr(config, "transformer_resume", False) and self._transformer_resume_checkpoint_dir is not None:
             logger.info(
                 f"Loading optimizer/scheduler training state from: {self._transformer_resume_checkpoint_dir / 'training_state.pt'}"
@@ -754,9 +770,12 @@ class Trainer:
     def _add_noise(self, latent, train_scheduler, action_mask=False, action_mode=False, noisy_cond_prob=0.):
         B, C, F, H, W = latent.shape
 
-        timestep_ids = sample_timestep_id(batch_size=B, num_train_timesteps=train_scheduler.num_train_timesteps)
+        timestep_ids = sample_timestep_id(
+            batch_size=B,
+            num_train_timesteps=len(train_scheduler.timesteps),
+        )
         noise = torch.zeros_like(latent).normal_()
-        timesteps = timestep_ids.to(device=self.device)
+        timesteps = train_scheduler.timesteps.to(device=self.device)[timestep_ids.to(device=self.device)]
         noisy_latents = train_scheduler.add_noise(latent, noise, timesteps, t_dim=0)
         targets = train_scheduler.training_target(latent, noise, timesteps)
         loss_weights = train_scheduler.training_weight(timesteps).view(B, 1, 1, 1, 1)
@@ -781,10 +800,12 @@ class Trainer:
                     batch_size=B,
                     min_timestep_bd=0.5, 
                     max_timestep_bd=1.0, 
-                    num_train_timesteps=train_scheduler.num_train_timesteps,
+                    num_train_timesteps=len(train_scheduler.timesteps),
                 )
             noise = torch.zeros_like(latent).normal_()
-            cond_timesteps = cond_timestep_ids.to(device=self.device)
+            cond_timesteps = train_scheduler.timesteps.to(device=self.device)[
+                cond_timestep_ids.to(device=self.device)
+            ]
             latent = train_scheduler.add_noise(latent, noise, cond_timesteps, t_dim=0)
         else:
             cond_timesteps = torch.zeros_like(timesteps)
@@ -808,6 +829,7 @@ class Trainer:
     def _prepare_input_dict(self, batch_dict):
         """Prepare model input dict from fixed-size dataset outputs."""
         chunk_size = getattr(self.config, 'chunk_size', None)
+        rdt_horizon = chunk_size + 1
 
         if 'images' not in batch_dict:
             raise ValueError("batch_dict must include raw 'images' for VGA training")
@@ -820,7 +842,7 @@ class Trainer:
 
         images = batch_dict['images']  # [B, C_image, F, H, W]
         actions = batch_dict['actions']  # [B, C_action, F, N, 1]
-        text_emb = batch_dict.get('text_emb', None)
+        text_emb = self._resolve_batch_text_embedding(batch_dict)
         image_mask = batch_dict.get('images_mask', torch.ones_like(images, dtype=torch.bool))
         action_mask = batch_dict.get('actions_mask', torch.ones_like(actions, dtype=torch.bool))
 
@@ -830,6 +852,7 @@ class Trainer:
             raise ValueError(
                 f"images/actions shape mismatch: images={tuple(images.shape)}, actions={tuple(actions.shape)}"
             )
+        actions = self._maybe_add_noise_to_vga_action_state(actions, action_mask)
 
 
         # Build grid_id for image tokens using 3D mesh (F, H//p, W//p)
@@ -848,7 +871,7 @@ class Trainer:
         image_dict = dict(
             images=images,
             grid_id=image_grid_id,
-            text_emb=batch_dict.get('text_emb', None),
+            text_emb=text_emb,
             images_mask=image_mask,
         )
 
@@ -867,28 +890,38 @@ class Trainer:
         action_dict = dict(
             actions=actions,
             grid_id=action_grid_id,
-            text_emb=batch_dict.get('text_emb', None),
+            text_emb=text_emb,
             action_mask=action_mask,
             actions_mask=action_mask,
         )
 
         # Build noised action chunks from dataset-provided chunk targets.
-        action_chunk = batch_dict['action_chunk']  # [B, C_action, chunk_size]
-        if action_chunk.shape[-1] != chunk_size:
+        action_chunk = batch_dict['action_chunk']  # [B, C_action, chunk_size + 1]
+        if action_chunk.shape[-1] != rdt_horizon:
             raise ValueError(
-                f"action_chunk length mismatch: got {action_chunk.shape[-1]}, expected {chunk_size}"
+                f"action_chunk length mismatch: got {action_chunk.shape[-1]}, expected {rdt_horizon}"
             )
-        action_chunk = rearrange(action_chunk, 'b c f -> b c f 1 1')  # [B, C_action, chunk_size, 1, 1]
+        action_chunk_mask = batch_dict.get('action_chunk_mask', None)
+        if action_chunk_mask is None:
+            action_chunk_mask = torch.ones_like(action_chunk, dtype=torch.bool)
+        if action_chunk_mask.shape != action_chunk.shape:
+            raise ValueError(
+                f"action_chunk_mask shape mismatch: got {tuple(action_chunk_mask.shape)}, "
+                f"expected {tuple(action_chunk.shape)}"
+            )
+        action_chunk = rearrange(action_chunk, 'b c f -> b c f 1 1')  # [B, C_action, chunk_size + 1, 1, 1]
+        action_chunk_mask = rearrange(action_chunk_mask, 'b c f -> b c f 1 1')
         action_chunk_dict = self._add_noise(
             action_chunk,
             train_scheduler=self.train_scheduler_action,
-            action_mask=None,
+            action_mask=action_chunk_mask,
             action_mode=True,
         )
         action_chunk_dict["pred_frame_idx"] = batch_dict['pred_frame_idx'].long()
         action_chunk_dict['targets'] = rearrange(action_chunk_dict['targets'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
         action_chunk_dict['noisy_latents'] = rearrange(action_chunk_dict['noisy_latents'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
         action_chunk_dict['latent'] = rearrange(action_chunk_dict['latent'], 'b c f 1 1 -> b c f')  # [B, C_action, chunk_size]
+        action_chunk_dict['action_mask'] = rearrange(action_chunk_mask, 'b c f 1 1 -> b c f')
 
         # Keep raw language conditioning for learned projection before RDT.
         if text_emb is not None:
@@ -904,7 +937,8 @@ class Trainer:
             'action_dict': action_dict,
             'pred_action_chunk_dict': action_chunk_dict,
             'lang_c': text_emb,
-            'chunk_size': chunk_size,
+            'chunk_size': rdt_horizon,
+            'future_action_chunk_size': chunk_size,
         }
         episode_initial_state = actions[:, :, 0, 0, 0]  # [B, C_action], first token of current sequence
         input_dict['episode_initial_state_c'] = episode_initial_state.unsqueeze(1)  # [B, 1, C_action]
@@ -917,6 +951,66 @@ class Trainer:
             else:
                 raise ValueError(f"state must be [B, C] or [B, 1, C], got {tuple(state.shape)}")
         return input_dict
+
+    def _normalize_batch_texts(self, text_payload):
+        if text_payload is None:
+            return None
+        if isinstance(text_payload, str):
+            return [text_payload]
+        if isinstance(text_payload, (list, tuple)):
+            return [str(v) for v in text_payload]
+        if torch.is_tensor(text_payload):
+            return [str(v) for v in text_payload.tolist()]
+        return [str(text_payload)]
+
+    def _encode_text_cached(self, text: str):
+        text = str(text or "")
+        if text not in self._text_embedding_cache:
+            text_emb = encode_prompt(text, self.config, device="cpu", dtype=torch.float32)
+            if text_emb is None:
+                self._text_embedding_cache[text] = None
+            else:
+                if text_emb.ndim == 3 and text_emb.shape[0] == 1:
+                    text_emb = text_emb.squeeze(0)
+                self._text_embedding_cache[text] = text_emb.cpu().float().contiguous()
+        cached = self._text_embedding_cache[text]
+        return None if cached is None else cached.clone()
+
+    def _get_empty_text_embedding(self):
+        if self._empty_text_embedding is None:
+            self._empty_text_embedding = self._encode_text_cached("")
+        return None if self._empty_text_embedding is None else self._empty_text_embedding.clone()
+
+    def _resolve_batch_text_embedding(self, batch_dict):
+        text_emb = batch_dict.get('text_emb', None)
+        if text_emb is not None:
+            return text_emb
+
+        texts = self._normalize_batch_texts(batch_dict.get('text', None))
+        if not texts:
+            return None
+
+        encoded = []
+        empty_emb = None
+        for text in texts:
+            use_empty = self.cfg_prob > 0.0 and torch.rand(1).item() < self.cfg_prob
+            if use_empty:
+                if empty_emb is None:
+                    empty_emb = self._get_empty_text_embedding()
+                cur_emb = empty_emb
+            else:
+                cur_emb = self._encode_text_cached(text)
+            if cur_emb is None:
+                return None
+            encoded.append(cur_emb)
+
+        try:
+            return torch.stack(encoded, dim=0)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Failed to stack text embeddings for batch texts={texts}; "
+                f"embedding shapes={[tuple(v.shape) for v in encoded]}"
+            ) from exc
 
     def convert_input_format(self, input_dict):
         """Move tensors inside nested dicts to the target device."""
@@ -936,13 +1030,40 @@ class Trainer:
 
         return to_dtype(to_device(input_dict))
 
+    def _maybe_add_noise_to_vga_action_state(self, actions, actions_mask):
+        if self.vga_action_state_noise_std <= 0.0:
+            return actions
+        valid_mask = actions_mask.to(device=actions.device, dtype=actions.dtype)
+        noise = torch.randn_like(actions.float()) * self.vga_action_state_noise_std
+        noisy_actions = actions.float() + noise * valid_mask
+        noisy_actions = torch.where(valid_mask.bool(), noisy_actions, actions.float())
+        if self.vga_action_state_noise_clip:
+            noisy_actions = noisy_actions.clamp(-1.0, 1.0)
+        return noisy_actions.to(dtype=actions.dtype)
+
+    def _maybe_add_noise_to_action_condition(self, action_condition):
+        if action_condition is None:
+            return None
+        if self.action_condition_noise_std <= 0.0:
+            return action_condition
+        action_condition_fp32 = action_condition.float()
+        token_rms = action_condition_fp32.pow(2).mean(dim=-1, keepdim=True)
+        token_rms = token_rms.add(1e-6).sqrt()
+        noise = torch.randn_like(action_condition_fp32) * (token_rms * self.action_condition_noise_std)
+        return (action_condition_fp32 + noise).to(dtype=action_condition.dtype)
+
     def compute_loss(self, input_dict, pred):
         action_pred = pred
         action_pred = rearrange(action_pred, 'b f c -> b c f')
         action_target = input_dict['pred_action_chunk_dict']['targets'].float().detach()
         action_loss_weight = input_dict['pred_action_chunk_dict']['loss_weights']
         action_loss_weight = rearrange(action_loss_weight, 'b 1 f 1 1 -> b 1 f').to(action_pred.dtype)
-        action_mask = torch.ones_like(action_target, dtype=action_pred.dtype, device=action_pred.device)
+        action_mask = input_dict['pred_action_chunk_dict'].get('action_mask', None)
+        if action_mask is None:
+            action_mask = torch.ones_like(action_target, dtype=torch.bool, device=action_pred.device)
+        action_mask = action_mask.to(device=action_pred.device, dtype=action_pred.dtype)
+        if action_mask.shape[-1] > 1:
+            action_mask[..., 0] *= self.rdt_state_token_loss_weight
 
         squared_error = (action_pred.float() - action_target).pow(2) * action_loss_weight.float()
         denom = action_mask.sum().clamp_min(1.0)
@@ -1030,12 +1151,20 @@ class Trainer:
             action_chunk = input_dict['pred_action_chunk_dict']['noisy_latents']  # [B, C_action, chunk_size]
             action_chunk = action_chunk.permute(0, 2, 1) # [B, chunk_size, C_action]
             timesteps = input_dict['pred_action_chunk_dict']['timesteps']
+            if rdt_conds['rdt_act_c'].shape[1] != action_chunk.shape[1]:
+                raise ValueError(
+                    f"RDT action condition length mismatch: act_c={rdt_conds['rdt_act_c'].shape[1]}, "
+                    f"noisy_action={action_chunk.shape[1]}"
+                )
             if self.state_condition_mode == "null":
                 state_c = torch.zeros(
                     (action_chunk.shape[0], 1, self.transformer.action_dim),
                     device=self.device,
                     dtype=action_chunk.dtype,
                 )
+            elif self.state_condition_mode == "first_action":
+                state_c = input_dict['pred_action_chunk_dict']['latent'][:, :, 0:1]
+                state_c = state_c.permute(0, 2, 1)  # [B, 1, C_action]
             elif self.state_condition_mode == "episode_initial":
                 state_c = input_dict.get('episode_initial_state_c', None)
                 if state_c is None:
@@ -1054,9 +1183,9 @@ class Trainer:
             action_pred = self.action_head(
                 action_chunk,
                 timesteps,
-                lang_c=rdt_conds['rdt_lang_c'],
+                lang_c=None,
                 img_c=rdt_conds['rdt_img_c'],
-                act_c=rdt_conds['rdt_act_c'],
+                act_c=self._maybe_add_noise_to_action_condition(rdt_conds['rdt_act_c']),
                 state_c=state_c,
                 embed_input=True,
                 decode_output=True,
