@@ -14,13 +14,15 @@ va_vga_robotwin_cfg.text_model_name_or_path = "google/embeddinggemma-300M"
 va_vga_robotwin_cfg.max_position_embeddings = 128
 va_vga_robotwin_cfg.text_embedding_shape = [1, 768]
 va_vga_robotwin_cfg.text_embed_dim = 768
+va_vga_robotwin_cfg.preload_text_embedder_eval = True
+va_vga_robotwin_cfg.text_embedder_warmup_prompt = "warmup"
 
 # The image/action token layout changed to stride=1; do not resume stride=4 checkpoints.
-va_vga_robotwin_cfg.transformer_resume = False
-va_vga_robotwin_cfg.transformer_resume_from = '/home/yds/code/StreamVGGT/src/train_out/checkpoint_step_27000/transformer/diffusion_pytorch_model.safetensors'
+va_vga_robotwin_cfg.transformer_resume = True
+va_vga_robotwin_cfg.transformer_resume_from = '/home/yds/code/StreamVGGT/src/train_out/checkpoint_step_22000/transformer/diffusion_pytorch_model.safetensors'
 va_vga_robotwin_cfg.transformer_pretrained = None
-va_vga_robotwin_cfg.action_head_resume = False
-va_vga_robotwin_cfg.action_head_resume_from = '/home/yds/code/StreamVGGT/src/train_out/checkpoint_step_27000/action_head/diffusion_pytorch_model.safetensors'
+va_vga_robotwin_cfg.action_head_resume = True
+va_vga_robotwin_cfg.action_head_resume_from = '/home/yds/code/StreamVGGT/src/train_out/checkpoint_step_22000/action_head/diffusion_pytorch_model.safetensors'
 va_vga_robotwin_cfg.action_head_pretrained = None
 
 # LoRA settings for the pretrained VGA backbone.

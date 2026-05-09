@@ -30,7 +30,7 @@ from utils import (
     logger,
     run_async_server_mode,
 )
-from utils.text_embedding import encode_prompt
+from utils.text_embedding import encode_prompt, get_text_embedder
 
 
 def get_effective_num_image_views(config):
@@ -319,6 +319,7 @@ class VA_Server:
         self._text_emb_cache = {}
         self._text_emb_search_files = None
 
+        self._preload_text_embedder()
         self._reset_runtime_buffers(prompt=None)
 
     def _normalize_prompt_text(self, prompt: Optional[str]) -> Optional[str]:
@@ -371,6 +372,55 @@ class VA_Server:
 
     def _resolve_text_emb_from_dataset(self, prompt: Optional[str]) -> Optional[torch.Tensor]:
         return self._encode_prompt_text_emb(prompt)
+
+    def _preload_text_embedder(self) -> None:
+        if not bool(getattr(self.job_config, "preload_text_embedder_eval", True)):
+            logger.info("Skipping eval text embedder preload because preload_text_embedder_eval=False.")
+            return
+
+        tokenizer_name = str(getattr(self.job_config, "text_tokenizer_name", "") or "").strip()
+        if not tokenizer_name:
+            logger.info("No eval text tokenizer configured; skipping text embedder preload.")
+            return
+
+        model_name = str(
+            getattr(self.job_config, "text_model_name_or_path", None)
+            or getattr(self.job_config, "model_name_or_path", None)
+            or "google/embeddinggemma-300M"
+        )
+        start_time = time.monotonic()
+        logger.info(
+            f"Preloading eval text embedder `{tokenizer_name}` from `{model_name}` before websocket startup..."
+        )
+        try:
+            embedder = get_text_embedder(self.job_config)
+            if embedder is None:
+                logger.warning(
+                    f"Text tokenizer `{tokenizer_name}` is not supported by get_text_embedder; "
+                    "eval will run without server-side text embeddings."
+                )
+                return
+            warmup_text = str(getattr(self.job_config, "text_embedder_warmup_prompt", "warmup"))
+            warmup_emb = encode_prompt(
+                warmup_text,
+                self.job_config,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            if warmup_emb is not None:
+                self._text_emb_cache[warmup_text] = warmup_emb
+                logger.info(
+                    f"Eval text embedder warmup complete: shape={tuple(warmup_emb.shape)}, "
+                    f"dtype={warmup_emb.dtype}, device={warmup_emb.device}"
+                )
+        except Exception:
+            logger.exception(
+                "Failed to preload eval text embedder before websocket startup. "
+                "Fix the text model path/cache or set preload_text_embedder_eval=False to bypass."
+            )
+            raise
+        finally:
+            logger.info(f"Eval text embedder preload took {(time.monotonic() - start_time):.2f}s.")
 
     def _encode_prompt_text_emb(self, prompt: Optional[str]) -> Optional[torch.Tensor]:
         prompt_norm = self._normalize_prompt_text(prompt)
@@ -570,9 +620,17 @@ class VA_Server:
         )
         logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
 
-    def _reset_runtime_buffers(self, prompt=None):
+    def _reset_runtime_buffers(self, prompt=None, text_emb=None):
         self.prompt = prompt
-        self.runtime_text_emb = self._resolve_text_emb_from_dataset(prompt)
+        if text_emb is not None:
+            normalized_text_emb = self._normalize_text_emb_payload(text_emb)
+            self.runtime_text_emb = (
+                normalized_text_emb
+                if normalized_text_emb is not None
+                else self._resolve_text_emb_from_dataset(prompt)
+            )
+        else:
+            self.runtime_text_emb = self._resolve_text_emb_from_dataset(prompt)
         self.action_history = []
         self.frame_history = []
         self.pose_history = []
@@ -1299,6 +1357,11 @@ class VA_Server:
         text_emb = obs.get("text_emb", None)
         compute_kv_cache = obs.get("compute_kv_cache", False)
 
+        if reset:
+            logger.info("******************* Reset server ******************")
+            self._reset_runtime_buffers(prompt=prompt, text_emb=text_emb)
+            return {}
+
         if text_emb is not None:
             normalized_text_emb = self._normalize_text_emb_payload(text_emb)
             if normalized_text_emb is not None:
@@ -1309,11 +1372,6 @@ class VA_Server:
         elif (self.runtime_text_emb is None) and prompt is not None:
             self.prompt = prompt
             self.runtime_text_emb = self._encode_prompt_text_emb(prompt)
-
-        if reset:
-            logger.info("******************* Reset server ******************")
-            self._reset_runtime_buffers(prompt=prompt)
-            return {}
 
         if compute_kv_cache:
             key_frames = obs.get("obs", [])
