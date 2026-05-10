@@ -609,10 +609,10 @@ class LatentLeRobotDataset(LeRobotDataset):
         num_views = len(self.used_video_keys)
         return states.repeat_interleave(num_views, dim=1)
 
-    def _normalize_relative_compact_action(self, relative_action_16d):
-        relative_action_16d = np.asarray(relative_action_16d, dtype=np.float32).reshape(-1, 16)
-        action_mask = np.ones_like(relative_action_16d, dtype=bool)
-        action_padded = np.pad(relative_action_16d, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+    def _normalize_compact_action(self, action_16d):
+        action_16d = np.asarray(action_16d, dtype=np.float32).reshape(-1, 16)
+        action_mask = np.ones_like(action_16d, dtype=bool)
+        action_padded = np.pad(action_16d, ((0, 0), (0, 1)), mode='constant', constant_values=0)
         action_mask_padded = np.pad(action_mask, ((0, 0), (0, 1)), mode='constant', constant_values=0)
 
         action_aligned = action_padded[:, self.config.inverse_used_action_channel_ids]
@@ -624,6 +624,9 @@ class LatentLeRobotDataset(LeRobotDataset):
             torch.from_numpy(action_aligned).float(),
             torch.from_numpy(action_mask_aligned).bool(),
         )
+
+    def _normalize_relative_compact_action(self, relative_action_16d):
+        return self._normalize_compact_action(relative_action_16d)
 
     def _sample_window_and_chunk(self, images, actions, states=None):
         """Sample one image frame and an action chunk starting at the same timestep."""
@@ -667,10 +670,19 @@ class LatentLeRobotDataset(LeRobotDataset):
             anchor_pose = actions[:, anchor_idx, 0, 0]
 
         action_abs_flat = rearrange(actions, 'c f n 1 -> (f n) c')
-        rel_action_flat = get_relative_compact_action(action_abs_flat, anchor_pose)
-        rel_action_norm_flat, rel_action_mask_flat = self._normalize_relative_compact_action(rel_action_flat)
-        actions = rearrange(rel_action_norm_flat, '(f n) c -> c f n 1', f=f_total, n=n)
-        base_action_mask = rearrange(rel_action_mask_flat, '(f n) c -> c f n 1', f=f_total, n=n)
+        action_representation = str(getattr(self.config, 'action_representation', 'relative')).lower()
+        if action_representation == 'relative':
+            action_model_flat = get_relative_compact_action(action_abs_flat, anchor_pose)
+        elif action_representation == 'absolute':
+            action_model_flat = action_abs_flat
+        else:
+            raise ValueError(
+                f"Unsupported action_representation `{action_representation}`. "
+                "Expected 'relative' or 'absolute'."
+            )
+        action_norm_flat, action_mask_flat = self._normalize_compact_action(action_model_flat)
+        actions = rearrange(action_norm_flat, '(f n) c -> c f n 1', f=f_total, n=n)
+        base_action_mask = rearrange(action_mask_flat, '(f n) c -> c f n 1', f=f_total, n=n)
         c_act = actions.shape[0]
         actions_window = actions.index_select(1, history_indices).clone()
 
@@ -684,8 +696,11 @@ class LatentLeRobotDataset(LeRobotDataset):
         else:
             # Fallback for legacy datasets without observation.state.
             state_abs = action_abs_flat[data_timestep * n]
-        state_rel = get_relative_compact_action(state_abs[None], anchor_pose)
-        state, state_mask = self._normalize_relative_compact_action(state_rel)
+        if action_representation == 'relative':
+            state_model = get_relative_compact_action(state_abs[None], anchor_pose)
+        else:
+            state_model = state_abs[None]
+        state, state_mask = self._normalize_compact_action(state_model)
         state = state[0]
         state_mask = state_mask[0]
         # Current-frame VGA action branch uses the real robot state as token 0;

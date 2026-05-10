@@ -41,6 +41,10 @@ va_robotwin_cfg.image_frame_stride = 1
 va_robotwin_cfg.history_len = 4
 va_robotwin_cfg.history_frame_stride = 1
 va_robotwin_cfg.actionvggt_depth = 12
+# Robot action/state representation used by both training and evaluation.
+# "relative": poses are represented relative to the history-window anchor pose.
+# "absolute": poses are represented in the simulator/world EE pose frame.
+va_robotwin_cfg.action_representation = "absolute"
 
 # Separate checkpoint controls
 # Priority per model in train_va.py:
@@ -94,13 +98,15 @@ va_robotwin_cfg.inverse_used_action_channel_ids = inverse_used_action_channel_id
 va_robotwin_cfg.action_norm_method = 'quantiles'
 va_robotwin_cfg.norm_stat = {
     "q01": [
-        -0.06172713458538055, -3.6716461181640625e-05, -0.08783501386642456,
-        -1, -1, -1, -1, -0.3547105032205582, -1.3113021850585938e-06,
-        -0.11975435614585876, -1, -1, -1, -1
+        -0.2979237735, -0.3138048649, 0.8695474267,
+        -1, -1, -1, -1,
+        -0.04576408118, -0.3128012717, 0.8713479042,
+        -1, -1, -1, -1,
     ] + [0.] * 16,
     "q99": [
-        0.3462600058317184, 0.39966784834861746, 0.14745532035827624, 1, 1, 1,
-        1, 0.034201726913452024, 0.39142737388610793, 0.1792279863357542, 1, 1,
-        1, 1
-    ] + [0.] * 14 + [1.0, 1.0],
+        0.03409340233, -0.03222606331, 1.077983499,
+        1, 1, 1, 1,
+        0.3064331412, -0.04851070791, 1.098479986,
+        1, 1, 1, 1,
+    ] + [1.0] * 16,
 }

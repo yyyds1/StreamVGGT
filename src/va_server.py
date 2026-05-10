@@ -197,6 +197,12 @@ class VA_Server:
         self.patch_size = tuple(getattr(job_config, "patch_size", (1, 14, 14)))
         self.multi_view_image_mode = getattr(job_config, "multi_view_image_mode", "vertical")
         self.model_arch = str(getattr(job_config, "model_arch", "actionvggt")).lower()
+        self.action_representation = str(getattr(job_config, "action_representation", "relative")).lower()
+        if self.action_representation not in {"relative", "absolute"}:
+            raise ValueError(
+                f"Unsupported action_representation `{self.action_representation}`. "
+                "Expected 'relative' or 'absolute'."
+            )
         self.state_condition_mode = str(getattr(job_config, "state_condition_mode", "latest")).lower()
         if self.state_condition_mode not in {"first_action", "latest", "episode_initial", "null"}:
             raise ValueError(
@@ -727,8 +733,7 @@ class VA_Server:
                 f"Expected state with {len(self.used_action_channel_ids)} values, got shape {tuple(state.shape)}"
             )
 
-        state_padded = torch.zeros(self.action_dim, dtype=torch.float32)
-        state_padded[self.used_action_channel_ids] = state
+        state_padded = F.pad(state, [0, 1], mode="constant", value=0)
         state_aligned = state_padded[self.inverse_used_action_channel_ids]
 
         if self.action_norm_method == "quantiles":
@@ -789,8 +794,7 @@ class VA_Server:
     def preprocess_relative_state(self, state, anchor_state=None):
         rel_state_16 = self._relative_state_16(state, anchor_state=anchor_state)
 
-        state_padded = torch.zeros(self.action_dim, dtype=torch.float32)
-        state_padded[self.used_action_channel_ids] = rel_state_16
+        state_padded = F.pad(rel_state_16, [0, 1], mode="constant", value=0)
         state_aligned = state_padded[self.inverse_used_action_channel_ids]
         if self.action_norm_method == "quantiles":
             q01 = self.actions_q01[:, 0, 0]
@@ -802,6 +806,11 @@ class VA_Server:
         state_aligned = state_aligned * self.action_mask.to(state_aligned.device)
 
         return state_aligned.unsqueeze(0).unsqueeze(1)  # [B, 1, C]
+
+    def preprocess_action_state(self, state, anchor_state=None):
+        if self.action_representation == "absolute":
+            return self.preprocess_state(state)
+        return self.preprocess_relative_state(state, anchor_state=anchor_state)
 
     def _compose_relative_pose(self, relative_pose, anchor_pose):
         relative_pose = np.asarray(relative_pose, dtype=np.float32).reshape(8)
@@ -868,7 +877,7 @@ class VA_Server:
         right = self._smooth_absolute_pose(previous_action_16d[8:], current_action_16d[8:], alpha)
         return np.concatenate([left, right]).astype(np.float32)
 
-    def _relative_action_chunk_to_normalized_tensor(self, absolute_action_chunk, anchor_state):
+    def _action_chunk_to_normalized_tensor(self, absolute_action_chunk, anchor_state=None):
         absolute_action_chunk = np.asarray(absolute_action_chunk, dtype=np.float32)
         if absolute_action_chunk.ndim == 3:
             absolute_action_chunk = absolute_action_chunk[:, :, 0]
@@ -877,15 +886,30 @@ class VA_Server:
                 f"Expected absolute action chunk with first dim {len(self.used_action_channel_ids)}, "
                 f"got shape {absolute_action_chunk.shape}"
             )
-        rel_tokens = []
+        tokens = []
         for token_idx in range(absolute_action_chunk.shape[1]):
-            rel_token = self.preprocess_relative_state(
+            token = self.preprocess_action_state(
                 absolute_action_chunk[:, token_idx],
                 anchor_state=anchor_state,
             )[0, 0]
-            rel_tokens.append(rel_token)
-        norm_chunk = torch.stack(rel_tokens, dim=1)  # [C, T]
+            tokens.append(token)
+        norm_chunk = torch.stack(tokens, dim=1)  # [C, T]
         return norm_chunk.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)  # [1, C, T, 1, 1]
+
+    def _absolute_action_chunk_to_relative(self, absolute_action, anchor_state):
+        absolute_action = np.asarray(absolute_action, dtype=np.float32)
+        original_shape = absolute_action.shape
+        if absolute_action.shape[0] != len(self.used_action_channel_ids):
+            raise ValueError(
+                f"Expected absolute action with first dim {len(self.used_action_channel_ids)}, "
+                f"got shape {absolute_action.shape}"
+            )
+        flat_actions = absolute_action.reshape(len(self.used_action_channel_ids), -1).T
+        relative_actions = [
+            self._relative_state_16(action_16d, anchor_state=anchor_state).numpy()
+            for action_16d in flat_actions
+        ]
+        return np.stack(relative_actions, axis=0).T.reshape(original_shape).astype(np.float32)
 
     def _build_warm_start_action_sample(self, current_obs, dtype):
         if self.prev_absolute_action_chunk is None or self.warm_start_blend <= 0.0:
@@ -907,11 +931,11 @@ class VA_Server:
             shifted_chunk[:, :-1, :] = prev_chunk[:, 1:, :]
         shifted_chunk[:, -1:, :] = prev_chunk[:, -1:, :]
 
-        future_x0 = self._relative_action_chunk_to_normalized_tensor(
+        future_x0 = self._action_chunk_to_normalized_tensor(
             shifted_chunk,
             anchor_state=self.current_anchor_abs_state,
         ).to(self.device, dtype=dtype)
-        current_state_x0 = self.preprocess_relative_state(
+        current_state_x0 = self.preprocess_action_state(
             obs_state,
             anchor_state=self.current_anchor_abs_state,
         ).to(self.device, dtype=dtype)
@@ -988,7 +1012,7 @@ class VA_Server:
     def _state_condition_from_current_obs(self, current_obs, dtype):
         obs_state = current_obs.get("observation.state", None)
         if obs_state is not None:
-            return self.preprocess_relative_state(
+            return self.preprocess_action_state(
                 obs_state,
                 anchor_state=self.current_anchor_abs_state,
             ).to(self.device, dtype=dtype)
@@ -1143,7 +1167,7 @@ class VA_Server:
         for local_idx, frame_hist_idx in enumerate(history_indices):
             if local_idx == current_local_idx:
                 if current_obs is not None and current_obs.get("observation.state", None) is not None:
-                    current_state = self.preprocess_relative_state(
+                    current_state = self.preprocess_action_state(
                         current_obs["observation.state"],
                         anchor_state=anchor_abs_state,
                     ).to(self.device, dtype=transformer_dtype)
@@ -1153,7 +1177,7 @@ class VA_Server:
             frame_action_abs = self.frame_history[frame_hist_idx].get("action_abs", None)
             if frame_action_abs is None:
                 frame_action_abs = self.pose_history[frame_hist_idx]
-            frame_action = self.preprocess_relative_state(
+            frame_action = self.preprocess_action_state(
                 frame_action_abs,
                 anchor_state=anchor_abs_state,
             )[0, 0].unsqueeze(-1)
@@ -1263,12 +1287,12 @@ class VA_Server:
                     current_obs=current_obs,
                 )
             elif self.state_condition_mode == "episode_initial" and obs_state is not None:
-                state_c = self.preprocess_relative_state(
+                state_c = self.preprocess_action_state(
                     obs_state,
                     anchor_state=self.current_anchor_abs_state,
                 ).to(self.device, dtype=self.dtype)
             elif obs_state is not None and self.state_condition_mode == "latest":
-                state_c = self.preprocess_relative_state(
+                state_c = self.preprocess_action_state(
                     obs_state,
                     anchor_state=self.current_anchor_abs_state,
                 ).to(self.device, dtype=self.dtype)
@@ -1320,13 +1344,24 @@ class VA_Server:
         action_sample[:, ~self.action_mask.to(action_sample.device)] *= 0
         action_tokens = rearrange(action_sample, "b c f n 1 -> b c (f n) 1 1")
         future_action_tokens = action_tokens[:, :, 1 : self.chunk_size + 1]
-        relative_action = self.postprocess_action(future_action_tokens)
-        if self.current_anchor_abs_state is None:
-            raise ValueError("Missing history-window anchor before composing predicted action.")
-        absolute_action = self._compose_relative_compact_action(
-            relative_action,
-            self.current_anchor_abs_state,
-        )
+        predicted_action = self.postprocess_action(future_action_tokens)
+        if self.action_representation == "relative":
+            relative_action = predicted_action
+            if self.current_anchor_abs_state is None:
+                raise ValueError("Missing history-window anchor before composing predicted action.")
+            absolute_action = self._compose_relative_compact_action(
+                relative_action,
+                self.current_anchor_abs_state,
+            )
+        else:
+            absolute_action = predicted_action
+            if self.current_anchor_abs_state is None:
+                relative_action = predicted_action.copy()
+            else:
+                relative_action = self._absolute_action_chunk_to_relative(
+                    absolute_action,
+                    self.current_anchor_abs_state,
+                )
         absolute_action = np.nan_to_num(
             absolute_action,
             nan=0.0,
@@ -1434,7 +1469,7 @@ class VA_Server:
             self.frame_history[-1]["action_abs"] = action[:, 0, 0].astype(np.float32).copy()
         self._trim_rolling_history()
         if self.episode_initial_state is None:
-            self.episode_initial_state = self.preprocess_relative_state(
+            self.episode_initial_state = self.preprocess_action_state(
                 action[:, 0, 0],
                 anchor_state=pred["action_reference"],
             ).to(self.device, dtype=self.dtype)
