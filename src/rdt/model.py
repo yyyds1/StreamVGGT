@@ -24,6 +24,7 @@ class RDT(nn.Module):
         max_img_len: int,
         act_pos_emb_config: Optional[List[Tuple]] = None,
         max_act_len: int = 0,
+        text_embed_dim: Optional[int] = None,
         dtype=torch.bfloat16
     ):
         super().__init__()
@@ -31,6 +32,7 @@ class RDT(nn.Module):
         self.hidden_size = config["hidden_size"]
         self.n_heads = config["num_heads"]
         self.dtype = dtype
+        self.text_embed_dim = int(text_embed_dim or config.get("text_embed_dim", self.hidden_size))
 
         self.t_embedder = TimestepEmbedder(self.hidden_size, dtype=dtype)
 
@@ -79,6 +81,10 @@ class RDT(nn.Module):
             1, self.horizon + self.num_register_tokens, self.hidden_size))
         
         self.action_embedder = nn.Linear(config["action_dim"], self.hidden_size)
+        if self.text_embed_dim == self.hidden_size:
+            self.lang_embedder = nn.Identity()
+        else:
+            self.lang_embedder = nn.Linear(self.text_embed_dim, self.hidden_size)
 
         self.initialize_weights()
 
@@ -189,6 +195,14 @@ class RDT(nn.Module):
         if embed_input:
             x = self.action_embedder(x)
             state_c = self.action_embedder(state_c) if state_c is not None else None
+            if lang_c is not None:
+                if lang_c.ndim == 2:
+                    lang_c = lang_c.unsqueeze(1)
+                elif lang_c.ndim != 3:
+                    raise ValueError(
+                        f"lang_c must be [B,D] or [B,L,D] before embedding, got {tuple(lang_c.shape)}"
+                    )
+                lang_c = self.lang_embedder(lang_c)
 
         t = self.t_embedder(t) # (B, D) or (1, D)
         if t.shape[0] == 1:

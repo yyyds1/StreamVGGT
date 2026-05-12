@@ -330,6 +330,7 @@ class Trainer:
         self.action_condition_noise_std = float(getattr(config.rdt, "action_condition_noise_std", 0.0))
         self.vga_action_state_noise_std = float(getattr(config, "vga_action_state_noise_std", 0.0))
         self.vga_action_state_noise_clip = bool(getattr(config, "vga_action_state_noise_clip", True))
+        self.rdt_use_language_condition = bool(getattr(config, "rdt_use_language_condition", False))
         self.state_condition_mode = str(getattr(config, "state_condition_mode", "latest")).lower()
         if self.state_condition_mode not in {"first_action", "latest", "episode_initial", "null"}:
             raise ValueError(
@@ -433,6 +434,7 @@ class Trainer:
             max_img_len=num_input_frames * img_tokens_per_frame,
             act_pos_emb_config=rdt_act_pos_emb_config,
             max_act_len=num_input_frames * act_tokens_per_frame,
+            text_embed_dim=int(getattr(config, "text_embed_dim", 4096)),
             dtype=self.dtype,
         )
         self.action_head.config = _to_plain_config({
@@ -447,6 +449,7 @@ class Trainer:
             "max_img_len": num_input_frames * img_tokens_per_frame,
             "act_pos_emb_config": rdt_act_pos_emb_config,
             "max_act_len": num_input_frames * act_tokens_per_frame,
+            "text_embed_dim": int(getattr(config, "text_embed_dim", 4096)),
             "dtype": self.dtype,
         })
         self.action_head.to(self.device)
@@ -1052,6 +1055,18 @@ class Trainer:
         noise = torch.randn_like(action_condition_fp32) * (token_rms * self.action_condition_noise_std)
         return (action_condition_fp32 + noise).to(dtype=action_condition.dtype)
 
+    def _get_rdt_lang_condition(self, input_dict, dtype):
+        if not self.rdt_use_language_condition:
+            return None
+        lang_c = input_dict.get('lang_c', None)
+        if lang_c is None:
+            return None
+        if lang_c.ndim == 2:
+            lang_c = lang_c.unsqueeze(1)
+        elif lang_c.ndim != 3:
+            raise ValueError(f"RDT language condition must be [B,D] or [B,L,D], got {tuple(lang_c.shape)}")
+        return lang_c.to(device=self.device, dtype=dtype)
+
     def compute_loss(self, input_dict, pred):
         action_pred = pred
         action_pred = rearrange(action_pred, 'b f c -> b c f')
@@ -1183,7 +1198,7 @@ class Trainer:
             action_pred = self.action_head(
                 action_chunk,
                 timesteps,
-                lang_c=None,
+                lang_c=self._get_rdt_lang_condition(input_dict, dtype=action_chunk.dtype),
                 img_c=rdt_conds['rdt_img_c'],
                 act_c=self._maybe_add_noise_to_action_condition(rdt_conds['rdt_act_c']),
                 state_c=state_c,

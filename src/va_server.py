@@ -200,6 +200,7 @@ class VA_Server:
         self.patch_size = tuple(getattr(job_config, "patch_size", (1, 14, 14)))
         self.multi_view_image_mode = getattr(job_config, "multi_view_image_mode", "vertical")
         self.model_arch = str(getattr(job_config, "model_arch", "actionvggt")).lower()
+        self.rdt_use_language_condition = bool(getattr(job_config, "rdt_use_language_condition", False))
         self.action_representation = str(getattr(job_config, "action_representation", "relative")).lower()
         if self.action_representation not in {"relative", "absolute"}:
             raise ValueError(
@@ -335,6 +336,7 @@ class VA_Server:
             max_img_len=self.num_input_frames * img_tokens_per_frame,
             act_pos_emb_config=rdt_act_pos_emb_config,
             max_act_len=self.num_input_frames * rdt_horizon,
+            text_embed_dim=int(getattr(job_config, "text_embed_dim", 4096)),
             dtype=self.dtype,
         )
         self.action_head.to(self.device)
@@ -1437,6 +1439,18 @@ class VA_Server:
         }
         return conds
 
+    def _get_rdt_lang_condition(self, dtype):
+        if not self.rdt_use_language_condition:
+            return None
+        lang_c = self.runtime_text_emb
+        if lang_c is None:
+            return None
+        if lang_c.ndim == 2:
+            lang_c = lang_c.unsqueeze(1)
+        elif lang_c.ndim != 3:
+            raise ValueError(f"RDT language condition must be [B,D] or [B,L,D], got {tuple(lang_c.shape)}")
+        return lang_c.to(device=self.device, dtype=dtype)
+
     def _predict_actions(self, current_obs, frame_conds=None):
         with torch.no_grad():
             if frame_conds is None:
@@ -1514,7 +1528,7 @@ class VA_Server:
                 flow_pred = self.action_head(
                     x_in,
                     t_batch,
-                    lang_c=None,
+                    lang_c=self._get_rdt_lang_condition(dtype=action_head_dtype),
                     img_c=conds_img_c,
                     act_c=conds_act_c,
                     state_c=state_c,

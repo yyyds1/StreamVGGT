@@ -65,3 +65,9 @@ va_vga_robotwin_cfg.rdt_condition_tokens = EasyDict()
 va_vga_robotwin_cfg.rdt_condition_tokens.use_action_queries = True
 va_vga_robotwin_cfg.rdt_condition_tokens.use_image_tokens = True
 va_vga_robotwin_cfg.rdt_condition_tokens.use_language_tokens = False
+
+# Direct RDT language conditioning from the encoded instruction embedding.
+# This is separate from VGA language tokens above: when enabled, the text-model
+# embedding is projected inside the RDT action head and used as a cross-attention
+# condition during action denoising.
+va_vga_robotwin_cfg.rdt_use_language_condition = True
