@@ -1507,6 +1507,9 @@ def run(args):
     if args.single_trajectory_episode_index is not None:
         config.single_trajectory_episode_index = int(args.single_trajectory_episode_index)
         config.single_trajectory = True
+    if args.single_trajectory_repo_id is not None:
+        config.single_trajectory_repo_id = str(args.single_trajectory_repo_id)
+        config.single_trajectory = True
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -1515,8 +1518,14 @@ def run(args):
             logger.info(f"Single-task training enabled: {config.single_task}")
         if getattr(config, "single_trajectory", False):
             logger.info(
-                f"Single-trajectory training enabled: episode_index={getattr(config, 'single_trajectory_episode_index', None)}"
+                f"Single-trajectory training enabled: repo_id={getattr(config, 'single_trajectory_repo_id', None)}, "
+                f"episode_index={getattr(config, 'single_trajectory_episode_index', None)}"
             )
+            if getattr(config, "single_trajectory_repo_id", None) and getattr(config, "single_trajectory_episode_index", None) is not None:
+                logger.info(
+                    f"Single-trajectory signature: {Path(str(getattr(config, 'single_trajectory_repo_id'))).name}"
+                    f"::episode_{int(getattr(config, 'single_trajectory_episode_index')):06d}"
+                )
 
     trainer = Trainer(config)
     trainer.train()
@@ -1554,6 +1563,12 @@ def main():
         type=int,
         default=None,
         help="Episode index for --single-trajectory. If omitted, first available episode is used.",
+    )
+    parser.add_argument(
+        "--single-trajectory-repo-id",
+        type=str,
+        default=None,
+        help="Exact RobotWin repo folder name/path for --single-trajectory.",
     )
 
     args = parser.parse_args()

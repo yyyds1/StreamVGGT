@@ -25,11 +25,15 @@ va_robotwin_cfg.action_guidance_scale = 1
 va_robotwin_cfg.num_inference_steps = 25
 va_robotwin_cfg.video_exec_step = -1
 va_robotwin_cfg.action_num_inference_steps = 100
+# Number of actions to cache from each predicted chunk before the server infers again.
+va_robotwin_cfg.action_chunk_exec_steps = 8
 
 # Debug mode: restrict data usage to a single trajectory (episode).
 va_robotwin_cfg.single_trajectory = False
 # Optional explicit episode index. If None and single_trajectory=True, use first available episode.
 va_robotwin_cfg.single_trajectory_episode_index = None
+# Optional repo pin to disambiguate the same episode index across multiple RobotWin repos.
+va_robotwin_cfg.single_trajectory_repo_id = None
 
 # Shared by both training and online evaluation (va_server.py + train_va.py)
 va_robotwin_cfg.multi_view_image_mode = 'vertical'
@@ -49,12 +53,12 @@ va_robotwin_cfg.action_representation = "absolute"
 # Separate checkpoint controls
 # Priority per model in train_va.py:
 # 1) *_resume_from, 2) *_pretrained, 3) random init
-va_robotwin_cfg.transformer_resume = False
-va_robotwin_cfg.transformer_resume_from = '/home/yds/code/StreamVGGT/src/train_out/train_log_20260417_162133/ckpt/checkpoint_step_2500/transformer/diffusion_pytorch_model.safetensors'
+va_robotwin_cfg.transformer_resume = True
+va_robotwin_cfg.transformer_resume_from = '/home/yds/code/StreamVGGT/src/train_out/checkpoint_step_35000/transformer/diffusion_pytorch_model.safetensors'
 va_robotwin_cfg.transformer_pretrained = '/mnt/nas/share/home/yds/actionvggt.pth'
 
-va_robotwin_cfg.action_head_resume = False
-va_robotwin_cfg.action_head_resume_from = '/home/yds/code/StreamVGGT/src/train_out/train_log_20260417_162133/ckpt/checkpoint_step_2500/action_head/diffusion_pytorch_model.safetensors'
+va_robotwin_cfg.action_head_resume = True
+va_robotwin_cfg.action_head_resume_from = '/home/yds/code/StreamVGGT/src/train_out/checkpoint_step_35000/action_head/diffusion_pytorch_model.safetensors'
 va_robotwin_cfg.action_head_pretrained = '/mnt/nas/share/home/yds/RDT.pth'
 
 va_robotwin_cfg.gradient_checkpointing = False
@@ -79,9 +83,20 @@ va_robotwin_cfg.rdt.sigma_max = 1.0
 va_robotwin_cfg.rdt.sigma_min = 0.003 / 1.002
 va_robotwin_cfg.rdt.extra_one_step = True
 va_robotwin_cfg.rdt.action_condition_noise_std = 0.01
-va_robotwin_cfg.rdt.warm_start_blend = 0.85
-va_robotwin_cfg.rdt.warm_start_noise_std = 0.03
-va_robotwin_cfg.rdt.action_smoothing_alpha = 0.35
+va_robotwin_cfg.rdt.warm_start_blend = 1.0
+va_robotwin_cfg.rdt.warm_start_noise_std = 0.0
+va_robotwin_cfg.rdt.action_smoothing_alpha = 0.6
+
+# Online EE safety guard for absolute actions. This clips commanded end-effector
+# targets before sending them to RoboTwin, reducing IK singularity/overreach
+# failures such as a fully straightened arm getting stuck.
+va_robotwin_cfg.ee_target_guard = EasyDict()
+va_robotwin_cfg.ee_target_guard.enabled = True
+va_robotwin_cfg.ee_target_guard.max_delta_xyz = 0.5
+va_robotwin_cfg.ee_target_guard.left_xyz_min = [-10.0, -10.0, -10.0]
+va_robotwin_cfg.ee_target_guard.left_xyz_max = [10.0, 10.0, 10.0]
+va_robotwin_cfg.ee_target_guard.right_xyz_min = [-10.0, -10.0, -10.0]
+va_robotwin_cfg.ee_target_guard.right_xyz_max = [10.0, 10.0, 10.0]
 
 va_robotwin_cfg.snr_shift = 5.0
 va_robotwin_cfg.action_snr_shift = 1.0

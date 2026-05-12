@@ -3,6 +3,7 @@ MASTER_PORT=${MASTER_PORT:-29661}
 CONFIG_NAME=${CONFIG_NAME:-vga_robotwin}
 SINGLE_TRAJECTORY=${SINGLE_TRAJECTORY:-"0"}
 SINGLE_TRAJECTORY_EPISODE_INDEX=${SINGLE_TRAJECTORY_EPISODE_INDEX:-""}
+SINGLE_TRAJECTORY_REPO_ID=${SINGLE_TRAJECTORY_REPO_ID:-""}
 LOG_DIR='./logs'
 mkdir -p $LOG_DIR
 
@@ -29,6 +30,7 @@ for i in {0..7}; do
         --port $CURRENT_PORT \
         $(if [ "${SINGLE_TRAJECTORY}" = "1" ]; then printf '%s' "--single-trajectory"; fi) \
         $(if [ -n "${SINGLE_TRAJECTORY_EPISODE_INDEX}" ]; then printf '%s' "--single-trajectory-episode-index ${SINGLE_TRAJECTORY_EPISODE_INDEX}"; fi) \
+        $(if [ -n "${SINGLE_TRAJECTORY_REPO_ID}" ]; then printf '%s' "--single-trajectory-repo-id ${SINGLE_TRAJECTORY_REPO_ID}"; fi) \
         > $LOG_FILE 2>&1 &
     sleep 2;
 done

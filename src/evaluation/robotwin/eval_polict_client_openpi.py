@@ -1,6 +1,7 @@
 import sys
 import os
 import subprocess
+import re
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
@@ -37,6 +38,7 @@ import imageio
 import numpy as np
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
+import transforms3d as t3d
 import json
 from pathlib import Path
 
@@ -44,6 +46,70 @@ from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
 
 
 DATASET_ROOT = Path("/home/yds/code/StreamVGGT/dataset")
+
+
+def _planner_result_payload(result):
+    if result is None:
+        return {
+            "status": None,
+            "success": False,
+            "num_waypoints": 0,
+        }
+    status = result.get("status", None) if isinstance(result, dict) else getattr(result, "status", None)
+    position = result.get("position", None) if isinstance(result, dict) else None
+    num_waypoints = int(position.shape[0]) if hasattr(position, "shape") and len(position.shape) > 0 else 0
+    return {
+        "status": None if status is None else str(status),
+        "success": bool(status == "Success"),
+        "num_waypoints": num_waypoints,
+    }
+
+
+def take_ee_action_with_planner_feedback(task_env, ee_action):
+    """Run an EE action and capture per-arm mplib planner/IK status."""
+    feedback = {
+        "plan_success_before": bool(getattr(task_env, "plan_success", True)),
+        "left": None,
+        "right": None,
+    }
+
+    robot = getattr(task_env, "robot", None)
+    if robot is None:
+        task_env.take_action(ee_action, action_type="ee")
+        feedback["plan_success_after"] = bool(getattr(task_env, "plan_success", True))
+        feedback["planner_success"] = feedback["plan_success_after"]
+        return feedback
+
+    original_left_plan_path = robot.left_plan_path
+    original_right_plan_path = robot.right_plan_path
+
+    def wrapped_left_plan_path(*args, **kwargs):
+        result = original_left_plan_path(*args, **kwargs)
+        feedback["left"] = _planner_result_payload(result)
+        return result
+
+    def wrapped_right_plan_path(*args, **kwargs):
+        result = original_right_plan_path(*args, **kwargs)
+        feedback["right"] = _planner_result_payload(result)
+        return result
+
+    robot.left_plan_path = wrapped_left_plan_path
+    robot.right_plan_path = wrapped_right_plan_path
+    try:
+        task_env.take_action(ee_action, action_type="ee")
+    finally:
+        robot.left_plan_path = original_left_plan_path
+        robot.right_plan_path = original_right_plan_path
+
+    feedback["plan_success_after"] = bool(getattr(task_env, "plan_success", True))
+    arm_success = [
+        arm_feedback["success"]
+        for arm_feedback in (feedback.get("left"), feedback.get("right"))
+        if arm_feedback is not None
+    ]
+    feedback["planner_success"] = bool(arm_success and all(arm_success) and feedback["plan_success_after"])
+    feedback["take_action_cnt"] = int(getattr(task_env, "take_action_cnt", -1))
+    return feedback
 
 
 def configure_headless_sapien_renderer() -> None:
@@ -108,13 +174,11 @@ def add_title_bar(img, text, font_scale=0.8, thickness=2):
 def quaternion_to_euler(quat):
     """
     Convert quaternion to Euler angles (roll, pitch, yaw)
-    quat: [rx, ry, rz, rw] format
+    quat: RoboTwin [w, x, y, z] format
     Return: [roll, pitch, yaw] (radians)
     """
-    # scipy uses [x, y, z, w] format
-    rotation = R.from_quat(quat)
-    euler = rotation.as_euler('xyz', degrees=False)  # returns [roll, pitch, yaw]
-    return euler
+    quat = safe_normalize_quat(quat)
+    return np.asarray(t3d.euler.quat2euler(quat, axes="sxyz"), dtype=np.float64)
 
 def visualize_action_step(action_history, step_idx, window=50):
     """
@@ -344,6 +408,13 @@ def main(usr_args):
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
     args["save_root"] = save_root
+    args["max_episode_steps"] = usr_args.get("max_episode_steps", None)
+    args["single_trajectory"] = bool(usr_args.get("single_trajectory", False))
+    if usr_args.get("single_trajectory_episode_index", None) is not None:
+        args["single_trajectory_episode_index"] = int(usr_args["single_trajectory_episode_index"])
+    else:
+        args["single_trajectory_episode_index"] = None
+    args["single_trajectory_repo_id"] = usr_args.get("single_trajectory_repo_id", None)
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -411,10 +482,22 @@ def main(usr_args):
           str(args["camera"]["collect_wrist_camera"]))
     print("\033[94mEmbodiment Config:\033[0m " + embodiment_name)
     print("\n==================================")
+    if args.get("single_trajectory", False):
+        print(
+            f"[single_trajectory][eval] enabled: repo_id={args.get('single_trajectory_repo_id', None)}, "
+            f"episode_index={args.get('single_trajectory_episode_index', None)}, "
+            f"test_num={usr_args.get('test_num', None)}"
+        )
+    else:
+        print("[single_trajectory][eval] disabled")
+    print(f"[eval] max_episode_steps={args.get('max_episode_steps', None)}")
 
     print(f"Connecting to policy server at ws://{usr_args.get('host', '127.0.0.1')}:{usr_args['port']} ...")
     model = WebsocketClientPolicy(host=usr_args.get('host', '127.0.0.1'), port=usr_args['port'])
-    text_emb_lookup = DatasetTextEmbLookup(DATASET_ROOT)
+    text_emb_lookup = DatasetTextEmbLookup(
+        DATASET_ROOT,
+        repo_id=args.get("single_trajectory_repo_id", None),
+    )
 
     TASK_ENV = class_decorator(args["task_name"])
     args["policy_name"] = policy_name
@@ -474,16 +557,15 @@ def safe_normalize_quat(quat, eps=1e-8):
     quat = np.asarray(quat, dtype=np.float64)
     norm = np.linalg.norm(quat)
     if not np.isfinite(norm) or norm < eps:
-        # Identity rotation in [x, y, z, w].
-        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        # RobotWin/Sapien/transforms3d use [w, x, y, z].
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
     return quat / norm
 
 def add_eef_pose(new_pose, init_pose):
     new_quat = safe_normalize_quat(new_pose[3:7])
     init_quat = safe_normalize_quat(init_pose[3:7])
-    new_pose_R = R.from_quat(new_quat[None])
-    init_pose_R = R.from_quat(init_quat[None])
-    out_rot = (init_pose_R * new_pose_R).as_quat().reshape(-1)
+    out_rot = t3d.quaternions.qmult(init_quat, new_quat)
+    out_rot = safe_normalize_quat(out_rot)
     out_trans = new_pose[:3] + init_pose[:3]
     return np.concatenate([out_trans, out_rot, new_pose[7:8]])
 
@@ -503,8 +585,9 @@ def sanitize_ee_action(ee_action):
 
 
 class DatasetTextEmbLookup:
-    def __init__(self, dataset_root: Path):
+    def __init__(self, dataset_root: Path, repo_id: str = None):
         self.dataset_root = Path(dataset_root)
+        self.repo_id = None if repo_id is None else str(repo_id)
         self._cache = {}
         self._index = {}
 
@@ -518,14 +601,30 @@ class DatasetTextEmbLookup:
         if task_name in self._index:
             return self._index[task_name]
 
-        search_root = self.dataset_root / task_name
-        if not search_root.exists():
+        repo_name = Path(self.repo_id).name if self.repo_id else None
+        if repo_name:
+            search_patterns = [
+                f"{repo_name}/latents/chunk-*/**/episode_*.pth",
+                f"{repo_name}/latents/chunk-*/*/episode_*.pth",
+            ]
+        else:
+            search_patterns = [
+                f"{task_name}-*/latents/chunk-*/**/episode_*.pth",
+                f"{task_name}-*/latents/chunk-*/*/episode_*.pth",
+                f"**/latents/chunk-*/**/episode_*.pth",
+                f"**/latents/chunk-*/*/episode_*.pth",
+            ]
+
+        files = []
+        for pattern in search_patterns:
+            files = sorted(self.dataset_root.glob(pattern))
+            if len(files) > 0:
+                break
+
+        if len(files) == 0:
             self._index[task_name] = []
             return self._index[task_name]
 
-        files = sorted(search_root.glob("latents/chunk-*/**/episode_*.pth"))
-        if len(files) == 0:
-            files = sorted(search_root.glob("latents/chunk-*/*/episode_*.pth"))
         self._index[task_name] = files
         return files
 
@@ -597,6 +696,44 @@ class DatasetTextEmbLookup:
             return text, text_emb
         return None, None
 
+    def get_episode_debug_entry(self, task_name: str, episode_index: int):
+        """Return text, text_emb, and latent file metadata for one episode if available."""
+        files = self._build_index(task_name)
+        episode_tag = f"episode_{int(episode_index):06d}_"
+        for latent_file in files:
+            if episode_tag not in latent_file.name:
+                continue
+            try:
+                payload = torch.load(latent_file, map_location="cpu", weights_only=False)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            text = self._norm(payload.get("text", None))
+            text_emb = payload.get("text_emb", None)
+            if text_emb is not None and not torch.is_tensor(text_emb):
+                text_emb = torch.as_tensor(text_emb)
+            if text_emb is not None:
+                if text_emb.ndim == 2:
+                    text_emb = text_emb.unsqueeze(0)
+                elif text_emb.ndim != 3:
+                    text_emb = None
+
+            stem_match = re.search(r"episode_(\d{6})_(\d+)_(\d+)\.pth$", latent_file.name)
+            start_frame = int(stem_match.group(2)) if stem_match else None
+            end_frame = int(stem_match.group(3)) if stem_match else None
+            repo_name = latent_file.parents[3].name if len(latent_file.parents) > 3 else None
+            return {
+                "text": text,
+                "text_emb": text_emb,
+                "latent_file": latent_file,
+                "repo_name": repo_name,
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "segment_length": None if start_frame is None or end_frame is None else end_frame - start_frame,
+            }
+        return None
+
 def eval_policy(task_name,
                 TASK_ENV,
                 args,
@@ -638,6 +775,16 @@ def eval_policy(task_name,
         test_num = 1
 
     args["eval_mode"] = True
+    max_episode_steps = args.get("max_episode_steps", None)
+    if max_episode_steps is not None:
+        max_episode_steps = int(max_episode_steps)
+
+    def apply_step_limit_override():
+        if max_episode_steps is not None and max_episode_steps > 0:
+            old_step_lim = getattr(TASK_ENV, "step_lim", None)
+            TASK_ENV.step_lim = max_episode_steps
+            if old_step_lim != max_episode_steps:
+                print(f"[eval] override step_lim: {old_step_lim} -> {TASK_ENV.step_lim}")
 
     while succ_seed < test_num:
         current_episode_index = single_trajectory_episode_index if single_trajectory else now_id
@@ -648,6 +795,7 @@ def eval_policy(task_name,
         if expert_check:
             try:
                 TASK_ENV.setup_demo(now_ep_num=current_episode_index, seed=current_seed, is_test=True, **args)
+                apply_step_limit_override()
                 episode_info = TASK_ENV.play_once()
                 TASK_ENV.close_env()
             except UnStableError as e:
@@ -684,17 +832,38 @@ def eval_policy(task_name,
         args["render_freq"] = render_freq
 
         TASK_ENV.setup_demo(now_ep_num=current_episode_index, seed=current_seed, is_test=True, **args)
+        apply_step_limit_override()
         episode_info_list = [episode_info["info"]]
+        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
+        instruction = np.random.choice(results[0][instruction_type])
         if single_trajectory:
-            instruction, _traj_text_emb = text_emb_lookup.get_episode_entry(
+            episode_debug = text_emb_lookup.get_episode_debug_entry(
                 task_name, current_episode_index
             )
-            if instruction is None:
-                results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-                instruction = np.random.choice(results[0][instruction_type])
-        else:
-            results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-            instruction = np.random.choice(results[0][instruction_type])
+            if episode_debug is not None:
+                debug_file = episode_debug.get("latent_file", None)
+                debug_repo = episode_debug.get("repo_name", None)
+                debug_len = episode_debug.get("segment_length", None)
+                dataset_instruction = episode_debug.get("text", None)
+                print(
+                    f"[single_trajectory][eval] task={task_name}, episode_index={current_episode_index}, "
+                    f"seed={current_seed}, step_lim={getattr(TASK_ENV, 'step_lim', None)}, "
+                    f"repo={debug_repo}, latent_file={str(debug_file) if debug_file is not None else None}, "
+                    f"segment_len={debug_len}, env_instruction={instruction}, dataset_instruction={dataset_instruction}"
+                )
+                if dataset_instruction is not None and str(dataset_instruction).strip() != str(instruction).strip():
+                    print(
+                        "[single_trajectory][eval] warning: dataset episode text and env-generated instruction differ; "
+                        "using env-generated instruction for evaluation."
+                    )
+            else:
+                print(
+                    f"[single_trajectory][eval] task={task_name}, episode_index={current_episode_index}, "
+                    f"seed={current_seed}, step_lim={getattr(TASK_ENV, 'step_lim', None)}, "
+                    f"env_instruction={instruction}, dataset_instruction=None"
+                )
+        if single_trajectory:
+            print(f"[single_trajectory][eval] env_info={episode_info['info']}")
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:
@@ -796,7 +965,13 @@ def eval_policy(task_name,
             else:
                 raise NotImplementedError
             ee_action = sanitize_ee_action(ee_action)
-            TASK_ENV.take_action(ee_action, action_type='ee')
+            planner_feedback = take_ee_action_with_planner_feedback(TASK_ENV, ee_action)
+            try:
+                model.infer(dict(
+                    planner_feedback=planner_feedback,
+                ))
+            except Exception as exc:
+                print(f"[eval] warning: failed to send planner feedback to policy server: {exc}")
 
             obs = format_obs(TASK_ENV.get_obs(), prompt)
             full_obs_list.append(obs)
@@ -864,8 +1039,10 @@ def parse_args_and_config():
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)
     parser.add_argument("--test_num", type=int, default=100)
+    parser.add_argument("--max_episode_steps", type=int, default=None)
     parser.add_argument("--single_trajectory", action="store_true")
     parser.add_argument("--single_trajectory_episode_index", type=int, default=None)
+    parser.add_argument("--single_trajectory_repo_id", type=str, default=None)
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -896,11 +1073,16 @@ def parse_args_and_config():
     config["video_guidance_scale"] = args.video_guidance_scale
     config["action_guidance_scale"] = args.action_guidance_scale
     config["test_num"] = args.test_num
+    if args.max_episode_steps is not None:
+        config["max_episode_steps"] = int(args.max_episode_steps)
     if args.single_trajectory:
         config["single_trajectory"] = True
     if args.single_trajectory_episode_index is not None:
         config["single_trajectory"] = True
         config["single_trajectory_episode_index"] = int(args.single_trajectory_episode_index)
+    if args.single_trajectory_repo_id is not None:
+        config["single_trajectory"] = True
+        config["single_trajectory_repo_id"] = args.single_trajectory_repo_id
 
     return config
 

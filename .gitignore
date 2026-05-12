@@ -24,4 +24,6 @@ src/train_out/**
 
 src/logs/**
 
+src/visualization/**
+
 dataset/

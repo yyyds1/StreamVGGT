@@ -1,10 +1,12 @@
 # Copyright 2024-2026 The Robbyant Team Authors. All rights reserved.
 import argparse
+import json
 import math
 import os
 import re
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -192,6 +194,7 @@ class VA_Server:
         self.history_frame_stride = max(1, int(getattr(job_config, "history_frame_stride", 1)))
         self.chunk_size = int(getattr(job_config, "chunk_size", 24))
         self.rdt_horizon = self.chunk_size + 1
+        self.action_chunk_exec_steps = max(1, int(getattr(job_config, "action_chunk_exec_steps", 1)))
         self.image_frame_stride = int(getattr(job_config, "image_frame_stride", 8))
         self.action_dim = int(job_config.action_dim)
         self.patch_size = tuple(getattr(job_config, "patch_size", (1, 14, 14)))
@@ -235,6 +238,31 @@ class VA_Server:
         self.warm_start_blend = float(max(0.0, min(1.0, getattr(rdt_cfg, "warm_start_blend", 0.85))))
         self.warm_start_noise_std = float(max(0.0, getattr(rdt_cfg, "warm_start_noise_std", 0.03)))
         self.action_smoothing_alpha = float(max(0.0, min(1.0, getattr(rdt_cfg, "action_smoothing_alpha", 0.35))))
+        self.unexecuted_action_buffer = deque()
+        self.actions_served_since_last_prediction = 0
+        guard_cfg = getattr(job_config, "ee_target_guard", None)
+        self.ee_target_guard_enabled = bool(getattr(guard_cfg, "enabled", False)) if guard_cfg is not None else False
+        self.ee_target_guard_max_delta_xyz = float(getattr(guard_cfg, "max_delta_xyz", 0.0)) if guard_cfg is not None else 0.0
+        self.ee_target_guard_left_min = (
+            np.asarray(getattr(guard_cfg, "left_xyz_min", [-np.inf, -np.inf, -np.inf]), dtype=np.float32)
+            if guard_cfg is not None
+            else np.full(3, -np.inf, dtype=np.float32)
+        )
+        self.ee_target_guard_left_max = (
+            np.asarray(getattr(guard_cfg, "left_xyz_max", [np.inf, np.inf, np.inf]), dtype=np.float32)
+            if guard_cfg is not None
+            else np.full(3, np.inf, dtype=np.float32)
+        )
+        self.ee_target_guard_right_min = (
+            np.asarray(getattr(guard_cfg, "right_xyz_min", [-np.inf, -np.inf, -np.inf]), dtype=np.float32)
+            if guard_cfg is not None
+            else np.full(3, -np.inf, dtype=np.float32)
+        )
+        self.ee_target_guard_right_max = (
+            np.asarray(getattr(guard_cfg, "right_xyz_max", [np.inf, np.inf, np.inf]), dtype=np.float32)
+            if guard_cfg is not None
+            else np.full(3, np.inf, dtype=np.float32)
+        )
 
         common_kwargs = dict(
             img_height=self.image_height,
@@ -355,6 +383,8 @@ class VA_Server:
             return
 
         cam_key = self.job_config.obs_cam_keys[0]
+        repo_id = getattr(self.job_config, "single_trajectory_repo_id", None)
+        repo_name = Path(str(repo_id)).name if repo_id else None
         if bool(getattr(self.job_config, "single_trajectory", False)):
             episode_index = getattr(self.job_config, "single_trajectory_episode_index", None)
             if episode_index is None:
@@ -368,8 +398,13 @@ class VA_Server:
                 logger.info(
                     f"single_trajectory=True for eval; restricting text embedding search to episode_index={int(episode_index)}"
                 )
+            if repo_name:
+                pattern = f"{repo_name}/latents/chunk-*/{cam_key}/episode_{int(episode_index):06d}_*.pth" if episode_index is not None else f"{repo_name}/latents/chunk-*/{cam_key}/episode_*.pth"
+                logger.info(
+                    f"single_trajectory=True for eval; restricting text embedding search to repo_id={repo_id}"
+                )
         else:
-            pattern = f"**/latents/chunk-*/{cam_key}/episode_*.pth"
+            pattern = f"**/latents/chunk-*/{cam_key}/episode_*.pth" if not repo_name else f"{repo_name}/latents/chunk-*/{cam_key}/episode_*.pth"
         self._text_emb_search_files = sorted(dataset_root.glob(pattern))
         logger.info(
             f"Prepared text embedding search index with {len(self._text_emb_search_files)} latent files "
@@ -640,7 +675,9 @@ class VA_Server:
         self.action_history = []
         self.frame_history = []
         self.pose_history = []
+        self.unexecuted_action_buffer.clear()
         self.prev_absolute_action_chunk = None
+        self.actions_served_since_last_prediction = 0
         self.prev_executed_absolute_action_16d = None
         self.episode_initial_state = None
         self.current_anchor_abs_state = None
@@ -649,6 +686,31 @@ class VA_Server:
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, "real", self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
+        self.ee_target_log_path = os.path.join(self.exp_save_root, "ee_target_log.jsonl")
+        self._last_ee_target_log_record = None
+
+    def _merge_latest_ee_target_log(self, update_payload):
+        log_path = getattr(self, "ee_target_log_path", None)
+        if log_path is None or self._last_ee_target_log_record is None:
+            return False
+        if not os.path.exists(log_path):
+            return False
+
+        record = dict(self._last_ee_target_log_record)
+        record.update(update_payload)
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if not lines:
+                return False
+            lines[-1] = json.dumps(record) + "\n"
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            self._last_ee_target_log_record = record
+            return True
+        except Exception as exc:
+            logger.warning(f"Failed to merge planner feedback into {log_path}: {exc}")
+            return False
 
     def _trim_transformer_kv_cache(self, past_key_values):
         if not isinstance(past_key_values, (list, tuple)):
@@ -877,6 +939,107 @@ class VA_Server:
         right = self._smooth_absolute_pose(previous_action_16d[8:], current_action_16d[8:], alpha)
         return np.concatenate([left, right]).astype(np.float32)
 
+    def _clip_target_xyz(self, target_xyz, current_xyz, xyz_min, xyz_max):
+        target_xyz = np.asarray(target_xyz, dtype=np.float32).reshape(3)
+        clipped = target_xyz.copy()
+        if current_xyz is not None and self.ee_target_guard_max_delta_xyz > 0.0:
+            current_xyz = np.asarray(current_xyz, dtype=np.float32).reshape(3)
+            delta = np.clip(
+                clipped - current_xyz,
+                -self.ee_target_guard_max_delta_xyz,
+                self.ee_target_guard_max_delta_xyz,
+            )
+            clipped = current_xyz + delta
+        return np.minimum(np.maximum(clipped, xyz_min), xyz_max)
+
+    def _apply_ee_target_guard(self, absolute_action, current_obs=None):
+        if not self.ee_target_guard_enabled:
+            return absolute_action
+        guarded = np.asarray(absolute_action, dtype=np.float32).copy()
+        if guarded.ndim == 2:
+            guarded = guarded[:, :, None]
+        if guarded.ndim != 3 or guarded.shape[0] != len(self.used_action_channel_ids):
+            return absolute_action
+
+        current_state = None
+        if current_obs is not None and current_obs.get("observation.state", None) is not None:
+            current_state = np.asarray(current_obs["observation.state"], dtype=np.float32).reshape(-1)
+            if current_state.size != len(self.used_action_channel_ids):
+                current_state = None
+
+        left_current_xyz = None if current_state is None else current_state[:3]
+        right_current_xyz = None if current_state is None else current_state[8:11]
+        for step_idx in range(guarded.shape[1]):
+            guarded[:3, step_idx, 0] = self._clip_target_xyz(
+                guarded[:3, step_idx, 0],
+                left_current_xyz,
+                self.ee_target_guard_left_min,
+                self.ee_target_guard_left_max,
+            )
+            guarded[8:11, step_idx, 0] = self._clip_target_xyz(
+                guarded[8:11, step_idx, 0],
+                right_current_xyz,
+                self.ee_target_guard_right_min,
+                self.ee_target_guard_right_max,
+            )
+            guarded[3:7, step_idx, 0] = self._safe_quat(guarded[3:7, step_idx, 0])
+            guarded[11:15, step_idx, 0] = self._safe_quat(guarded[11:15, step_idx, 0])
+        return guarded.astype(np.float32)
+
+    def _log_executed_ee_target(self, current_obs, buffered_action_16d, served_action_16d):
+        current_state = None
+        if current_obs is not None and current_obs.get("observation.state", None) is not None:
+            current_state = np.asarray(current_obs["observation.state"], dtype=np.float32).reshape(-1)
+            if current_state.size != len(self.used_action_channel_ids):
+                current_state = None
+
+        buffered_action_16d = np.asarray(buffered_action_16d, dtype=np.float32).reshape(16)
+        served_action_16d = np.asarray(served_action_16d, dtype=np.float32).reshape(16)
+
+        def pose_payload(vec):
+            return {
+                "xyz": vec[:3].astype(float).tolist(),
+                "quat": vec[3:7].astype(float).tolist(),
+                "gripper": float(vec[7]),
+            }
+
+        def delta_payload(target, current):
+            if current is None:
+                return None
+            delta_xyz = target[:3] - current[:3]
+            return {
+                "xyz": delta_xyz.astype(float).tolist(),
+                "xyz_norm": float(np.linalg.norm(delta_xyz)),
+            }
+
+        left_current = None if current_state is None else current_state[:8]
+        right_current = None if current_state is None else current_state[8:16]
+        record = {
+            "server_step": int(self.frame_st_id),
+            "buffer_remaining": int(len(self.unexecuted_action_buffer)),
+            "actions_served_since_last_prediction": int(self.actions_served_since_last_prediction),
+            "ee_target_guard_enabled": bool(self.ee_target_guard_enabled),
+            "ee_target_guard_max_delta_xyz": float(self.ee_target_guard_max_delta_xyz),
+            "left": {
+                "current": None if left_current is None else pose_payload(left_current),
+                "buffered_target": pose_payload(buffered_action_16d[:8]),
+                "served_target": pose_payload(served_action_16d[:8]),
+                "served_delta_from_current": delta_payload(served_action_16d[:8], left_current),
+            },
+            "right": {
+                "current": None if right_current is None else pose_payload(right_current),
+                "buffered_target": pose_payload(buffered_action_16d[8:16]),
+                "served_target": pose_payload(served_action_16d[8:16]),
+                "served_delta_from_current": delta_payload(served_action_16d[8:16], right_current),
+            },
+        }
+
+        log_path = getattr(self, "ee_target_log_path", None)
+        if log_path is not None:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        self._last_ee_target_log_record = record
+
     def _action_chunk_to_normalized_tensor(self, absolute_action_chunk, anchor_state=None):
         absolute_action_chunk = np.asarray(absolute_action_chunk, dtype=np.float32)
         if absolute_action_chunk.ndim == 3:
@@ -926,10 +1089,17 @@ class VA_Server:
         if prev_chunk.shape[0] != len(self.used_action_channel_ids) or prev_chunk.shape[1] < 1:
             return None
 
+        # The server may execute several buffered actions before the next model call.
+        # Warm start should roll by the number of environment steps already served,
+        # matching p2p's one-step roll when action_chunk_exec_steps == 1.
+        shift_steps = max(1, int(self.actions_served_since_last_prediction))
+        shift_steps = min(shift_steps, int(prev_chunk.shape[1]))
         shifted_chunk = np.empty_like(prev_chunk)
-        if prev_chunk.shape[1] > 1:
-            shifted_chunk[:, :-1, :] = prev_chunk[:, 1:, :]
-        shifted_chunk[:, -1:, :] = prev_chunk[:, -1:, :]
+        if shift_steps < prev_chunk.shape[1]:
+            shifted_chunk[:, :-shift_steps, :] = prev_chunk[:, shift_steps:, :]
+            shifted_chunk[:, -shift_steps:, :] = prev_chunk[:, -1:, :]
+        else:
+            shifted_chunk[...] = prev_chunk[:, -1:, :]
 
         future_x0 = self._action_chunk_to_normalized_tensor(
             shifted_chunk,
@@ -956,9 +1126,10 @@ class VA_Server:
             self.tokens_per_frame,
             1,
         )
-        noise = torch.randn_like(x0_tokens)
-        sigma_start = self.train_scheduler_action.sigmas[0].to(self.device, dtype=dtype)
-        sample = (1.0 - sigma_start) * x0_tokens + sigma_start * noise
+        # Match p2p-style warm start: initialize the next denoising pass from
+        # the rolled previous prediction. Re-noising by sigma_start would erase
+        # this signal because sigma_start is normally 1.0.
+        sample = x0_tokens
         if self.warm_start_blend < 1.0:
             sample = self.warm_start_blend * sample + (1.0 - self.warm_start_blend) * torch.randn_like(sample)
         if self.warm_start_noise_std > 0.0:
@@ -982,6 +1153,20 @@ class VA_Server:
             anchor_state=anchor_state,
         ).numpy()
         return absolute_action, relative_action
+
+    def _buffer_action_chunk(self, absolute_action_chunk):
+        absolute_action_chunk = np.asarray(absolute_action_chunk, dtype=np.float32)
+        if absolute_action_chunk.ndim == 2:
+            absolute_action_chunk = absolute_action_chunk[:, :, None]
+        if absolute_action_chunk.ndim != 3:
+            raise ValueError(
+                f"absolute_action_chunk must be [C, T] or [C, T, N], got {tuple(absolute_action_chunk.shape)}"
+            )
+
+        exec_steps = min(self.action_chunk_exec_steps, int(absolute_action_chunk.shape[1]))
+        for step_idx in range(exec_steps):
+            step = np.asarray(absolute_action_chunk[:, step_idx], dtype=np.float32).reshape(-1)
+            self.unexecuted_action_buffer.append(step.copy())
 
     def postprocess_action(self, action):
         action = action.cpu()  # [B, C, F, N, 1]
@@ -1125,7 +1310,7 @@ class VA_Server:
         ]
         return [max(0, min(length - 1, idx)) for idx in indices]
 
-    def _update_transformer_cache_with_frame(self, frame_tensor, current_obs=None):
+    def _update_transformer_cache_with_frame(self, frame_tensor, current_obs=None, build_conds=True):
         transformer_dtype = next(self.transformer.aggregator.patch_embed.parameters()).dtype
         frame_tensor = frame_tensor.to(self.device, dtype=transformer_dtype)
         current_pose = None
@@ -1145,6 +1330,9 @@ class VA_Server:
         else:
             self.pose_history.append(np.zeros(len(self.used_action_channel_ids), dtype=np.float32))
         self._trim_rolling_history()
+
+        if not build_conds:
+            return None
 
         history_indices = self._select_history_indices(len(self.frame_history))
         if len(self.pose_history) != len(self.frame_history):
@@ -1249,11 +1437,12 @@ class VA_Server:
         }
         return conds
 
-    def _predict_actions(self, current_obs):
+    def _predict_actions(self, current_obs, frame_conds=None):
         with torch.no_grad():
-            current_frames = self._preprocess_obs_to_frames([current_obs])
-            frame_tensor = current_frames[-1].to(self.device, dtype=self.dtype)
-            frame_conds = self._update_transformer_cache_with_frame(frame_tensor, current_obs=current_obs)
+            if frame_conds is None:
+                current_frames = self._preprocess_obs_to_frames([current_obs])
+                frame_tensor = current_frames[-1].to(self.device, dtype=self.dtype)
+                frame_conds = self._update_transformer_cache_with_frame(frame_tensor, current_obs=current_obs)
             conds = self._build_windowed_rdt_conds(frame_conds)
             action_head_dtype = next(self.action_head.parameters()).dtype
             conds_img_c = conds["rdt_img_c"].to(self.device, dtype=action_head_dtype)
@@ -1368,17 +1557,13 @@ class VA_Server:
             posinf=1e3,
             neginf=-1e3,
         ).astype(np.float32)
+        absolute_action = self._apply_ee_target_guard(absolute_action, current_obs=current_obs)
         relative_action = np.nan_to_num(
             relative_action,
             nan=0.0,
             posinf=1e3,
             neginf=-1e3,
         ).astype(np.float32)
-        absolute_action, relative_action = self._apply_action_smoothing(
-            absolute_action,
-            relative_action,
-            anchor_state=self.current_anchor_abs_state,
-        )
         return {
             "relative_action": relative_action,
             "absolute_action": absolute_action,
@@ -1387,6 +1572,23 @@ class VA_Server:
 
     @torch.no_grad()
     def infer(self, obs):
+        if "planner_feedback" in obs:
+            planner_feedback = obs.get("planner_feedback")
+            merged = self._merge_latest_ee_target_log(
+                {
+                    "planner_feedback": planner_feedback,
+                    "planner_success": (
+                        bool(planner_feedback.get("planner_success"))
+                        if isinstance(planner_feedback, dict)
+                        and planner_feedback.get("planner_success") is not None
+                        else None
+                    ),
+                }
+            )
+            if not merged:
+                logger.warning("Received planner feedback but no EE target log record was available to update.")
+            return {"planner_feedback_logged": bool(merged)}
+
         reset = obs.get("reset", False)
         prompt = obs.get("prompt", None)
         text_emb = obs.get("text_emb", None)
@@ -1457,28 +1659,78 @@ class VA_Server:
                 raise ValueError("obs list is empty")
             current_obs = current_obs[-1]
 
-        logger.info("################# Infer One Chunk (ActionVGGT + RDT) #################")
-        pred = self._predict_actions(current_obs)
-        action = pred["absolute_action"]
-        relative_action = pred["relative_action"]
+        current_frames = self._preprocess_obs_to_frames([current_obs])
+        frame_tensor = current_frames[-1].to(self.device, dtype=self.dtype)
+        need_new_chunk = len(self.unexecuted_action_buffer) == 0
+        frame_conds = self._update_transformer_cache_with_frame(
+            frame_tensor,
+            current_obs=current_obs,
+            build_conds=need_new_chunk,
+        )
+
+        if need_new_chunk:
+            logger.info("################# Infer One Chunk (ActionVGGT + RDT) #################")
+            pred = self._predict_actions(current_obs, frame_conds=frame_conds)
+            action_chunk = pred["absolute_action"]
+            self.prev_absolute_action_chunk = action_chunk.astype(np.float32).copy()
+            self.actions_served_since_last_prediction = 0
+            self._buffer_action_chunk(action_chunk)
+        else:
+            logger.info(
+                f"################# Pop Buffered Action ({len(self.unexecuted_action_buffer)} remaining) #################"
+            )
+
+        if len(self.unexecuted_action_buffer) == 0:
+            raise RuntimeError("Action buffer is empty after inference; cannot serve an action.")
+
+        action_16d = self.unexecuted_action_buffer.popleft().astype(np.float32)
+        buffered_action_16d = action_16d.copy()
+        action = action_16d.reshape(len(self.used_action_channel_ids), 1, 1)
+        if self.current_anchor_abs_state is None:
+            relative_action = action.copy()
+        else:
+            relative_action = self._absolute_action_chunk_to_relative(
+                action,
+                self.current_anchor_abs_state,
+            )
+        action, relative_action = self._apply_action_smoothing(
+            action,
+            relative_action,
+            anchor_state=self.current_anchor_abs_state,
+        )
+        self._log_executed_ee_target(
+            current_obs=current_obs,
+            buffered_action_16d=buffered_action_16d,
+            served_action_16d=action[:, 0, 0],
+        )
+
         current_action_abs = torch.from_numpy(action[:, 0, 0]).float()
         self.action_history.append(current_action_abs.detach().cpu())
-        self.prev_absolute_action_chunk = action.astype(np.float32).copy()
         self.prev_executed_absolute_action_16d = action[:, 0, 0].astype(np.float32).copy()
+        if self.prev_absolute_action_chunk is not None:
+            served_idx = int(self.actions_served_since_last_prediction)
+            if 0 <= served_idx < self.prev_absolute_action_chunk.shape[1]:
+                self.prev_absolute_action_chunk[:, served_idx, 0] = self.prev_executed_absolute_action_16d
+        self.actions_served_since_last_prediction += 1
         if len(self.frame_history) > 0:
             self.frame_history[-1]["action_abs"] = action[:, 0, 0].astype(np.float32).copy()
         self._trim_rolling_history()
         if self.episode_initial_state is None:
             self.episode_initial_state = self.preprocess_action_state(
                 action[:, 0, 0],
-                anchor_state=pred["action_reference"],
+                anchor_state=self.current_anchor_abs_state,
             ).to(self.device, dtype=self.dtype)
         self.frame_st_id += 1
+        action_reference = (
+            self.current_anchor_abs_state.astype(np.float32).copy()
+            if self.current_anchor_abs_state is not None
+            else np.zeros(len(self.used_action_channel_ids), dtype=np.float32)
+        )
         return {
             "action": action,
             "action_absolute": action,
             "action_relative": relative_action,
-            "action_reference": pred["action_reference"],
+            "action_reference": action_reference,
         }
 
 
@@ -1503,6 +1755,9 @@ def run(args):
         config.single_trajectory = True
     if args.single_trajectory_episode_index is not None:
         config.single_trajectory_episode_index = int(args.single_trajectory_episode_index)
+        config.single_trajectory = True
+    if args.single_trajectory_repo_id is not None:
+        config.single_trajectory_repo_id = args.single_trajectory_repo_id
         config.single_trajectory = True
 
     model = VA_Server(config)
@@ -1540,6 +1795,12 @@ def main():
         type=int,
         default=None,
         help="Episode index used when --single-trajectory is enabled. If omitted, first available episode is used.",
+    )
+    parser.add_argument(
+        "--single-trajectory-repo-id",
+        type=str,
+        default=None,
+        help="Exact RobotWin repo folder name/path for --single-trajectory.",
     )
     args = parser.parse_args()
     run(args)

@@ -2,6 +2,7 @@
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import get_episode_data_index
 from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+import json
 import numpy as np
 from pathlib import Path
 from collections.abc import Callable
@@ -55,6 +56,17 @@ def construct_lerobot_multi_processor(config,
             if Path(v).name.startswith(f"{config.single_task}-")
         ]
         logger.info(f"Found {len(repo_list)} repositories with info.json in {config.dataset_path} for task {config.single_task}.")
+    single_trajectory_repo_id = getattr(config, "single_trajectory_repo_id", None)
+    if single_trajectory_repo_id:
+        target_repo_name = Path(str(single_trajectory_repo_id)).name
+        repo_list = [
+            v for v in repo_list
+            if Path(v).name == target_repo_name or str(v) == str(single_trajectory_repo_id)
+        ]
+        logger.info(
+            f"Single-trajectory repo pin enabled: target_repo_id={single_trajectory_repo_id}, "
+            f"matched_repos={len(repo_list)}"
+        )
     # repo_list = repo_list[:2]
     if num_init_worker is None or int(num_init_worker) <= 1:
         for repo in repo_list:
@@ -196,6 +208,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         )
         self._text_embedding_cache = {}
         self._empty_text_embedding = None
+        self._episode_meta_cache = None
         self.prefer_raw_text_for_text_embeddings = bool(
             getattr(config, "prefer_raw_text_for_text_embeddings", True)
         )
@@ -242,12 +255,71 @@ class LatentLeRobotDataset(LeRobotDataset):
                 )
                 target_episode = fallback_episode
                 filtered = [m for m in out if int(m["episode_index"]) == target_episode]
-            logger.info(
-                f"Dataset {self.repo_id}: single-trajectory mode enabled, selected episode_index={target_episode}, "
-                f"segments={len(filtered)}"
-            )
+            self._log_single_trajectory_summary(target_episode, filtered)
             out = filtered
         self.new_metas = out
+
+    def _load_episode_meta_map(self):
+        if self._episode_meta_cache is not None:
+            return self._episode_meta_cache
+
+        episode_meta_path = Path(self.repo_id) / "meta" / "episodes.jsonl"
+        episode_meta_map = {}
+        if episode_meta_path.exists():
+            try:
+                with open(episode_meta_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        record = json.loads(line)
+                        episode_index = record.get("episode_index", None)
+                        if episode_index is not None:
+                            episode_meta_map[int(episode_index)] = record
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to load episode meta summary from {episode_meta_path}: {exc}"
+                )
+
+        self._episode_meta_cache = episode_meta_map
+        return self._episode_meta_cache
+
+    def _log_single_trajectory_summary(self, target_episode: int, filtered_metas):
+        episode_record = self._load_episode_meta_map().get(int(target_episode), {})
+        episode_length = episode_record.get("length", None)
+        tasks = episode_record.get("tasks", [])
+        action_config = episode_record.get("action_config", [])
+        task_name = Path(self.repo_id).name.split("-")[0]
+
+        if episode_length is None and len(filtered_metas) > 0:
+            first_meta = filtered_metas[0]
+            episode_length = int(first_meta["end_frame"]) - int(first_meta["start_frame"])
+
+        primary_instruction = tasks[0] if len(tasks) > 0 else None
+        logger.info(
+            f"Dataset {self.repo_id}: single-trajectory mode enabled (task_name={task_name})"
+        )
+        logger.info(
+            f"  episode_index={int(target_episode)}, episode_length={episode_length}, "
+            f"segments={len(filtered_metas)}, task_count={len(tasks)}"
+        )
+        if primary_instruction is not None:
+            logger.info(f"  language_instruction={primary_instruction}")
+        if len(tasks) > 1:
+            logger.info(f"  all_task_strings={tasks}")
+        logger.info(f"  trajectory_signature={Path(self.repo_id).name}::episode_{int(target_episode):06d}")
+
+        if len(action_config) == 0:
+            action_config = filtered_metas
+        for seg_idx, seg in enumerate(action_config):
+            start_frame = seg.get("start_frame", None)
+            end_frame = seg.get("end_frame", None)
+            action_text = seg.get("action_text", None)
+            skill = seg.get("skill", None)
+            logger.info(
+                f"  segment[{seg_idx}]: start_frame={start_frame}, end_frame={end_frame}, "
+                f"action_text={action_text}, skill={skill}"
+            )
 
     def _check_meta(self, start_frame, end_frame, episode_index):
         episode_chunk = self.meta.get_episode_chunk(episode_index)
