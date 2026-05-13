@@ -679,7 +679,12 @@ class Trainer:
         for name, param in self.transformer.named_parameters():
             total_params += param.numel()
             if self.use_lora:
-                should_train = ("lora_" in name) or name.endswith("action_query_tokens")
+                should_train = (
+                    ("lora_" in name)
+                    or name.endswith("action_query_tokens")
+                    or name.startswith("aggregator.action_embedder.")
+                    or name.startswith("text_token_proj.")
+                )
                 param.requires_grad = should_train
             else:
                 param.requires_grad = True
