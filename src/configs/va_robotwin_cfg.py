@@ -92,11 +92,11 @@ va_robotwin_cfg.rdt.action_smoothing_alpha = 0.6
 # failures such as a fully straightened arm getting stuck.
 va_robotwin_cfg.ee_target_guard = EasyDict()
 va_robotwin_cfg.ee_target_guard.enabled = True
-va_robotwin_cfg.ee_target_guard.max_delta_xyz = 0.5
-va_robotwin_cfg.ee_target_guard.left_xyz_min = [-10.0, -10.0, -10.0]
-va_robotwin_cfg.ee_target_guard.left_xyz_max = [10.0, 10.0, 10.0]
-va_robotwin_cfg.ee_target_guard.right_xyz_min = [-10.0, -10.0, -10.0]
-va_robotwin_cfg.ee_target_guard.right_xyz_max = [10.0, 10.0, 10.0]
+va_robotwin_cfg.ee_target_guard.max_delta_xyz = 0.2
+va_robotwin_cfg.ee_target_guard.left_xyz_min = [-0.2979237735, -0.3138048649, 0.8695474267]
+va_robotwin_cfg.ee_target_guard.left_xyz_max = [0.03409340233, -0.03222606331, 1.077983499]
+va_robotwin_cfg.ee_target_guard.right_xyz_min = [-0.04576408118, -0.3128012717, 0.8713479042]
+va_robotwin_cfg.ee_target_guard.right_xyz_max = [0.3064331412, -0.04851070791, 1.098479986]
 
 va_robotwin_cfg.snr_shift = 5.0
 va_robotwin_cfg.action_snr_shift = 1.0
@@ -125,3 +125,17 @@ va_robotwin_cfg.norm_stat = {
         1, 1, 1, 1,
     ] + [1.0] * 16,
 }
+# va_robotwin_cfg.norm_stat = {
+#     "q01": [
+#         -0.2979239821, -0.3138048649, 0.9291918278,
+#         -1, -1, -1, -1,
+#         0.05056908354, -0.3128008246, 0.9288659096,
+#         -1, -1, -1, -1,
+#     ] + [0.] * 16,
+#     "q99": [
+#         -0.06342231482, -0.001932744752, 1.062610745,
+#         1, 1, 1, 1,
+#         0.3064331412, -0.006573319435, 1.062978864,
+#         1, 1, 1, 1,
+#     ] + [1.0] * 16,
+# }

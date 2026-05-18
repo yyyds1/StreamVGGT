@@ -691,6 +691,60 @@ class VA_Server:
         self.ee_target_log_path = os.path.join(self.exp_save_root, "ee_target_log.jsonl")
         self._last_ee_target_log_record = None
 
+    def _get_valid_obs_state(self, current_obs):
+        if current_obs is None or current_obs.get("observation.state", None) is None:
+            return None
+        state = np.asarray(current_obs["observation.state"], dtype=np.float32).reshape(-1)
+        if state.size != len(self.used_action_channel_ids):
+            logger.warning(
+                f"Skip eval warm start: expected observation.state with "
+                f"{len(self.used_action_channel_ids)} values, got shape {tuple(state.shape)}"
+            )
+            return None
+        return state
+
+    def _warm_start_runtime_from_obs(self, current_obs):
+        """Seed eval buffers from the current robot state before the first policy step."""
+        state_16d = self._get_valid_obs_state(current_obs)
+        if state_16d is None:
+            return False
+
+        self.current_anchor_abs_state = state_16d.copy()
+        self.prev_executed_absolute_action_16d = state_16d.copy()
+        self.prev_absolute_action_chunk = np.repeat(
+            state_16d[:, None, None],
+            self.chunk_size,
+            axis=1,
+        ).astype(np.float32)
+        self.episode_initial_state = self.preprocess_action_state(
+            state_16d,
+            anchor_state=state_16d,
+        ).to(self.device, dtype=self.dtype)
+
+        state_token = self.episode_initial_state[0, 0].detach().cpu()
+        state_frame = state_token.unsqueeze(-1).repeat(1, self.image_frame_stride)
+        max_buffer = max(1, self.history_len * self.history_frame_stride)
+        self.action_history = [state_frame.clone() for _ in range(max_buffer)]
+        self.pose_history = [state_16d.copy() for _ in range(max_buffer)]
+
+        frames = self._preprocess_obs_to_frames([current_obs])
+        if len(frames) > 0:
+            frame_tensor = frames[-1].detach().cpu()
+            self.frame_history = [
+                {
+                    "frame": frame_tensor.clone(),
+                    "action_abs": state_16d.copy(),
+                    "pose": state_16d.copy(),
+                }
+                for _ in range(max_buffer)
+            ]
+
+        logger.info(
+            f"Eval warm start: filled {len(self.frame_history)} frame/pose entries, "
+            f"{len(self.action_history)} action-history entries, and seeded first action chunk from current state."
+        )
+        return True
+
     def _merge_latest_ee_target_log(self, update_payload):
         log_path = getattr(self, "ee_target_log_path", None)
         if log_path is None or self._last_ee_target_log_record is None:
@@ -1136,7 +1190,19 @@ class VA_Server:
             sample = self.warm_start_blend * sample + (1.0 - self.warm_start_blend) * torch.randn_like(sample)
         if self.warm_start_noise_std > 0.0:
             sample = sample + self.warm_start_noise_std * torch.randn_like(sample)
-        return sample
+        return self._mask_action_sample_channels(sample)
+
+    def _mask_action_sample_channels(self, action_sample):
+        """Keep eval action samples aligned with training masks.
+
+        Training zeroes inactive/dummy action channels before RDT sees the noised
+        action chunk. Do the same during online denoising so random dummy channels
+        do not enter the action embedder.
+        """
+        action_mask = self.action_mask.to(action_sample.device)
+        action_sample = action_sample.clone()
+        action_sample[:, ~action_mask] = 0
+        return action_sample
 
     def _apply_action_smoothing(self, absolute_action, relative_action, anchor_state):
         if self.prev_executed_absolute_action_16d is None or self.action_smoothing_alpha >= 1.0:
@@ -1173,6 +1239,7 @@ class VA_Server:
     def postprocess_action(self, action):
         action = action.cpu()  # [B, C, F, N, 1]
         action = action[0, ..., 0]  # [C, F, N]
+        action = action.clamp(-1.0, 1.0)
         if self.action_norm_method == "quantiles":
             action = (action + 1) / 2 * (self.actions_q99 - self.actions_q01 + 1e-6) + self.actions_q01
         else:
@@ -1479,6 +1546,7 @@ class VA_Server:
                     device=self.device,
                     dtype=self.dtype,
                 )
+            action_sample = self._mask_action_sample_channels(action_sample)
 
             if self.state_condition_mode == "first_action":
                 # Match p2p+RDT inference: RDT uses state_actions[:, :1, :].
@@ -1523,6 +1591,7 @@ class VA_Server:
 
             timesteps = self.train_scheduler_action.timesteps.to(self.device)
             for i, t in enumerate(timesteps):
+                action_sample = self._mask_action_sample_channels(action_sample)
                 x_in = rearrange(action_sample, "b c f n 1 -> b (f n) c").to(self.device, dtype=action_head_dtype)
                 t_batch = torch.full((x_in.shape[0],), float(t.item()), device=self.device, dtype=torch.float32)
                 flow_pred = self.action_head(
@@ -1543,8 +1612,9 @@ class VA_Server:
                     prev_timestep=timesteps[i + 1] if (i + 1) < len(timesteps) else None,
                     to_final=(i + 1 == len(timesteps)),
                 )
+                action_sample = self._mask_action_sample_channels(action_sample)
 
-        action_sample[:, ~self.action_mask.to(action_sample.device)] *= 0
+        action_sample = self._mask_action_sample_channels(action_sample)
         action_tokens = rearrange(action_sample, "b c f n 1 -> b c (f n) 1 1")
         future_action_tokens = action_tokens[:, :, 1 : self.chunk_size + 1]
         predicted_action = self.postprocess_action(future_action_tokens)
@@ -1611,6 +1681,11 @@ class VA_Server:
         if reset:
             logger.info("******************* Reset server ******************")
             self._reset_runtime_buffers(prompt=prompt, text_emb=text_emb)
+            reset_obs = obs.get("obs", None)
+            if isinstance(reset_obs, list):
+                reset_obs = reset_obs[-1] if len(reset_obs) > 0 else None
+            if reset_obs is not None:
+                self._warm_start_runtime_from_obs(reset_obs)
             return {}
 
         if text_emb is not None:

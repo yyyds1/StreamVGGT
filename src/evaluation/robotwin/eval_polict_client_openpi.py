@@ -897,13 +897,22 @@ def eval_policy(task_name,
 
         succ = False
 
+        initial_obs = TASK_ENV.get_obs() 
+        inint_eef_pose = initial_obs['endpose']['left_endpose'] + \
+        [initial_obs['endpose']['left_gripper']] + \
+        initial_obs['endpose']['right_endpose'] + \
+        [initial_obs['endpose']['right_gripper']]
+        inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
         prompt = TASK_ENV.get_instruction()
         episode_index = int(current_episode_index)
+        initial_formatted_obs = format_obs(initial_obs, prompt)
+
         # StreamVGGT now follows p2p and encodes the prompt on the policy server with
         # EmbeddingGemma. Do not send legacy dataset text_emb tensors from the client.
         prompt_text_emb = None
         ret = model.infer(dict(
             reset=True,
+            obs=initial_formatted_obs,
             prompt=prompt,
             text_emb=prompt_text_emb,
             save_visualization=save_visualization,
@@ -913,13 +922,6 @@ def eval_policy(task_name,
         gen_video_list = []
         full_action_history = []
 
-        initial_obs = TASK_ENV.get_obs() 
-        inint_eef_pose = initial_obs['endpose']['left_endpose'] + \
-        [initial_obs['endpose']['left_gripper']] + \
-        initial_obs['endpose']['right_endpose'] + \
-        [initial_obs['endpose']['right_gripper']]
-        inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
-        initial_formatted_obs = format_obs(initial_obs, prompt)
         full_obs_list.append(initial_formatted_obs)
         while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
             observation = TASK_ENV.get_obs()
