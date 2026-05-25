@@ -10,9 +10,6 @@ PORT=${PORT:-"1106"}
 LOG_RANK=${LOG_RANK:-"0"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 CONFIG_NAME=${CONFIG_NAME:-"robotwin_train"}
-SINGLE_TRAJECTORY=${SINGLE_TRAJECTORY:-"0"}
-SINGLE_TRAJECTORY_EPISODE_INDEX=${SINGLE_TRAJECTORY_EPISODE_INDEX:-""}
-SINGLE_TRAJECTORY_REPO_ID=${SINGLE_TRAJECTORY_REPO_ID:-""}
 
 overrides=""
 if [ $# -ne 0 ]; then
@@ -42,6 +39,3 @@ python -m torch.distributed.run \
     --tee 3 \
     -m train_va --config-name ${config_name} $overrides \
     --task_name adjust_bottle \
-    $(if [ "${SINGLE_TRAJECTORY}" = "1" ]; then printf '%s' "--single-trajectory"; fi) \
-    $(if [ -n "${SINGLE_TRAJECTORY_EPISODE_INDEX}" ]; then printf '%s' "--single-trajectory-episode-index ${SINGLE_TRAJECTORY_EPISODE_INDEX}"; fi) \
-    $(if [ -n "${SINGLE_TRAJECTORY_REPO_ID}" ]; then printf '%s' "--single-trajectory-repo-id ${SINGLE_TRAJECTORY_REPO_ID}"; fi)

@@ -60,13 +60,68 @@ from dataset import MultiLatentLeRobotDataset, MultiVGARobotwinDataset
 import gc
 
 
+def use_separate_obs_view_selection(config):
+    return bool(getattr(config, "separate_history_current_obs_views", False))
+
+
+def get_current_obs_cam_keys(config):
+    return list(getattr(config, "current_obs_cam_keys", getattr(config, "obs_cam_keys", [])))
+
+
+def get_current_image_frame_count(config):
+    if use_separate_obs_view_selection(config):
+        return max(1, len(get_current_obs_cam_keys(config)))
+    mode = getattr(config, "multi_view_image_mode", "vertical")
+    if mode == "frame":
+        return max(1, len(getattr(config, "obs_cam_keys", [])))
+    return 1
+
+
 def get_effective_num_image_views(config):
+    if use_separate_obs_view_selection(config):
+        return 1
     mode = getattr(config, "multi_view_image_mode", "vertical")
     if mode == "vertical":
         return len(config.obs_cam_keys)
     if mode in {"frame", "first"}:
         return 1
     raise ValueError(f"Unsupported multi_view_image_mode `{mode}`")
+
+
+def build_mixed_view_image_grid_id(batch_dict, batch_size, seq_len, height, width, patch_h, patch_w, device):
+    image_time_ids = batch_dict.get("image_time_ids", None)
+    image_view_ids = batch_dict.get("image_view_ids", None)
+    if image_time_ids is None or image_view_ids is None:
+        return None
+
+    if image_time_ids.ndim == 1:
+        image_time_ids = image_time_ids.unsqueeze(0).expand(batch_size, -1)
+    if image_view_ids.ndim == 1:
+        image_view_ids = image_view_ids.unsqueeze(0).expand(batch_size, -1)
+    if image_time_ids.shape != (batch_size, seq_len) or image_view_ids.shape != (batch_size, seq_len):
+        raise ValueError(
+            "image_time_ids/image_view_ids must match compact image sequence shape: "
+            f"time={tuple(image_time_ids.shape)}, view={tuple(image_view_ids.shape)}, expected={(batch_size, seq_len)}"
+        )
+
+    grid_h = height // patch_h
+    grid_w = width // patch_w
+    patch_y, patch_x = torch.meshgrid(
+        torch.arange(grid_h, device=device),
+        torch.arange(grid_w, device=device),
+        indexing="ij",
+    )
+    patch_y = patch_y.reshape(1, 1, -1)
+    patch_x = patch_x.reshape(1, 1, -1)
+
+    image_time_ids = image_time_ids.to(device=device, dtype=torch.long)
+    image_view_ids = image_view_ids.to(device=device, dtype=torch.long)
+    f_coord = image_time_ids[:, :, None].expand(-1, -1, grid_h * grid_w)
+    h_coord = patch_y + image_view_ids[:, :, None] * grid_h
+    w_coord = patch_x.expand(batch_size, seq_len, -1)
+    t_coord = torch.zeros_like(f_coord)
+    grid = torch.stack([f_coord, h_coord, w_coord, t_coord], dim=1)
+    return grid.reshape(batch_size, 4, seq_len * grid_h * grid_w)
 
 
 def _to_plain_config(value):
@@ -321,8 +376,13 @@ class Trainer:
 
         self.enable_camera_loss = bool(getattr(config, "enable_camera_loss", False))
         self.enable_depth_loss = bool(getattr(config, "enable_depth_loss", False))
+        self.enable_ee_target_loss = bool(getattr(config, "enable_ee_target_loss", False))
         self.loss_weight_camera = float(getattr(config, "loss_weight_camera", 0.0))
         self.loss_weight_depth = float(getattr(config, "loss_weight_depth", 0.0))
+        self.loss_weight_ee_target = float(getattr(config, "loss_weight_ee_target", 0.0))
+        self.loss_weight_ee_target_xyz = float(getattr(config, "loss_weight_ee_target_xyz", 1.0))
+        self.loss_weight_ee_target_quat = float(getattr(config, "loss_weight_ee_target_quat", 1.0))
+        self.loss_weight_ee_target_gripper = float(getattr(config, "loss_weight_ee_target_gripper", 0.2))
         self.loss_weight_action = float(getattr(config, "loss_weight_action", 1.0))
         self.state_noise_std = float(getattr(config, "state_noise_std", 0.0))
         self.state_noise_clip = bool(getattr(config, "state_noise_clip", True))
@@ -330,7 +390,11 @@ class Trainer:
         self.action_condition_noise_std = float(getattr(config.rdt, "action_condition_noise_std", 0.0))
         self.vga_action_state_noise_std = float(getattr(config, "vga_action_state_noise_std", 0.0))
         self.vga_action_state_noise_clip = bool(getattr(config, "vga_action_state_noise_clip", True))
-        self.rdt_use_language_condition = bool(getattr(config, "rdt_use_language_condition", False))
+        self.use_language_condition = bool(getattr(config, "use_language_condition", True))
+        self.rdt_use_language_condition = (
+            self.use_language_condition
+            and bool(getattr(config, "rdt_use_language_condition", False))
+        )
         self.state_condition_mode = str(getattr(config, "state_condition_mode", "latest")).lower()
         if self.state_condition_mode not in {"first_action", "latest", "episode_initial", "null"}:
             raise ValueError(
@@ -346,7 +410,8 @@ class Trainer:
         # Bypass geometry heads when corresponding losses are disabled.
         enable_camera_head = self.enable_camera_loss and self.loss_weight_camera > 0.0
         enable_depth_head = self.enable_depth_loss and self.loss_weight_depth > 0.0
-        enable_geometry_heads_train = enable_camera_head or enable_depth_head
+        enable_ee_target_head = self.enable_ee_target_loss and self.loss_weight_ee_target > 0.0
+        enable_geometry_heads_train = enable_camera_head or enable_depth_head or enable_ee_target_head
 
         # Load and shard transformer with FSDP
         logger.info("Loading transformer...")
@@ -364,6 +429,10 @@ class Trainer:
             chunk_size=int(getattr(config, "chunk_size", 24)) + 1,
             action_dim=int(getattr(config, "action_dim", 30)),
             image_frame_stride=int(getattr(config, "image_frame_stride", 8)),
+            enable_ee_target_head=enable_ee_target_head,
+            ee_target_head_num_heads=int(getattr(config, "ee_target_head_num_heads", 8)),
+            ee_target_head_trunk_depth=int(getattr(config, "ee_target_head_trunk_depth", 4)),
+            ee_target_head_num_iterations=int(getattr(config, "ee_target_head_num_iterations", 4)),
         )
         self.transformer = VGA(
             rdt_condition_tokens=getattr(config, "rdt_condition_tokens", None),
@@ -385,6 +454,8 @@ class Trainer:
             "rdt_img_cond_mode": self.transformer.rdt_img_cond_mode,
             "rdt_img_pool_size": self.transformer.rdt_img_pool_size,
             "rdt_img_keep_summary_tokens": self.transformer.rdt_img_keep_summary_tokens,
+            "use_language_condition": self.use_language_condition,
+            "rdt_use_language_condition": self.rdt_use_language_condition,
             "aggregator_depth": self.transformer.aggregator.depth,
             "use_lora": self.use_lora,
             "lora_rank": self.lora_rank,
@@ -397,7 +468,8 @@ class Trainer:
         self.transformer.to(self.device)
 
         rdt_config = config.rdt
-        num_input_frames = 1
+        num_rdt_img_frames = get_current_image_frame_count(self.config)
+        num_rdt_act_frames = 1
         effective_num_image_views = get_effective_num_image_views(self.config)
         patch_h = self.transformer.img_height // self.transformer.patch_size
         patch_w = self.transformer.img_width // self.transformer.patch_size
@@ -408,20 +480,20 @@ class Trainer:
             img_tokens_per_frame = pooled_tokens_per_view * effective_num_image_views
             if self.transformer.rdt_img_keep_summary_tokens:
                 img_tokens_per_frame += effective_num_image_views
-                rdt_img_pos_emb_config = [("image", num_input_frames * img_tokens_per_frame)]
+                rdt_img_pos_emb_config = [("image", num_rdt_img_frames * img_tokens_per_frame)]
             else:
                 rdt_img_pos_emb_config = [
-                    ("image", (num_input_frames * effective_num_image_views, pooled_patch_h, pooled_patch_w))
+                    ("image", (num_rdt_img_frames * effective_num_image_views, pooled_patch_h, pooled_patch_w))
                 ]
         else:
             img_tokens_per_frame = patch_h * patch_w * effective_num_image_views
             rdt_img_pos_emb_config = [
-                ("image", (num_input_frames * effective_num_image_views, patch_h, patch_w))
+                ("image", (num_rdt_img_frames * effective_num_image_views, patch_h, patch_w))
             ]
         rdt_horizon = self.config.chunk_size + 1
         act_tokens_per_frame = rdt_horizon
         rdt_x_pos_emb_config = [("act", rdt_horizon + self.config.rdt.num_register_tokens)]
-        rdt_act_pos_emb_config = [("action", (num_input_frames, act_tokens_per_frame))]
+        rdt_act_pos_emb_config = [("action", (num_rdt_act_frames, act_tokens_per_frame))]
 
         self.action_head = RDT(
             horizon=rdt_horizon,
@@ -431,9 +503,9 @@ class Trainer:
             lang_pos_emb_config=None,
             max_lang_len=0,
             img_pos_emb_config=rdt_img_pos_emb_config,
-            max_img_len=num_input_frames * img_tokens_per_frame,
+            max_img_len=num_rdt_img_frames * img_tokens_per_frame,
             act_pos_emb_config=rdt_act_pos_emb_config,
-            max_act_len=num_input_frames * act_tokens_per_frame,
+            max_act_len=num_rdt_act_frames * act_tokens_per_frame,
             text_embed_dim=int(getattr(config, "text_embed_dim", 4096)),
             dtype=self.dtype,
         )
@@ -446,9 +518,9 @@ class Trainer:
             "lang_pos_emb_config": None,
             "max_lang_len": 0,
             "img_pos_emb_config": rdt_img_pos_emb_config,
-            "max_img_len": num_input_frames * img_tokens_per_frame,
+            "max_img_len": num_rdt_img_frames * img_tokens_per_frame,
             "act_pos_emb_config": rdt_act_pos_emb_config,
-            "max_act_len": num_input_frames * act_tokens_per_frame,
+            "max_act_len": num_rdt_act_frames * act_tokens_per_frame,
             "text_embed_dim": int(getattr(config, "text_embed_dim", 4096)),
             "dtype": self.dtype,
         })
@@ -682,8 +754,10 @@ class Trainer:
                 should_train = (
                     ("lora_" in name)
                     or name.endswith("action_query_tokens")
+                    or name.endswith("ee_target_token")
                     or name.startswith("aggregator.action_embedder.")
                     or name.startswith("text_token_proj.")
+                    or name.startswith("ee_target_head.")
                 )
                 param.requires_grad = should_train
             else:
@@ -850,43 +924,61 @@ class Trainer:
 
         images = batch_dict['images']  # [B, C_image, F, H, W]
         actions = batch_dict['actions']  # [B, C_action, F, N, 1]
-        text_emb = self._resolve_batch_text_embedding(batch_dict)
+        text_emb = self._resolve_batch_text_embedding(batch_dict) if self.use_language_condition else None
         image_mask = batch_dict.get('images_mask', torch.ones_like(images, dtype=torch.bool))
         action_mask = batch_dict.get('actions_mask', torch.ones_like(actions, dtype=torch.bool))
 
         B, _, F, H, W = images.shape
         B_action, _, F_action, N, _ = actions.shape
-        if B != B_action or F != F_action:
+        if B != B_action:
             raise ValueError(
                 f"images/actions shape mismatch: images={tuple(images.shape)}, actions={tuple(actions.shape)}"
+            )
+        if F != F_action and "image_time_ids" not in batch_dict:
+            raise ValueError(
+                "images/actions frame count mismatch without compact-view metadata: "
+                f"images={tuple(images.shape)}, actions={tuple(actions.shape)}"
             )
         actions = self._maybe_add_noise_to_vga_action_state(actions, action_mask)
 
 
         # Build grid_id for image tokens using 3D mesh (F, H//p, W//p)
         patch_f, patch_h, patch_w = self.patch_size
-        image_grid_id = get_mesh_id(
-            F // patch_f,
-            H // patch_h,
-            W // patch_w,
-            t=0,
-            f_w=1,
-            f_shift=0,
-            action=False,
-        ).to(self.device)
-        image_grid_id = image_grid_id[None].repeat(B, 1, 1)
+        image_grid_id = build_mixed_view_image_grid_id(
+            batch_dict=batch_dict,
+            batch_size=B,
+            seq_len=F,
+            height=H,
+            width=W,
+            patch_h=patch_h,
+            patch_w=patch_w,
+            device=self.device,
+        )
+        if image_grid_id is None:
+            image_grid_id = get_mesh_id(
+                F // patch_f,
+                H // patch_h,
+                W // patch_w,
+                t=0,
+                f_w=1,
+                f_shift=0,
+                action=False,
+            ).to(self.device)
+            image_grid_id = image_grid_id[None].repeat(B, 1, 1)
 
         image_dict = dict(
             images=images,
             grid_id=image_grid_id,
             text_emb=text_emb,
             images_mask=image_mask,
+            current_image_frame_count=batch_dict.get("current_image_frame_count", 1),
+            image_time_ids=batch_dict.get("image_time_ids", None),
         )
 
-        # Replace action grid_id to align with action token RoPE (one token per frame)
+        # VGA action tokens are one history/state token per frame plus future action queries.
         action_grid_id = get_mesh_id(
-            F,
-            N,
+            F_action + chunk_size,
+            1,
             1,
             t=1,
             f_w=1,
@@ -1072,7 +1164,27 @@ class Trainer:
             raise ValueError(f"RDT language condition must be [B,D] or [B,L,D], got {tuple(lang_c.shape)}")
         return lang_c.to(device=self.device, dtype=dtype)
 
-    def compute_loss(self, input_dict, pred):
+    def _get_arm_action_channel_ids(self, num_channels, device):
+        used_ids = list(getattr(self.config, "used_action_channel_ids", []))
+        if len(used_ids) >= 2:
+            half = len(used_ids) // 2
+            left_ids = [int(idx) for idx in used_ids[:half] if 0 <= int(idx) < num_channels]
+            right_ids = [int(idx) for idx in used_ids[half : 2 * half] if 0 <= int(idx) < num_channels]
+        else:
+            half = num_channels // 2
+            left_ids = list(range(half))
+            right_ids = list(range(half, num_channels))
+
+        return (
+            torch.as_tensor(left_ids, device=device, dtype=torch.long),
+            torch.as_tensor(right_ids, device=device, dtype=torch.long),
+        )
+
+    @staticmethod
+    def _masked_loss_mean(loss_values, mask):
+        return (loss_values * mask).sum() / mask.sum().clamp_min(1.0)
+
+    def compute_action_loss_dict(self, input_dict, pred):
         action_pred = pred
         action_pred = rearrange(action_pred, 'b f c -> b c f')
         action_target = input_dict['pred_action_chunk_dict']['targets'].float().detach()
@@ -1086,10 +1198,34 @@ class Trainer:
             action_mask[..., 0] *= self.rdt_state_token_loss_weight
 
         squared_error = (action_pred.float() - action_target).pow(2) * action_loss_weight.float()
-        denom = action_mask.sum().clamp_min(1.0)
-        action_loss = (squared_error * action_mask).sum() / denom
+        action_loss = self._masked_loss_mean(squared_error, action_mask)
 
-        return action_loss / self.gradient_accumulation_steps
+        left_ids, right_ids = self._get_arm_action_channel_ids(action_pred.shape[1], action_pred.device)
+        if left_ids.numel() > 0:
+            left_action_loss = self._masked_loss_mean(
+                squared_error.index_select(1, left_ids),
+                action_mask.index_select(1, left_ids),
+            )
+        else:
+            left_action_loss = torch.zeros((), device=action_pred.device, dtype=action_loss.dtype)
+        if right_ids.numel() > 0:
+            right_action_loss = self._masked_loss_mean(
+                squared_error.index_select(1, right_ids),
+                action_mask.index_select(1, right_ids),
+            )
+        else:
+            right_action_loss = torch.zeros((), device=action_pred.device, dtype=action_loss.dtype)
+
+        scale = 1.0 / self.gradient_accumulation_steps
+        return {
+            "action": action_loss * scale,
+            "left_action": left_action_loss * scale,
+            "right_action": right_action_loss * scale,
+            "added_action": (left_action_loss + right_action_loss) * scale,
+        }
+
+    def compute_loss(self, input_dict, pred):
+        return self.compute_action_loss_dict(input_dict, pred)["action"]
 
     def _compute_camera_depth_losses(self, batch, model_output):
         zero = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -1135,6 +1271,60 @@ class Trainer:
 
         return camera_loss, depth_loss
 
+    def _zero_ee_target_loss_dict(self, device=None):
+        if device is None:
+            device = self.device
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        return {
+            "ee_target": zero,
+            "left_ee_target": zero,
+            "right_ee_target": zero,
+            "added_ee_target": zero,
+        }
+
+    def _compute_ee_target_loss_dict(self, batch, model_output):
+        geometry = getattr(model_output, "geometry", None)
+        if not isinstance(geometry, dict):
+            return self._zero_ee_target_loss_dict()
+
+        pred = geometry.get("ee_target", None)
+        target = batch.get("ee_target", None)
+        valid = batch.get("ee_target_valid", None)
+        if pred is None or target is None:
+            return self._zero_ee_target_loss_dict(device=pred.device if pred is not None else self.device)
+
+        zero = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        target = target.to(device=pred.device, dtype=pred.dtype)
+        if target.ndim == 2:
+            target = target.unsqueeze(0)
+        if valid is None:
+            valid = torch.ones(target.shape[:2], device=pred.device, dtype=pred.dtype)
+        else:
+            valid = valid.to(device=pred.device, dtype=pred.dtype)
+            if valid.ndim == 1:
+                valid = valid.unsqueeze(0)
+
+        xyz_loss = F.smooth_l1_loss(pred[..., :3], target[..., :3], reduction="none").mean(dim=-1)
+        quat_loss = F.smooth_l1_loss(pred[..., 3:7], target[..., 3:7], reduction="none").mean(dim=-1)
+        gripper_loss = F.smooth_l1_loss(pred[..., 7:], target[..., 7:], reduction="none").mean(dim=-1)
+        per_arm = (
+            self.loss_weight_ee_target_xyz * xyz_loss
+            + self.loss_weight_ee_target_quat * quat_loss
+            + self.loss_weight_ee_target_gripper * gripper_loss
+        )
+        ee_target_loss = self._masked_loss_mean(per_arm, valid)
+        left_ee_target_loss = self._masked_loss_mean(per_arm[:, 0], valid[:, 0]) if per_arm.shape[1] > 0 else zero
+        right_ee_target_loss = self._masked_loss_mean(per_arm[:, 1], valid[:, 1]) if per_arm.shape[1] > 1 else zero
+        return {
+            "ee_target": ee_target_loss,
+            "left_ee_target": left_ee_target_loss,
+            "right_ee_target": right_ee_target_loss,
+            "added_ee_target": left_ee_target_loss + right_ee_target_loss,
+        }
+
+    def _compute_ee_target_loss(self, batch, model_output):
+        return self._compute_ee_target_loss_dict(batch, model_output)["ee_target"]
+
     def train_epoch(self):
         self.transformer.train()
 
@@ -1150,8 +1340,15 @@ class Trainer:
         self.optimizer.zero_grad()
         accumulated_latent_losses = []
         accumulated_action_losses = []
+        accumulated_left_action_losses = []
+        accumulated_right_action_losses = []
+        accumulated_added_action_losses = []
         accumulated_camera_losses = []
         accumulated_depth_losses = []
+        accumulated_ee_target_losses = []
+        accumulated_left_ee_target_losses = []
+        accumulated_right_ee_target_losses = []
+        accumulated_added_ee_target_losses = []
 
         for batch_idx, batch in enumerate(self.train_loader):
             batch = self.convert_input_format(batch)
@@ -1211,7 +1408,8 @@ class Trainer:
                 decode_output=True,
             )
 
-            action_loss = self.compute_loss(input_dict, action_pred)
+            action_loss_dict = self.compute_action_loss_dict(input_dict, action_pred)
+            action_loss = action_loss_dict["action"]
             if self.model_arch == "vga":
                 if self.enable_camera_loss or self.enable_depth_loss:
                     camera_loss, depth_loss = self._compute_camera_depth_losses(batch, output)
@@ -1219,13 +1417,30 @@ class Trainer:
                     zero = torch.zeros((), device=self.device, dtype=torch.float32)
                     camera_loss, depth_loss = zero, zero
 
+                if self.enable_ee_target_loss:
+                    ee_target_loss_dict = self._compute_ee_target_loss_dict(batch, output)
+                else:
+                    ee_target_loss_dict = self._zero_ee_target_loss_dict()
+                ee_target_loss = ee_target_loss_dict["ee_target"]
+
                 loss = (
                     self.loss_weight_action * action_loss
                     + self.loss_weight_camera * camera_loss
                     + self.loss_weight_depth * depth_loss
+                    + self.loss_weight_ee_target * ee_target_loss
                 )
                 accumulated_camera_losses.append((camera_loss / self.gradient_accumulation_steps).detach())
                 accumulated_depth_losses.append((depth_loss / self.gradient_accumulation_steps).detach())
+                accumulated_ee_target_losses.append((ee_target_loss / self.gradient_accumulation_steps).detach())
+                accumulated_left_ee_target_losses.append(
+                    (ee_target_loss_dict["left_ee_target"] / self.gradient_accumulation_steps).detach()
+                )
+                accumulated_right_ee_target_losses.append(
+                    (ee_target_loss_dict["right_ee_target"] / self.gradient_accumulation_steps).detach()
+                )
+                accumulated_added_ee_target_losses.append(
+                    (ee_target_loss_dict["added_ee_target"] / self.gradient_accumulation_steps).detach()
+                )
             else:
                 loss = action_loss
 
@@ -1234,6 +1449,9 @@ class Trainer:
             # Accumulate losses for logging
             # accumulated_latent_losses.append(latent_loss.detach())
             accumulated_action_losses.append(action_loss.detach())
+            accumulated_left_action_losses.append(action_loss_dict["left_action"].detach())
+            accumulated_right_action_losses.append(action_loss_dict["right_action"].detach())
+            accumulated_added_action_losses.append(action_loss_dict["added_action"].detach())
 
             # Only update weights after accumulating gradients
             if should_sync:
@@ -1254,6 +1472,15 @@ class Trainer:
                 # Average accumulated losses
                 action_loss_show = dist_mean(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
                 max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
+                left_action_loss_show = dist_mean(
+                    torch.stack(accumulated_left_action_losses).sum()
+                ).detach().cpu().item()
+                right_action_loss_show = dist_mean(
+                    torch.stack(accumulated_right_action_losses).sum()
+                ).detach().cpu().item()
+                added_action_loss_show = dist_mean(
+                    torch.stack(accumulated_added_action_losses).sum()
+                ).detach().cpu().item()
                 if len(accumulated_latent_losses) > 0:
                     latent_loss_show = dist_mean(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
                     max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
@@ -1269,12 +1496,35 @@ class Trainer:
                     depth_loss_show = dist_mean(torch.stack(accumulated_depth_losses).sum()).detach().cpu().item()
                 else:
                     depth_loss_show = 0.0
+                if len(accumulated_ee_target_losses) > 0:
+                    ee_target_loss_show = dist_mean(torch.stack(accumulated_ee_target_losses).sum()).detach().cpu().item()
+                    left_ee_target_loss_show = dist_mean(
+                        torch.stack(accumulated_left_ee_target_losses).sum()
+                    ).detach().cpu().item()
+                    right_ee_target_loss_show = dist_mean(
+                        torch.stack(accumulated_right_ee_target_losses).sum()
+                    ).detach().cpu().item()
+                    added_ee_target_loss_show = dist_mean(
+                        torch.stack(accumulated_added_ee_target_losses).sum()
+                    ).detach().cpu().item()
+                else:
+                    ee_target_loss_show = 0.0
+                    left_ee_target_loss_show = 0.0
+                    right_ee_target_loss_show = 0.0
+                    added_ee_target_loss_show = 0.0
 
                 # Clear accumulated losses
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
+                accumulated_left_action_losses = []
+                accumulated_right_action_losses = []
+                accumulated_added_action_losses = []
                 accumulated_camera_losses = []
                 accumulated_depth_losses = []
+                accumulated_ee_target_losses = []
+                accumulated_left_ee_target_losses = []
+                accumulated_right_ee_target_losses = []
+                accumulated_added_ee_target_losses = []
 
                 torch.cuda.synchronize()
                 if self.step % self.config.gc_interval == 0:
@@ -1287,8 +1537,15 @@ class Trainer:
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
                         'action_loss': f'{action_loss_show:.4f}',
+                        'left_action_loss': f'{left_action_loss_show:.4f}',
+                        'right_action_loss': f'{right_action_loss_show:.4f}',
+                        'added_action_loss': f'{added_action_loss_show:.4f}',
                         'camera_loss': f'{camera_loss_show:.4f}',
                         'depth_loss': f'{depth_loss_show:.4f}',
+                        'ee_target_loss': f'{ee_target_loss_show:.4f}',
+                        'left_ee_target_loss': f'{left_ee_target_loss_show:.4f}',
+                        'right_ee_target_loss': f'{right_ee_target_loss_show:.4f}',
+                        'added_ee_target_loss': f'{added_ee_target_loss_show:.4f}',
                         'step': self.step,
                         'grad_norm': f'{total_norm.item():.2f}',
                         'lr': f'{lr:.2e}'
@@ -1297,8 +1554,15 @@ class Trainer:
                         self.wandb.log({
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
                             'loss_metrics/global_avg_action_loss': action_loss_show,
+                            'loss_metrics/global_avg_left_action_loss': left_action_loss_show,
+                            'loss_metrics/global_avg_right_action_loss': right_action_loss_show,
+                            'loss_metrics/global_avg_added_action_loss': added_action_loss_show,
                             'loss_metrics/global_avg_camera_loss': camera_loss_show,
                             'loss_metrics/global_avg_depth_loss': depth_loss_show,
+                            'loss_metrics/global_avg_ee_target_loss': ee_target_loss_show,
+                            'loss_metrics/global_avg_left_ee_target_loss': left_ee_target_loss_show,
+                            'loss_metrics/global_avg_right_ee_target_loss': right_ee_target_loss_show,
+                            'loss_metrics/global_avg_added_ee_target_loss': added_ee_target_loss_show,
                             'loss_metrics/global_max_video_loss': max_latent_loss_show,
                             'loss_metrics/global_max_action_loss': max_action_loss_show,
                             'grad_norm': total_norm.item(),
@@ -1387,7 +1651,10 @@ class Trainer:
                 lora_state_dict = {
                     key: value.detach().to(dtype=torch.bfloat16, device="cpu").contiguous().clone()
                     for key, value in state_dict.items()
-                    if "lora_" in key or key.endswith("action_query_tokens")
+                    if "lora_" in key
+                    or key.endswith("action_query_tokens")
+                    or key.endswith("ee_target_token")
+                    or "ee_target_head" in key
                 }
                 if lora_state_dict:
                     lora_file = transformer_dir / "lora_weights.safetensors"

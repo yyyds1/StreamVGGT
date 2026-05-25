@@ -238,6 +238,7 @@ class VA_Server:
         self.train_scheduler_action.set_timesteps(action_steps)
         self.warm_start_blend = float(max(0.0, min(1.0, getattr(rdt_cfg, "warm_start_blend", 0.85))))
         self.warm_start_noise_std = float(max(0.0, getattr(rdt_cfg, "warm_start_noise_std", 0.03)))
+        self.warm_start_sigma = float(max(0.0, min(1.0, getattr(rdt_cfg, "warm_start_sigma", 0.5))))
         self.action_smoothing_alpha = float(max(0.0, min(1.0, getattr(rdt_cfg, "action_smoothing_alpha", 0.35))))
         self.unexecuted_action_buffer = deque()
         self.actions_served_since_last_prediction = 0
@@ -323,7 +324,8 @@ class VA_Server:
 
         rdt_horizon = self.rdt_horizon
         rdt_x_pos_emb_config = [("act", rdt_horizon + self.job_config.rdt.num_register_tokens)]
-        rdt_act_pos_emb_config = [("action", (self.num_input_frames, rdt_horizon))]
+        num_rdt_act_frames = 1
+        rdt_act_pos_emb_config = [("action", (num_rdt_act_frames, rdt_horizon))]
 
         self.action_head = RDT(
             horizon=rdt_horizon,
@@ -335,7 +337,7 @@ class VA_Server:
             img_pos_emb_config=rdt_img_pos_emb_config,
             max_img_len=self.num_input_frames * img_tokens_per_frame,
             act_pos_emb_config=rdt_act_pos_emb_config,
-            max_act_len=self.num_input_frames * rdt_horizon,
+            max_act_len=num_rdt_act_frames * rdt_horizon,
             text_embed_dim=int(getattr(job_config, "text_embed_dim", 4096)),
             dtype=self.dtype,
         )
@@ -1132,18 +1134,18 @@ class VA_Server:
 
     def _build_warm_start_action_sample(self, current_obs, dtype):
         if self.prev_absolute_action_chunk is None or self.warm_start_blend <= 0.0:
-            return None
+            return None, 0
         if self.current_anchor_abs_state is None:
-            return None
+            return None, 0
         obs_state = current_obs.get("observation.state", None)
         if obs_state is None:
-            return None
+            return None, 0
 
         prev_chunk = np.asarray(self.prev_absolute_action_chunk, dtype=np.float32)
         if prev_chunk.ndim == 2:
             prev_chunk = prev_chunk[:, :, None]
         if prev_chunk.shape[0] != len(self.used_action_channel_ids) or prev_chunk.shape[1] < 1:
-            return None
+            return None, 0
 
         # The server may execute several buffered actions before the next model call.
         # Warm start should roll by the number of environment steps already served,
@@ -1174,7 +1176,7 @@ class VA_Server:
             dim=2,
         )
         if x0_tokens.shape[2] != self.rdt_horizon:
-            return None
+            return None, 0
         x0_tokens = x0_tokens.reshape(
             1,
             self.action_dim,
@@ -1182,15 +1184,23 @@ class VA_Server:
             self.tokens_per_frame,
             1,
         )
-        # Match p2p-style warm start: initialize the next denoising pass from
-        # the rolled previous prediction. Re-noising by sigma_start would erase
-        # this signal because sigma_start is normally 1.0.
-        sample = x0_tokens
+        x0_tokens = self._mask_action_sample_channels(x0_tokens)
         if self.warm_start_blend < 1.0:
-            sample = self.warm_start_blend * sample + (1.0 - self.warm_start_blend) * torch.randn_like(sample)
+            x0_tokens = self.warm_start_blend * x0_tokens + (1.0 - self.warm_start_blend) * torch.randn_like(x0_tokens)
         if self.warm_start_noise_std > 0.0:
-            sample = sample + self.warm_start_noise_std * torch.randn_like(sample)
-        return self._mask_action_sample_channels(sample)
+            x0_tokens = x0_tokens + self.warm_start_noise_std * torch.randn_like(x0_tokens)
+        x0_tokens = self._mask_action_sample_channels(x0_tokens.clamp(-1.0, 1.0))
+
+        sigmas = self.train_scheduler_action.sigmas
+        sigma_candidates = torch.nonzero(sigmas <= self.warm_start_sigma, as_tuple=False).flatten()
+        if sigma_candidates.numel() == 0:
+            start_idx = len(sigmas) - 1
+        else:
+            start_idx = int(sigma_candidates[0].item())
+        sigma_start = sigmas[start_idx].to(device=self.device, dtype=dtype)
+        noise = torch.randn_like(x0_tokens)
+        sample = (1.0 - sigma_start) * x0_tokens + sigma_start * noise
+        return self._mask_action_sample_channels(sample), start_idx
 
     def _mask_action_sample_channels(self, action_sample):
         """Keep eval action samples aligned with training masks.
@@ -1239,7 +1249,7 @@ class VA_Server:
     def postprocess_action(self, action):
         action = action.cpu()  # [B, C, F, N, 1]
         action = action[0, ..., 0]  # [C, F, N]
-        action = action.clamp(-1.0, 1.0)
+        # action = action.clamp(-1.0, 1.0)
         if self.action_norm_method == "quantiles":
             action = (action + 1) / 2 * (self.actions_q99 - self.actions_q01 + 1e-6) + self.actions_q01
         else:
@@ -1333,8 +1343,8 @@ class VA_Server:
         image_grid_id = image_grid_id[None].repeat(b, 1, 1)
 
         action_grid_id = get_mesh_id(
-            self.num_input_frames,
-            self.image_frame_stride,
+            self.num_input_frames + self.chunk_size,
+            1,
             1,
             t=1,
             f_w=1,
@@ -1462,8 +1472,8 @@ class VA_Server:
             action=False,
         ).to(self.device)[None]
         action_grid_id = get_mesh_id(
-            len(selected_frames),
-            self.image_frame_stride,
+            len(selected_frames) + self.chunk_size,
+            1,
             1,
             t=1,
             f_w=1,
@@ -1536,7 +1546,7 @@ class VA_Server:
                 )
 
             obs_state = current_obs.get("observation.state", None)
-            action_sample = self._build_warm_start_action_sample(
+            action_sample, timestep_start_idx = self._build_warm_start_action_sample(
                 current_obs,
                 dtype=self.dtype,
             )
@@ -1546,6 +1556,7 @@ class VA_Server:
                     device=self.device,
                     dtype=self.dtype,
                 )
+                timestep_start_idx = 0
             action_sample = self._mask_action_sample_channels(action_sample)
 
             if self.state_condition_mode == "first_action":
@@ -1589,7 +1600,7 @@ class VA_Server:
                 state_c = torch.zeros((1, 1, self.action_dim), device=self.device, dtype=self.dtype)
             state_c = state_c.to(self.device, dtype=action_head_dtype)
 
-            timesteps = self.train_scheduler_action.timesteps.to(self.device)
+            timesteps = self.train_scheduler_action.timesteps.to(self.device)[timestep_start_idx:]
             for i, t in enumerate(timesteps):
                 action_sample = self._mask_action_sample_channels(action_sample)
                 x_in = rearrange(action_sample, "b c f n 1 -> b (f n) c").to(self.device, dtype=action_head_dtype)
@@ -1787,6 +1798,14 @@ class VA_Server:
             relative_action,
             anchor_state=self.current_anchor_abs_state,
         )
+        action = self._apply_ee_target_guard(action, current_obs=current_obs)
+        if self.current_anchor_abs_state is None:
+            relative_action = action.copy()
+        else:
+            relative_action = self._absolute_action_chunk_to_relative(
+                action,
+                self.current_anchor_abs_state,
+            )
         self._log_executed_ee_target(
             current_obs=current_obs,
             buffered_action_16d=buffered_action_16d,

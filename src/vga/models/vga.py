@@ -9,6 +9,7 @@ from transformers.file_utils import ModelOutput
 
 from streamvggt.heads.camera_head import CameraHead
 from streamvggt.heads.dpt_head import DPTHead
+from vga.heads import EETargetHead
 from vga.models.aggregator import VGAAggregator
 from vga.utils import apply_lora_to_module
 
@@ -41,6 +42,10 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         enable_camera_depth_heads=True,
         enable_camera_head=True,
         enable_depth_head=True,
+        enable_ee_target_head=False,
+        ee_target_head_num_heads=8,
+        ee_target_head_trunk_depth=4,
+        ee_target_head_num_iterations=4,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -102,6 +107,17 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             )
         else:
             self.depth_head = None
+
+        self.enable_ee_target_head = bool(enable_ee_target_head)
+        if self.enable_ee_target_head:
+            self.ee_target_head = EETargetHead(
+                embed_dim=embed_dim,
+                num_heads=int(ee_target_head_num_heads),
+                trunk_depth=int(ee_target_head_trunk_depth),
+                num_iterations=int(ee_target_head_num_iterations),
+            )
+        else:
+            self.ee_target_head = None
 
         self.lora_replaced_modules = []
         self.lora_config = None
@@ -167,12 +183,15 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         # RDT act condition is [current_state_token, action_query_tokens...],
         # aligned one-to-one with the RDT noised action horizon.
         tokens_per_frame = int(self.chunk_size)
-        if act_tokens.shape[2] < tokens_per_frame:
+        history_len = int(self.window_size)
+        expected_tokens = history_len + max(tokens_per_frame - 1, 0)
+        if act_tokens.shape[2] < expected_tokens:
             raise ValueError(
-                f"Not enough action tokens per frame: got {act_tokens.shape[2]}, "
-                f"expected at least {tokens_per_frame}"
+                f"Not enough action tokens: got {act_tokens.shape[2]}, expected at least {expected_tokens}"
             )
-        act_tokens = act_tokens[:, :, :tokens_per_frame]
+        current_state_token = act_tokens[:, :, history_len - 1 : history_len]
+        future_query_tokens = act_tokens[:, :, history_len : history_len + tokens_per_frame - 1]
+        act_tokens = torch.cat([current_state_token, future_query_tokens], dim=2)
         return act_tokens.reshape(act_tokens.shape[0], -1, act_tokens.shape[-1])
 
     def _extract_geometry_predictions(self, aggregated_tokens_list, images, patch_start_idx):
@@ -207,11 +226,20 @@ class VGA(nn.Module, PyTorchModelHubMixin):
 
         images = image_dict["images"]  # [B, C, F, H, W]
         text_emb = image_dict.get("text_emb", input_dict.get("action_dict", {}).get("text_emb", None))
+        current_image_frame_count = image_dict.get("current_image_frame_count", 1)
+        if torch.is_tensor(current_image_frame_count):
+            current_image_frame_count = int(current_image_frame_count.reshape(-1)[0].item())
+        else:
+            current_image_frame_count = int(current_image_frame_count)
+        current_image_frame_count = max(1, current_image_frame_count)
 
         image_mask = image_dict.get("images_mask", None)
+        image_grid_id = image_dict.get("grid_id", image_dict.get("image_grid_id", None))
+        image_time_ids = image_dict.get("image_time_ids", None)
         action_dict = input_dict.get("action_dict", {})
         actions = action_dict.get("actions", None)
         actions_mask = action_dict.get("actions_mask", action_dict.get("action_mask", None))
+        action_grid_id = action_dict.get("grid_id", action_dict.get("action_grid_id", None))
 
         if image_mask is not None:
             images = images * image_mask
@@ -225,6 +253,9 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             actions=actions,
             actions_mask=actions_mask,
             text_emb=text_token,
+            image_grid_id=image_grid_id,
+            action_grid_id=action_grid_id,
+            image_time_ids=image_time_ids,
             return_all_layers=True,
         )
 
@@ -240,13 +271,16 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             )
 
         img_tokens = rdt_tokens[:, :, token_idx["image"][0] : token_idx["image"][1]]
+        ee_tokens = rdt_tokens[:, :, token_idx["ee_target"][0] : token_idx["ee_target"][1]]
         act_tokens = rdt_tokens[:, :, token_idx["action"][0] : token_idx["action"][1]]
         lang_tokens = rdt_tokens[:, :, token_idx["lang"][0] : token_idx["lang"][1]]
-        current_frame_idx = -1
-        img_tokens = img_tokens[:, current_frame_idx:]
-        act_tokens = act_tokens[:, current_frame_idx:]
-        lang_tokens = lang_tokens[:, current_frame_idx:]
+        current_image_frame_count = min(current_image_frame_count, img_tokens.shape[1])
+        img_tokens = img_tokens[:, -current_image_frame_count:]
+        ee_tokens = ee_tokens[:, -current_image_frame_count:]
+        act_tokens = act_tokens[:, -1:]
+        lang_tokens = lang_tokens[:, -1:]
 
+        current_ee_tokens = ee_tokens.mean(dim=1)
         img_tokens = self._build_rdt_img_tokens(img_tokens)
         act_tokens = self._build_rdt_act_tokens(act_tokens)
         lang_tokens = lang_tokens.reshape(lang_tokens.shape[0], -1, lang_tokens.shape[-1])
@@ -267,6 +301,10 @@ class VGA(nn.Module, PyTorchModelHubMixin):
                 images=images,
                 patch_start_idx=token_idx["image"][0],
             )
+        if self.ee_target_head is not None:
+            if geometry is None:
+                geometry = {}
+            geometry.update(self.ee_target_head(current_ee_tokens))
 
         return VGAOutput(
             ress={
@@ -299,6 +337,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             raise ValueError(f"Expected frame['img'] to have 3, 4, or 5 dims, got {tuple(first_img.shape)}")
 
         text_emb = frames[0].get("text_emb", None)
+        image_grid_id = frames[0].get("grid_id", frames[0].get("image_grid_id", None))
         action_dict = {"text_emb": text_emb}
         first_action = frames[0].get("actions", None)
         if len(frames) == 1 and first_action is not None and first_action.dim() == 4:
@@ -330,9 +369,18 @@ class VGA(nn.Module, PyTorchModelHubMixin):
                 actions = torch.stack(action_frames, dim=2).unsqueeze(-1)
                 actions_mask = torch.stack(action_mask_frames, dim=2).unsqueeze(-1)
                 action_dict.update({"actions": actions, "actions_mask": actions_mask})
+        action_grid_id = frames[0].get("action_grid_id", None)
+        if action_grid_id is not None:
+            action_dict["grid_id"] = action_grid_id
 
         input_dict = {
-            "image_dict": {"images": images.permute(0, 2, 1, 3, 4), "text_emb": text_emb},
+            "image_dict": {
+                "images": images.permute(0, 2, 1, 3, 4),
+                "text_emb": text_emb,
+                "grid_id": image_grid_id,
+                "current_image_frame_count": frames[0].get("current_image_frame_count", 1),
+                "image_time_ids": frames[0].get("image_time_ids", None),
+            },
             "action_dict": action_dict,
         }
         return self.forward(input_dict=input_dict, predict_geometry=False)
