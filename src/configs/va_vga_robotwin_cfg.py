@@ -21,6 +21,7 @@ va_vga_robotwin_cfg.history_obs_cam_keys = [
 ]
 va_vga_robotwin_cfg.view_position_cam_keys = list(va_vga_robotwin_cfg.obs_cam_keys)
 va_vga_robotwin_cfg.separate_history_current_obs_views = True
+va_vga_robotwin_cfg.use_expert_marked_rgb = True
 va_vga_robotwin_cfg.streamvggt_pretrained = "/home/yds/code/StreamVGGT/ckpt/checkpoints.pth"
 va_vga_robotwin_cfg.text_tokenizer_name = "gemma"
 va_vga_robotwin_cfg.text_model_name_or_path = "google/embeddinggemma-300M"

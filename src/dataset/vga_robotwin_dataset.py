@@ -363,8 +363,10 @@ class MultiVGARobotwinDataset(Dataset):
         if self.action_representation == "relative":
             anchor_pose = raw_state_16d[history_indices[0]]
             action_model_flat = get_relative_compact_action(raw_actions_16d, anchor_pose)
+            state_model_flat = get_relative_compact_action(raw_state_16d, anchor_pose)
         elif self.action_representation == "absolute":
             action_model_flat = raw_actions_16d
+            state_model_flat = raw_state_16d
         else:
             raise ValueError(
                 f"Unsupported action_representation `{self.action_representation}`. "
@@ -376,17 +378,18 @@ class MultiVGARobotwinDataset(Dataset):
         action_valid_mask = action_valid_mask.expand(-1, action_mask_flat.shape[1])
         action_norm_flat = action_norm_flat * action_valid_mask.to(action_norm_flat.dtype)
         action_mask_flat = action_mask_flat & action_valid_mask
+        state_norm_flat, state_mask_flat = self._normalize_compact_action(state_model_flat)
 
         if self.action_representation == "relative":
-            state_model = get_relative_compact_action(raw_state_16d[data_timestep : data_timestep + 1], raw_state_16d[history_indices[0]])[0]
+            state_model = state_model_flat[data_timestep]
         else:
-            state_model = raw_state_16d[data_timestep]
+            state_model = state_model_flat[data_timestep]
         state_norm, state_mask = self._normalize_compact_action(state_model[None])
         state = state_norm[0]
         state_mask = state_mask[0]
 
-        action_window = action_norm_flat[history_indices].T.unsqueeze(-1).unsqueeze(-1)
-        action_window_mask = action_mask_flat[history_indices].T.unsqueeze(-1).unsqueeze(-1)
+        action_window = state_norm_flat[history_indices].T.unsqueeze(-1).unsqueeze(-1)
+        action_window_mask = state_mask_flat[history_indices].T.unsqueeze(-1).unsqueeze(-1)
 
         future_action_chunk = action_norm_flat[data_timestep : data_timestep + self.chunk_size].T
         future_action_chunk_mask = action_mask_flat[data_timestep : data_timestep + self.chunk_size].T

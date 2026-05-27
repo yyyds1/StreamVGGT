@@ -380,6 +380,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
                 "grid_id": image_grid_id,
                 "current_image_frame_count": frames[0].get("current_image_frame_count", 1),
                 "image_time_ids": frames[0].get("image_time_ids", None),
+                "image_view_ids": frames[0].get("image_view_ids", None),
             },
             "action_dict": action_dict,
         }

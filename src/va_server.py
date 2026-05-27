@@ -36,12 +36,27 @@ from utils.text_embedding import encode_prompt, get_text_embedder
 
 
 def get_effective_num_image_views(config):
+    if bool(getattr(config, "separate_history_current_obs_views", False)):
+        return 1
     mode = getattr(config, "multi_view_image_mode", "vertical")
     if mode == "vertical":
         return len(config.obs_cam_keys)
     if mode in {"frame", "first"}:
         return 1
     raise ValueError(f"Unsupported multi_view_image_mode `{mode}`")
+
+
+def get_current_obs_cam_keys(config):
+    return list(getattr(config, "current_obs_cam_keys", getattr(config, "obs_cam_keys", [])))
+
+
+def get_current_image_frame_count(config):
+    if bool(getattr(config, "separate_history_current_obs_views", False)):
+        return max(1, len(get_current_obs_cam_keys(config)))
+    mode = getattr(config, "multi_view_image_mode", "vertical")
+    if mode == "frame":
+        return max(1, len(getattr(config, "obs_cam_keys", [])))
+    return 1
 
 
 def _extract_modulelist_indices_from_state(state, prefix):
@@ -189,7 +204,7 @@ class VA_Server:
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
 
-        self.num_input_frames = 1
+        self.num_input_frames = get_current_image_frame_count(self.job_config)
         self.history_len = max(1, int(getattr(job_config, "history_len", 1)))
         self.history_frame_stride = max(1, int(getattr(job_config, "history_frame_stride", 1)))
         self.chunk_size = int(getattr(job_config, "chunk_size", 24))
@@ -199,6 +214,18 @@ class VA_Server:
         self.action_dim = int(job_config.action_dim)
         self.patch_size = tuple(getattr(job_config, "patch_size", (1, 14, 14)))
         self.multi_view_image_mode = getattr(job_config, "multi_view_image_mode", "vertical")
+        self.separate_history_current_obs_views = bool(
+            getattr(job_config, "separate_history_current_obs_views", False)
+        )
+        self.current_obs_cam_keys = list(getattr(job_config, "current_obs_cam_keys", job_config.obs_cam_keys))
+        self.history_obs_cam_keys = list(getattr(job_config, "history_obs_cam_keys", self.current_obs_cam_keys))
+        self.view_position_cam_keys = list(
+            dict.fromkeys(
+                list(getattr(job_config, "view_position_cam_keys", job_config.obs_cam_keys))
+                + self.history_obs_cam_keys
+                + self.current_obs_cam_keys
+            )
+        )
         self.model_arch = str(getattr(job_config, "model_arch", "actionvggt")).lower()
         self.rdt_use_language_condition = bool(getattr(job_config, "rdt_use_language_condition", False))
         self.action_representation = str(getattr(job_config, "action_representation", "relative")).lower()
@@ -726,24 +753,20 @@ class VA_Server:
         state_token = self.episode_initial_state[0, 0].detach().cpu()
         state_frame = state_token.unsqueeze(-1).repeat(1, self.image_frame_stride)
         max_buffer = max(1, self.history_len * self.history_frame_stride)
-        self.action_history = [state_frame.clone() for _ in range(max_buffer)]
         self.pose_history = [state_16d.copy() for _ in range(max_buffer)]
 
-        frames = self._preprocess_obs_to_frames([current_obs])
-        if len(frames) > 0:
-            frame_tensor = frames[-1].detach().cpu()
-            self.frame_history = [
-                {
-                    "frame": frame_tensor.clone(),
-                    "action_abs": state_16d.copy(),
-                    "pose": state_16d.copy(),
-                }
-                for _ in range(max_buffer)
-            ]
+        self.frame_history = [
+            {
+                "obs": dict(current_obs),
+                "action_abs": state_16d.copy(),
+                "pose": state_16d.copy(),
+            }
+            for _ in range(max_buffer)
+        ]
 
         logger.info(
             f"Eval warm start: filled {len(self.frame_history)} frame/pose entries, "
-            f"{len(self.action_history)} action-history entries, and seeded first action chunk from current state."
+            "and seeded first action chunk from current state."
         )
         return True
 
@@ -829,6 +852,62 @@ class VA_Server:
             else:
                 raise ValueError(f"Unsupported multi_view_image_mode `{self.multi_view_image_mode}`")
         return merged_frames
+
+    def _preprocess_compact_obs_window(self, obs_items):
+        if len(obs_items) == 0:
+            raise ValueError("obs_items must contain at least one observation")
+
+        frames = []
+        image_time_ids = []
+        image_view_ids = []
+        current_start = len(obs_items) - 1
+        for local_idx, obs in enumerate(obs_items):
+            cam_keys = self.current_obs_cam_keys if local_idx >= current_start else self.history_obs_cam_keys
+            for cam in cam_keys:
+                if cam not in obs:
+                    raise KeyError(
+                        f"Observation is missing camera `{cam}`. "
+                        f"Available keys={sorted(obs.keys())}"
+                    )
+                frames.append(self._resize_pad_frame(obs[cam]))
+                image_time_ids.append(local_idx)
+                image_view_ids.append(self.view_position_cam_keys.index(cam))
+
+        return (
+            torch.stack(frames, dim=0),
+            torch.as_tensor(image_time_ids, dtype=torch.long),
+            torch.as_tensor(image_view_ids, dtype=torch.long),
+            len(self.current_obs_cam_keys),
+        )
+
+    def _build_compact_image_grid_id(self, image_time_ids, image_view_ids, seq_len, height, width, device):
+        if image_time_ids.ndim == 1:
+            image_time_ids = image_time_ids.unsqueeze(0)
+        if image_view_ids.ndim == 1:
+            image_view_ids = image_view_ids.unsqueeze(0)
+        if image_time_ids.shape != (1, seq_len) or image_view_ids.shape != (1, seq_len):
+            raise ValueError(
+                "image_time_ids/image_view_ids must match compact image sequence: "
+                f"time={tuple(image_time_ids.shape)}, view={tuple(image_view_ids.shape)}, expected={(1, seq_len)}"
+            )
+
+        grid_h = height // self.patch_size[1]
+        grid_w = width // self.patch_size[2]
+        patch_y, patch_x = torch.meshgrid(
+            torch.arange(grid_h, device=device),
+            torch.arange(grid_w, device=device),
+            indexing="ij",
+        )
+        patch_y = patch_y.reshape(1, 1, -1)
+        patch_x = patch_x.reshape(1, 1, -1)
+        image_time_ids = image_time_ids.to(device=device, dtype=torch.long)
+        image_view_ids = image_view_ids.to(device=device, dtype=torch.long)
+        f_coord = image_time_ids[:, :, None].expand(-1, -1, grid_h * grid_w)
+        h_coord = patch_y + image_view_ids[:, :, None] * grid_h
+        w_coord = patch_x.expand(1, seq_len, -1)
+        t_coord = torch.zeros_like(f_coord)
+        grid = torch.stack([f_coord, h_coord, w_coord, t_coord], dim=1)
+        return grid.reshape(1, 4, seq_len * grid_h * grid_w)
 
     def preprocess_action(self, action):
         action_model_input = torch.from_numpy(np.asarray(action))
@@ -1303,8 +1382,17 @@ class VA_Server:
         return rearrange(action_source, "b c f n 1 -> b (f n) c")[:, :1]
 
     def _build_model_input(self, current_obs):
-        current_frames = self._preprocess_obs_to_frames([current_obs])
-        images = torch.stack(current_frames[-1:], dim=0).unsqueeze(0).to(self.device, dtype=self.dtype)
+        if self.separate_history_current_obs_views:
+            frames, image_time_ids, image_view_ids, current_image_frame_count = self._preprocess_compact_obs_window(
+                [current_obs]
+            )
+            images = frames.unsqueeze(0).to(self.device, dtype=self.dtype)
+        else:
+            current_frames = self._preprocess_obs_to_frames([current_obs])
+            images = torch.stack(current_frames[-1:], dim=0).unsqueeze(0).to(self.device, dtype=self.dtype)
+            image_time_ids = None
+            image_view_ids = None
+            current_image_frame_count = get_current_image_frame_count(self.job_config)
         image_mask = torch.ones_like(images, dtype=torch.bool)
 
         actions = torch.zeros(
@@ -1331,16 +1419,26 @@ class VA_Server:
         b = images.shape[0]
         _, _, f, h, w = images.shape
         patch_f, patch_h, patch_w = self.patch_size
-        image_grid_id = get_mesh_id(
-            f // patch_f,
-            h // patch_h,
-            w // patch_w,
-            t=0,
-            f_w=1,
-            f_shift=0,
-            action=False,
-        ).to(self.device)
-        image_grid_id = image_grid_id[None].repeat(b, 1, 1)
+        if self.separate_history_current_obs_views:
+            image_grid_id = self._build_compact_image_grid_id(
+                image_time_ids,
+                image_view_ids,
+                f,
+                h,
+                w,
+                self.device,
+            )
+        else:
+            image_grid_id = get_mesh_id(
+                f // patch_f,
+                h // patch_h,
+                w // patch_w,
+                t=0,
+                f_w=1,
+                f_shift=0,
+                action=False,
+            ).to(self.device)
+            image_grid_id = image_grid_id[None].repeat(b, 1, 1)
 
         action_grid_id = get_mesh_id(
             self.num_input_frames + self.chunk_size,
@@ -1358,6 +1456,9 @@ class VA_Server:
             "images_mask": image_mask,
             "grid_id": image_grid_id,
             "text_emb": None,
+            "current_image_frame_count": current_image_frame_count,
+            "image_time_ids": image_time_ids,
+            "image_view_ids": image_view_ids,
         }
         action_dict = {
             "actions": actions,
@@ -1389,19 +1490,27 @@ class VA_Server:
         ]
         return [max(0, min(length - 1, idx)) for idx in indices]
 
-    def _update_transformer_cache_with_frame(self, frame_tensor, current_obs=None, build_conds=True):
+    def _update_transformer_cache_with_frame(self, frame_tensor=None, current_obs=None, build_conds=True):
         transformer_dtype = next(self.transformer.aggregator.patch_embed.parameters()).dtype
-        frame_tensor = frame_tensor.to(self.device, dtype=transformer_dtype)
         current_pose = None
         if current_obs is not None and current_obs.get("observation.state", None) is not None:
             current_pose = np.asarray(current_obs["observation.state"], dtype=np.float32).reshape(-1)
-        self.frame_history.append(
+        if self.separate_history_current_obs_views:
+            if current_obs is None:
+                raise ValueError("current_obs is required for compact history/current view selection")
+            frame_entry = {"obs": dict(current_obs)}
+        else:
+            if frame_tensor is None:
+                raise ValueError("frame_tensor is required when compact view selection is disabled")
+            frame_tensor = frame_tensor.to(self.device, dtype=transformer_dtype)
+            frame_entry = {"frame": frame_tensor.detach().cpu()}
+        frame_entry.update(
             {
-                "frame": frame_tensor.detach().cpu(),
                 "action_abs": None,
                 "pose": None if current_pose is None else current_pose.copy(),
             }
         )
+        self.frame_history.append(frame_entry)
         if current_pose is not None:
             self.pose_history.append(current_pose.copy())
         elif len(self.pose_history) > 0:
@@ -1420,17 +1529,27 @@ class VA_Server:
             )
         anchor_abs_state = self.pose_history[history_indices[0]].copy()
         self.current_anchor_abs_state = anchor_abs_state
-        selected_frames = [
-            self.frame_history[idx]["frame"].to(self.device, dtype=transformer_dtype)
-            for idx in history_indices
-        ]
+        if self.separate_history_current_obs_views:
+            selected_obs = [self.frame_history[idx]["obs"] for idx in history_indices]
+            selected_frames, image_time_ids, image_view_ids, current_image_frame_count = self._preprocess_compact_obs_window(
+                selected_obs
+            )
+            selected_frames = selected_frames.to(self.device, dtype=transformer_dtype)
+        else:
+            selected_frames = [
+                self.frame_history[idx]["frame"].to(self.device, dtype=transformer_dtype)
+                for idx in history_indices
+            ]
+            image_time_ids = None
+            image_view_ids = None
+            current_image_frame_count = get_current_image_frame_count(self.job_config)
         action_state = torch.zeros(
-            (1, self.action_dim, len(selected_frames), self.image_frame_stride, 1),
+            (1, self.action_dim, len(history_indices), self.image_frame_stride, 1),
             device=self.device,
             dtype=transformer_dtype,
         )
         action_mask = torch.zeros_like(action_state, dtype=torch.bool)
-        current_local_idx = len(selected_frames) - 1
+        current_local_idx = len(history_indices) - 1
         for local_idx, frame_hist_idx in enumerate(history_indices):
             if local_idx == current_local_idx:
                 if current_obs is not None and current_obs.get("observation.state", None) is not None:
@@ -1441,9 +1560,7 @@ class VA_Server:
                     action_state[:, :, local_idx, 0, 0] = current_state[:, 0]
                     action_mask[:, :, local_idx, 0, 0] = True
                 continue
-            frame_action_abs = self.frame_history[frame_hist_idx].get("action_abs", None)
-            if frame_action_abs is None:
-                frame_action_abs = self.pose_history[frame_hist_idx]
+            frame_action_abs = self.pose_history[frame_hist_idx]
             frame_action = self.preprocess_action_state(
                 frame_action_abs,
                 anchor_state=anchor_abs_state,
@@ -1461,18 +1578,30 @@ class VA_Server:
             action_mask[:, :, local_idx, :, 0] = True
 
         frame_idx = self.frame_st_id
-        _, frame_h, frame_w = selected_frames[-1].shape
-        image_grid_id = get_mesh_id(
-            len(selected_frames),
-            frame_h // self.patch_size[1],
-            frame_w // self.patch_size[2],
-            t=0,
-            f_w=1,
-            f_shift=frame_idx,
-            action=False,
-        ).to(self.device)[None]
+        if self.separate_history_current_obs_views:
+            _, frame_h, frame_w = selected_frames[-1].shape
+            image_grid_id = self._build_compact_image_grid_id(
+                image_time_ids,
+                image_view_ids,
+                selected_frames.shape[0],
+                frame_h,
+                frame_w,
+                self.device,
+            )
+            image_time_ids = image_time_ids.to(self.device)
+        else:
+            _, frame_h, frame_w = selected_frames[-1].shape
+            image_grid_id = get_mesh_id(
+                len(selected_frames),
+                frame_h // self.patch_size[1],
+                frame_w // self.patch_size[2],
+                t=0,
+                f_w=1,
+                f_shift=frame_idx,
+                action=False,
+            ).to(self.device)[None]
         action_grid_id = get_mesh_id(
-            len(selected_frames) + self.chunk_size,
+            len(history_indices) + self.chunk_size,
             1,
             1,
             t=1,
@@ -1482,12 +1611,17 @@ class VA_Server:
         ).to(self.device)[None]
 
         frame_payload = {
-            "img": torch.stack(selected_frames, dim=0).unsqueeze(0),
+            "img": selected_frames.unsqueeze(0)
+            if self.separate_history_current_obs_views
+            else torch.stack(selected_frames, dim=0).unsqueeze(0),
             "actions": action_state[:, :, :, :, 0],
             "actions_mask": action_mask[:, :, :, :, 0],
             "image_grid_id": image_grid_id,
             "action_grid_id": action_grid_id,
             "text_emb": self.runtime_text_emb,
+            "current_image_frame_count": current_image_frame_count,
+            "image_time_ids": image_time_ids,
+            "image_view_ids": image_view_ids,
         }
         with torch.cuda.amp.autocast(enabled=False):
             transformer_out = self.transformer.inference(
@@ -1531,8 +1665,11 @@ class VA_Server:
     def _predict_actions(self, current_obs, frame_conds=None):
         with torch.no_grad():
             if frame_conds is None:
-                current_frames = self._preprocess_obs_to_frames([current_obs])
-                frame_tensor = current_frames[-1].to(self.device, dtype=self.dtype)
+                if self.separate_history_current_obs_views:
+                    frame_tensor = None
+                else:
+                    current_frames = self._preprocess_obs_to_frames([current_obs])
+                    frame_tensor = current_frames[-1].to(self.device, dtype=self.dtype)
                 frame_conds = self._update_transformer_cache_with_frame(frame_tensor, current_obs=current_obs)
             conds = self._build_windowed_rdt_conds(frame_conds)
             action_head_dtype = next(self.action_head.parameters()).dtype
@@ -1727,7 +1864,8 @@ class VA_Server:
 
             if len(merged_frames) > 0:
                 frame_tensor = merged_frames[-1].to(self.device, dtype=self.dtype)
-                _ = self._update_transformer_cache_with_frame(frame_tensor)
+                cache_obs = key_frames[-1] if self.separate_history_current_obs_views and len(key_frames) > 0 else None
+                _ = self._update_transformer_cache_with_frame(frame_tensor, current_obs=cache_obs)
                 self.frame_st_id += 1
 
             if action_state_norm is not None and num_action_frames > 0:
@@ -1759,8 +1897,11 @@ class VA_Server:
                 raise ValueError("obs list is empty")
             current_obs = current_obs[-1]
 
-        current_frames = self._preprocess_obs_to_frames([current_obs])
-        frame_tensor = current_frames[-1].to(self.device, dtype=self.dtype)
+        if self.separate_history_current_obs_views:
+            frame_tensor = None
+        else:
+            current_frames = self._preprocess_obs_to_frames([current_obs])
+            frame_tensor = current_frames[-1].to(self.device, dtype=self.dtype)
         need_new_chunk = len(self.unexecuted_action_buffer) == 0
         frame_conds = self._update_transformer_cache_with_frame(
             frame_tensor,

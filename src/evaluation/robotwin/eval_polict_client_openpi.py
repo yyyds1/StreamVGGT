@@ -543,11 +543,21 @@ def format_eef_state(observation):
     )
 
 
+def _get_camera_rgb(observation, camera_name):
+    camera_obs = observation["observation"][camera_name]
+    return camera_obs.get("rgb_expert_marked", camera_obs["rgb"])
+
+
 def format_obs(observation, prompt):
     return {
-                "observation.images.cam_high": observation["observation"]["head_camera"]["rgb"], # H,W,3
-                "observation.images.cam_left_wrist": observation["observation"]["left_camera"]["rgb"],
-                "observation.images.cam_right_wrist": observation["observation"]["right_camera"]["rgb"],
+                "head_camera": _get_camera_rgb(observation, "head_camera"),
+                "left_camera": _get_camera_rgb(observation, "left_camera"),
+                "right_camera": _get_camera_rgb(observation, "right_camera"),
+                "front_camera": _get_camera_rgb(observation, "front_camera"),
+                "side_camera": _get_camera_rgb(observation, "side_camera"),
+                "observation.images.cam_high": _get_camera_rgb(observation, "head_camera"),
+                "observation.images.cam_left_wrist": _get_camera_rgb(observation, "left_camera"),
+                "observation.images.cam_right_wrist": _get_camera_rgb(observation, "right_camera"),
                 "observation.state": format_eef_state(observation),
                 "task": prompt,
             }
