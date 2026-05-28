@@ -8,7 +8,10 @@ import shutil
 from pathlib import Path
 
 from datetime import datetime
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 import hydra
 from omegaconf import OmegaConf
@@ -17,6 +20,10 @@ import pathlib
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from torch.distributed.checkpoint.state_dict import (
@@ -303,6 +310,48 @@ def _adapt_transformer_state_for_depth(state, target_depth, rank=0):
     return adapted
 
 
+def get_rdt_condition_layer_mode(config):
+    cond_cfg = getattr(config, "rdt_condition_tokens", None)
+    if cond_cfg is None:
+        return "last"
+    return str(getattr(cond_cfg, "layer_mode", "last")).lower()
+
+
+def get_rdt_condition_layer_indices(config, name):
+    cond_cfg = getattr(config, "rdt_condition_tokens", None)
+    if cond_cfg is None:
+        return []
+    layers = getattr(cond_cfg, name, [])
+    return [int(idx) for idx in layers]
+
+
+def get_rdt_depth_from_condition_config(config):
+    if get_rdt_condition_layer_mode(config) != "selected":
+        return int(config.rdt.depth)
+
+    cond_cfg = getattr(config, "rdt_condition_tokens", None)
+    if cond_cfg is None:
+        return int(config.rdt.depth)
+
+    depth = 0
+    if bool(getattr(cond_cfg, "use_image_tokens", True)):
+        image_layers = get_rdt_condition_layer_indices(config, "image_layers")
+        if len(image_layers) == 0:
+            raise ValueError("rdt_condition_tokens.image_layers must be set when layer_mode='selected'")
+        depth += len(image_layers)
+    if bool(getattr(cond_cfg, "use_action_queries", True)):
+        action_layers = get_rdt_condition_layer_indices(config, "action_layers")
+        if len(action_layers) == 0:
+            raise ValueError("rdt_condition_tokens.action_layers must be set when layer_mode='selected'")
+        depth += len(action_layers)
+    if bool(getattr(cond_cfg, "use_language_tokens", False)):
+        language_layers = get_rdt_condition_layer_indices(config, "language_layers")
+        depth += max(1, len(language_layers))
+    if depth <= 0:
+        raise ValueError("Selected RDT condition layer schedule produced zero RDT layers")
+    return depth
+
+
 def _strip_state_dict_prefixes(state):
     stripped = {}
     for key, value in state.items():
@@ -343,19 +392,8 @@ def _adapt_streamvggt_state_for_vga(state, target_depth, rank=0):
 
 class Trainer:
     def __init__(self, config):
-        if config.enable_wandb and config.rank == 0:
-            # wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
-            self.wandb = wandb
-            self.wandb.init(
-                # entity=os.environ["WANDB_TEAM_NAME"],
-                project=os.getenv("WANDB_PROJECT", "va_robotwin"),
-                # dir=log_dir,
-                config=config,
-                mode="online",
-                name='test_lln'
-                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
-            )
-            logger.info("WandB logging enabled")
+        self.metric_logger_type = self._resolve_metric_logger_type(config)
+        self.metric_logger = None
         self.step = 0
         self.config = config
         self._warned_lang_dim_mismatch = False
@@ -454,6 +492,7 @@ class Trainer:
             "rdt_img_cond_mode": self.transformer.rdt_img_cond_mode,
             "rdt_img_pool_size": self.transformer.rdt_img_pool_size,
             "rdt_img_keep_summary_tokens": self.transformer.rdt_img_keep_summary_tokens,
+            "rdt_condition_tokens": getattr(config, "rdt_condition_tokens", None),
             "use_language_condition": self.use_language_condition,
             "rdt_use_language_condition": self.rdt_use_language_condition,
             "aggregator_depth": self.transformer.aggregator.depth,
@@ -467,7 +506,8 @@ class Trainer:
 
         self.transformer.to(self.device)
 
-        rdt_config = config.rdt
+        rdt_config = config.rdt.copy()
+        rdt_config["depth"] = get_rdt_depth_from_condition_config(config)
         num_rdt_img_frames = get_current_image_frame_count(self.config)
         num_rdt_act_frames = 1
         effective_num_image_views = get_effective_num_image_views(self.config)
@@ -837,6 +877,7 @@ class Trainer:
         else:
             self.save_dir = Path(config.save_root) / datetime.now().strftime("train_log_%Y%m%d_%H%M%S") / "ckpt" # Add timestamp YYMMDD_HHMMSS to save directory
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self._setup_metric_logger()
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.cfg_prob = float(getattr(config, "cfg_prob", 0.0))
@@ -847,6 +888,77 @@ class Trainer:
                 f"Loading optimizer/scheduler training state from: {self._transformer_resume_checkpoint_dir / 'training_state.pt'}"
             )
             self._load_training_state(self._transformer_resume_checkpoint_dir)
+
+    @staticmethod
+    def _resolve_metric_logger_type(config):
+        logger_type = getattr(config, "metric_logger", None)
+        if logger_type is None:
+            logger_type = "wandb" if bool(getattr(config, "enable_wandb", False)) else "none"
+        logger_type = str(logger_type).lower()
+        aliases = {
+            "tb": "tensorboard",
+            "tensor_board": "tensorboard",
+            "none": "none",
+            "off": "none",
+            "disabled": "none",
+        }
+        logger_type = aliases.get(logger_type, logger_type)
+        if logger_type not in {"wandb", "tensorboard", "none"}:
+            raise ValueError("metric_logger must be one of {'wandb', 'tensorboard', 'none'}")
+        return logger_type
+
+    def _setup_metric_logger(self):
+        if self.config.rank != 0 or self.metric_logger_type == "none":
+            return
+
+        run_root = self.save_dir.parent
+        if self.metric_logger_type == "wandb":
+            if wandb is None:
+                raise ImportError(
+                    "WandB logger requested but the wandb package is unavailable. "
+                    "Install wandb or set metric_logger='tensorboard'/'none'."
+                )
+            # wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
+            wandb.init(
+                # entity=os.environ["WANDB_TEAM_NAME"],
+                project=os.getenv("WANDB_PROJECT", "va_robotwin"),
+                dir=str(run_root),
+                config=self.config,
+                mode=str(getattr(self.config, "wandb_mode", "online")),
+                name=str(getattr(self.config, "run_name", "test_lln")),
+                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
+            )
+            self.metric_logger = wandb
+            logger.info("WandB logging enabled")
+            return
+
+        if SummaryWriter is None:
+            raise ImportError(
+                "TensorBoard logger requested but torch.utils.tensorboard is unavailable. "
+                "Install tensorboard or set metric_logger='wandb'/'none'."
+            )
+        log_dir_cfg = getattr(self.config, "tensorboard_log_dir", None)
+        log_dir = Path(log_dir_cfg) if log_dir_cfg else run_root / "tensorboard"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self.metric_logger = SummaryWriter(log_dir=str(log_dir))
+        logger.info(f"TensorBoard logging enabled: {log_dir}")
+
+    def _log_metrics(self, metrics, step):
+        if self.config.rank != 0 or self.metric_logger is None:
+            return
+        if self.metric_logger_type == "wandb":
+            self.metric_logger.log(metrics, step=step)
+        elif self.metric_logger_type == "tensorboard":
+            for key, value in metrics.items():
+                self.metric_logger.add_scalar(key, value, step)
+
+    def _close_metric_logger(self):
+        if self.config.rank != 0 or self.metric_logger is None:
+            return
+        if self.metric_logger_type == "wandb":
+            self.metric_logger.finish()
+        elif self.metric_logger_type == "tensorboard":
+            self.metric_logger.close()
     
     @torch.no_grad()
     def _add_noise(self, latent, train_scheduler, action_mask=False, action_mode=False, noisy_cond_prob=0.):
@@ -1152,6 +1264,18 @@ class Trainer:
         noise = torch.randn_like(action_condition_fp32) * (token_rms * self.action_condition_noise_std)
         return (action_condition_fp32 + noise).to(dtype=action_condition.dtype)
 
+    @staticmethod
+    def _rdt_condition_token_len(condition):
+        if condition is None:
+            return 0
+        if condition.ndim == 3:
+            return int(condition.shape[1])
+        if condition.ndim == 4:
+            return int(condition.shape[2])
+        raise ValueError(
+            f"RDT condition tensor must be [B,L,D] or [B,N_layers,L,D], got {tuple(condition.shape)}"
+        )
+
     def _get_rdt_lang_condition(self, input_dict, dtype):
         if not self.rdt_use_language_condition:
             return None
@@ -1368,9 +1492,10 @@ class Trainer:
             action_chunk = input_dict['pred_action_chunk_dict']['noisy_latents']  # [B, C_action, chunk_size]
             action_chunk = action_chunk.permute(0, 2, 1) # [B, chunk_size, C_action]
             timesteps = input_dict['pred_action_chunk_dict']['timesteps']
-            if rdt_conds['rdt_act_c'].shape[1] != action_chunk.shape[1]:
+            rdt_act_cond_len = self._rdt_condition_token_len(rdt_conds['rdt_act_c'])
+            if rdt_act_cond_len != action_chunk.shape[1]:
                 raise ValueError(
-                    f"RDT action condition length mismatch: act_c={rdt_conds['rdt_act_c'].shape[1]}, "
+                    f"RDT action condition length mismatch: act_c={rdt_act_cond_len}, "
                     f"noisy_action={action_chunk.shape[1]}"
                 )
             if self.state_condition_mode == "null":
@@ -1475,7 +1600,13 @@ class Trainer:
                 left_action_loss_show = dist_mean(
                     torch.stack(accumulated_left_action_losses).sum()
                 ).detach().cpu().item()
+                max_left_action_loss_show = dist_max(
+                    torch.stack(accumulated_left_action_losses).sum()
+                ).detach().cpu().item()
                 right_action_loss_show = dist_mean(
+                    torch.stack(accumulated_right_action_losses).sum()
+                ).detach().cpu().item()
+                max_right_action_loss_show = dist_max(
                     torch.stack(accumulated_right_action_losses).sum()
                 ).detach().cpu().item()
                 added_action_loss_show = dist_mean(
@@ -1550,24 +1681,21 @@ class Trainer:
                         'grad_norm': f'{total_norm.item():.2f}',
                         'lr': f'{lr:.2e}'
                     })
-                    if self.config.enable_wandb:
-                        self.wandb.log({
-                            'loss_metrics/global_avg_video_loss': latent_loss_show,
-                            'loss_metrics/global_avg_action_loss': action_loss_show,
-                            'loss_metrics/global_avg_left_action_loss': left_action_loss_show,
-                            'loss_metrics/global_avg_right_action_loss': right_action_loss_show,
-                            'loss_metrics/global_avg_added_action_loss': added_action_loss_show,
-                            'loss_metrics/global_avg_camera_loss': camera_loss_show,
-                            'loss_metrics/global_avg_depth_loss': depth_loss_show,
-                            'loss_metrics/global_avg_ee_target_loss': ee_target_loss_show,
-                            'loss_metrics/global_avg_left_ee_target_loss': left_ee_target_loss_show,
-                            'loss_metrics/global_avg_right_ee_target_loss': right_ee_target_loss_show,
-                            'loss_metrics/global_avg_added_ee_target_loss': added_ee_target_loss_show,
-                            'loss_metrics/global_max_video_loss': max_latent_loss_show,
-                            'loss_metrics/global_max_action_loss': max_action_loss_show,
-                            'grad_norm': total_norm.item(),
-                            'lr': lr,
-                        }, step=self.step)
+                    self._log_metrics({
+                        'loss_metrics/global_avg_camera_loss': camera_loss_show,
+                        'loss_metrics/global_avg_depth_loss': depth_loss_show,
+                        'loss_metrics/global_avg_left_action_loss': left_action_loss_show,
+                        'loss_metrics/global_avg_right_action_loss': right_action_loss_show,
+                        'loss_metrics/global_avg_action_loss': action_loss_show,
+                        'loss_metrics/global_max_left_action_loss': max_left_action_loss_show,
+                        'loss_metrics/global_max_right_action_loss': max_right_action_loss_show,
+                        'loss_metrics/global_max_action_loss': max_action_loss_show,
+                        'loss_metrics/global_avg_left_ee_target_loss': left_ee_target_loss_show,
+                        'loss_metrics/global_avg_right_ee_target_loss': right_ee_target_loss_show,
+                        'loss_metrics/global_avg_ee_target_loss': ee_target_loss_show,
+                        'grad_norm': total_norm.item(),
+                        'lr': lr,
+                    }, step=self.step)
                 self.step += 1
                 if self.step % self.config.save_interval == 0:
                     if self.config.rank == 0:
@@ -1768,6 +1896,7 @@ class Trainer:
                 dist.barrier()
 
         logger.info("Training completed!")
+        self._close_metric_logger()
 
 
 def run(args):
@@ -1786,6 +1915,11 @@ def run(args):
 
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.metric_logger is not None:
+        config.metric_logger = args.metric_logger
+        config.enable_wandb = args.metric_logger == "wandb"
+    if args.tensorboard_log_dir is not None:
+        config.tensorboard_log_dir = args.tensorboard_log_dir
 
     if args.single_task is not None:
         config.single_task = args.single_task
@@ -1831,6 +1965,19 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--metric-logger",
+        type=str,
+        choices=["wandb", "tensorboard", "none"],
+        default=None,
+        help="Metric logger backend. Use tensorboard for offline environments.",
+    )
+    parser.add_argument(
+        "--tensorboard-log-dir",
+        type=str,
+        default=None,
+        help="TensorBoard event directory. Defaults to <run_root>/tensorboard.",
     )
     parser.add_argument(
         "--single-task",

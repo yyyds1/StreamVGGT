@@ -66,6 +66,14 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         self.rdt_cond_use_action_queries = bool(cond_cfg.get("use_action_queries", True))
         self.rdt_cond_use_image_tokens = bool(cond_cfg.get("use_image_tokens", True))
         self.rdt_cond_use_language_tokens = bool(cond_cfg.get("use_language_tokens", True))
+        self.rdt_condition_layer_mode = str(cond_cfg.get("layer_mode", "last")).lower()
+        if self.rdt_condition_layer_mode not in {"last", "selected"}:
+            raise ValueError(
+                f"Unsupported RDT condition layer_mode `{self.rdt_condition_layer_mode}`; "
+                "expected `last` or `selected`."
+            )
+        self.rdt_image_layer_idx = cond_cfg.get("image_layers", None)
+        self.rdt_action_layer_idx = cond_cfg.get("action_layers", None)
         if not (
             self.rdt_cond_use_action_queries
             or self.rdt_cond_use_image_tokens
@@ -219,7 +227,57 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             cond_parts.append(lang_c)
         if len(cond_parts) == 0:
             raise ValueError("No RDT condition token source is enabled")
-        return torch.cat(cond_parts, dim=1)
+        flat_parts = [
+            cond.reshape(cond.shape[0], -1, cond.shape[-1]) if cond.dim() == 4 else cond
+            for cond in cond_parts
+        ]
+        return torch.cat(flat_parts, dim=1)
+
+    @staticmethod
+    def _normalize_layer_indices(layer_indices, num_layers: int, name: str):
+        if layer_indices is None:
+            return [num_layers - 1]
+        indices = [int(idx) for idx in layer_indices]
+        if len(indices) == 0:
+            raise ValueError(f"{name} must contain at least one VGA layer index")
+        normalized = []
+        for idx in indices:
+            if idx < 0:
+                idx += num_layers
+            if idx < 0 or idx >= num_layers:
+                raise ValueError(
+                    f"{name} contains invalid layer index {idx}; "
+                    f"valid range is [0, {num_layers - 1}]"
+                )
+            normalized.append(idx)
+        return normalized
+
+    def _extract_global_half(self, tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.shape[-1] == 2 * self.embed_dim:
+            return tokens[..., self.embed_dim :]
+        if tokens.shape[-1] == self.embed_dim:
+            return tokens
+        raise ValueError(
+            f"Unexpected token dim {tokens.shape[-1]} for VGA; expected {self.embed_dim} or {2 * self.embed_dim}"
+        )
+
+    def _split_rdt_tokens_from_layer(self, tokens: torch.Tensor, token_idx: dict, current_image_frame_count: int):
+        rdt_tokens = self._extract_global_half(tokens)
+        img_tokens = rdt_tokens[:, :, token_idx["image"][0] : token_idx["image"][1]]
+        ee_tokens = rdt_tokens[:, :, token_idx["ee_target"][0] : token_idx["ee_target"][1]]
+        act_tokens = rdt_tokens[:, :, token_idx["action"][0] : token_idx["action"][1]]
+        lang_tokens = rdt_tokens[:, :, token_idx["lang"][0] : token_idx["lang"][1]]
+
+        current_frame_count = min(current_image_frame_count, img_tokens.shape[1])
+        img_tokens = img_tokens[:, -current_frame_count:]
+        ee_tokens = ee_tokens[:, -current_frame_count:]
+        act_tokens = act_tokens[:, -1:]
+        lang_tokens = lang_tokens[:, -1:]
+
+        img_tokens = self._build_rdt_img_tokens(img_tokens)
+        act_tokens = self._build_rdt_act_tokens(act_tokens)
+        lang_tokens = lang_tokens.reshape(lang_tokens.shape[0], -1, lang_tokens.shape[-1])
+        return img_tokens, ee_tokens, act_tokens, lang_tokens
 
     def forward(self, input_dict: dict, predict_geometry: bool = True):
         image_dict = input_dict["image_dict"]
@@ -259,31 +317,47 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             return_all_layers=True,
         )
 
-        tokens = aggregated_tokens_list[-1]  # [B, F, P, 2C]
-        # Use the last-layer global half as RDT condition tokens (no output projection).
-        if tokens.shape[-1] == 2 * self.embed_dim:
-            rdt_tokens = tokens[..., self.embed_dim :]
-        elif tokens.shape[-1] == self.embed_dim:
-            rdt_tokens = tokens
-        else:
-            raise ValueError(
-                f"Unexpected token dim {tokens.shape[-1]} for VGA; expected {self.embed_dim} or {2 * self.embed_dim}"
-            )
-
-        img_tokens = rdt_tokens[:, :, token_idx["image"][0] : token_idx["image"][1]]
-        ee_tokens = rdt_tokens[:, :, token_idx["ee_target"][0] : token_idx["ee_target"][1]]
-        act_tokens = rdt_tokens[:, :, token_idx["action"][0] : token_idx["action"][1]]
-        lang_tokens = rdt_tokens[:, :, token_idx["lang"][0] : token_idx["lang"][1]]
-        current_image_frame_count = min(current_image_frame_count, img_tokens.shape[1])
-        img_tokens = img_tokens[:, -current_image_frame_count:]
-        ee_tokens = ee_tokens[:, -current_image_frame_count:]
-        act_tokens = act_tokens[:, -1:]
-        lang_tokens = lang_tokens[:, -1:]
+        img_tokens, ee_tokens, act_tokens, lang_tokens = self._split_rdt_tokens_from_layer(
+            aggregated_tokens_list[-1],
+            token_idx,
+            current_image_frame_count,
+        )
 
         current_ee_tokens = ee_tokens.mean(dim=1)
-        img_tokens = self._build_rdt_img_tokens(img_tokens)
-        act_tokens = self._build_rdt_act_tokens(act_tokens)
-        lang_tokens = lang_tokens.reshape(lang_tokens.shape[0], -1, lang_tokens.shape[-1])
+        if self.rdt_condition_layer_mode == "selected":
+            num_layers = len(aggregated_tokens_list)
+            img_layer_idx = self._normalize_layer_indices(
+                self.rdt_image_layer_idx,
+                num_layers,
+                "rdt_condition_tokens.image_layers",
+            )
+            act_layer_idx = self._normalize_layer_indices(
+                self.rdt_action_layer_idx,
+                num_layers,
+                "rdt_condition_tokens.action_layers",
+            )
+            img_tokens = torch.stack(
+                [
+                    self._split_rdt_tokens_from_layer(
+                        aggregated_tokens_list[layer_idx],
+                        token_idx,
+                        current_image_frame_count,
+                    )[0]
+                    for layer_idx in img_layer_idx
+                ],
+                dim=1,
+            )
+            act_tokens = torch.stack(
+                [
+                    self._split_rdt_tokens_from_layer(
+                        aggregated_tokens_list[layer_idx],
+                        token_idx,
+                        current_image_frame_count,
+                    )[2]
+                    for layer_idx in act_layer_idx
+                ],
+                dim=1,
+            )
 
         rdt_img_tokens = img_tokens
         rdt_act_tokens = act_tokens

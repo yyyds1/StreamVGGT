@@ -181,9 +181,9 @@ class RDT(nn.Module):
                 dimension D is assumed to be the same as the hidden size.
             lang_c_kv: (B, depth, L_lang, 2, D) or None, language condition key and value tokens (variable length),
                 dimension D is assumed to be the same as the hidden size.
-            img_c: (B, L_img, D) or None, image condition tokens (fixed length),
+            img_c: (B, L_img, D), (B, N_img_layers, L_img, D), or None, image condition tokens,
                 dimension D is assumed to be the same as the hidden size.
-            act_c: (B, L_act, D) or None, action condition tokens (fixed length),
+            act_c: (B, L_act, D), (B, N_act_layers, L_act, D), or None, action condition tokens,
                 dimension D is assumed to be the same as the hidden size.
             state_c: (B, 1, D) or None, state condition tokens (fixed length),
             lang_mask: (B, L_lang) or None, language condition mask (True for valid).
@@ -224,9 +224,9 @@ class RDT(nn.Module):
         # we don't need to add it here
         # lang_c = lang_c + self.lang_pos_emb[:, :lang_c.shape[1]]
         if img_c is not None and self.img_pos_emb is not None:
-            img_c = img_c + self.img_pos_emb
+            img_c = img_c + self.img_pos_emb.unsqueeze(1) if img_c.dim() == 4 else img_c + self.img_pos_emb
         if act_c is not None and self.act_pos_emb is not None:
-            act_c = act_c + self.act_pos_emb
+            act_c = act_c + self.act_pos_emb.unsqueeze(1) if act_c.dim() == 4 else act_c + self.act_pos_emb
         
         conds = []
         masks = []
@@ -244,8 +244,10 @@ class RDT(nn.Module):
             raise ValueError("At least one condition (lang_c/img_c/act_c) must be provided.")
         
         num_conds = len(conds)
+        cond_use_counts = [0 for _ in conds]
         for i, block in enumerate(self.blocks):
-            c, mask = conds[i % num_conds], masks[i % num_conds]
+            cond_idx = i % num_conds
+            c, mask = conds[cond_idx], masks[cond_idx]
             ck, cv = None, None
             if isinstance(c, List):
                 ck, cv = c[i % len(c)]
@@ -253,8 +255,8 @@ class RDT(nn.Module):
                 ck = ck.transpose(1, 2) # (bs, n_kv_heads, seq_len, head_size)
                 cv = cv.transpose(1, 2) # (bs, n_kv_heads, seq_len, head_size)
             elif c.dim() == 4:
-                # its per layer language condition
-                c = c[:, i]
+                c = c[:, cond_use_counts[cond_idx] % c.shape[1]]
+            cond_use_counts[cond_idx] += 1
             x = block(x, t, c, ck, cv, mask=mask)
         # x = self.final_layer(x, t)
 

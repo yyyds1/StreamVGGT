@@ -139,6 +139,48 @@ def _adapt_rdt_state_for_depth(state, target_depth):
     return adapted
 
 
+def get_rdt_condition_layer_mode(config):
+    cond_cfg = getattr(config, "rdt_condition_tokens", None)
+    if cond_cfg is None:
+        return "last"
+    return str(getattr(cond_cfg, "layer_mode", "last")).lower()
+
+
+def get_rdt_condition_layer_indices(config, name):
+    cond_cfg = getattr(config, "rdt_condition_tokens", None)
+    if cond_cfg is None:
+        return []
+    layers = getattr(cond_cfg, name, [])
+    return [int(idx) for idx in layers]
+
+
+def get_rdt_depth_from_condition_config(config):
+    if get_rdt_condition_layer_mode(config) != "selected":
+        return int(config.rdt.depth)
+
+    cond_cfg = getattr(config, "rdt_condition_tokens", None)
+    if cond_cfg is None:
+        return int(config.rdt.depth)
+
+    depth = 0
+    if bool(getattr(cond_cfg, "use_image_tokens", True)):
+        image_layers = get_rdt_condition_layer_indices(config, "image_layers")
+        if len(image_layers) == 0:
+            raise ValueError("rdt_condition_tokens.image_layers must be set when layer_mode='selected'")
+        depth += len(image_layers)
+    if bool(getattr(cond_cfg, "use_action_queries", True)):
+        action_layers = get_rdt_condition_layer_indices(config, "action_layers")
+        if len(action_layers) == 0:
+            raise ValueError("rdt_condition_tokens.action_layers must be set when layer_mode='selected'")
+        depth += len(action_layers)
+    if bool(getattr(cond_cfg, "use_language_tokens", False)):
+        language_layers = get_rdt_condition_layer_indices(config, "language_layers")
+        depth += max(1, len(language_layers))
+    if depth <= 0:
+        raise ValueError("Selected RDT condition layer schedule produced zero RDT layers")
+    return depth
+
+
 CHECKPOINT_SUCCESS_MARKER = "_SUCCESS"
 
 
@@ -309,6 +351,7 @@ class VA_Server:
         )
         if self.model_arch == "vga":
             self.transformer = VGA(
+                rdt_condition_tokens=getattr(job_config, "rdt_condition_tokens", None),
                 enable_camera_depth_heads=bool(getattr(job_config, "enable_geometry_heads_eval", False)),
                 **common_kwargs,
             )
@@ -327,7 +370,8 @@ class VA_Server:
             self.transformer = ActionVGGT(**common_kwargs)
         self.transformer.to(self.device)
 
-        rdt_config = self.job_config.rdt
+        rdt_config = self.job_config.rdt.copy()
+        rdt_config["depth"] = get_rdt_depth_from_condition_config(self.job_config)
         effective_num_image_views = get_effective_num_image_views(self.job_config)
         patch_h = self.transformer.img_height // self.transformer.patch_size
         patch_w = self.transformer.img_width // self.transformer.patch_size
@@ -1650,6 +1694,18 @@ class VA_Server:
         }
         return conds
 
+    @staticmethod
+    def _rdt_condition_token_len(condition):
+        if condition is None:
+            return 0
+        if condition.ndim == 3:
+            return int(condition.shape[1])
+        if condition.ndim == 4:
+            return int(condition.shape[2])
+        raise ValueError(
+            f"RDT condition tensor must be [B,L,D] or [B,N_layers,L,D], got {tuple(condition.shape)}"
+        )
+
     def _get_rdt_lang_condition(self, dtype):
         if not self.rdt_use_language_condition:
             return None
@@ -1676,9 +1732,10 @@ class VA_Server:
             conds_img_c = conds["rdt_img_c"].to(self.device, dtype=action_head_dtype)
             conds_act_c = conds["rdt_act_c"].to(self.device, dtype=action_head_dtype)
             expected_act_cond_len = self.pred_frames * self.tokens_per_frame
-            if conds_act_c.shape[1] != expected_act_cond_len:
+            act_cond_len = self._rdt_condition_token_len(conds_act_c)
+            if act_cond_len != expected_act_cond_len:
                 raise ValueError(
-                    f"RDT action condition length mismatch: act_c={conds_act_c.shape[1]}, "
+                    f"RDT action condition length mismatch: act_c={act_cond_len}, "
                     f"noisy_action={expected_act_cond_len}"
                 )
 

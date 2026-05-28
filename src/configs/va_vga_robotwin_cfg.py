@@ -88,6 +88,15 @@ va_vga_robotwin_cfg.rdt_condition_tokens = EasyDict()
 va_vga_robotwin_cfg.rdt_condition_tokens.use_action_queries = True
 va_vga_robotwin_cfg.rdt_condition_tokens.use_image_tokens = True
 va_vga_robotwin_cfg.rdt_condition_tokens.use_language_tokens = False
+va_vga_robotwin_cfg.rdt_condition_tokens.layer_mode = "selected"
+va_vga_robotwin_cfg.rdt_condition_tokens.image_layers = [2, 5, 8, 11]
+va_vga_robotwin_cfg.rdt_condition_tokens.action_layers = [2, 5, 8, 11]
+# With selected image/action layers, RDT alternates one image layer then one
+# action layer, so the effective RDT depth is len(image_layers)+len(action_layers).
+va_vga_robotwin_cfg.rdt.depth = (
+    len(va_vga_robotwin_cfg.rdt_condition_tokens.image_layers)
+    + len(va_vga_robotwin_cfg.rdt_condition_tokens.action_layers)
+)
 
 # Direct RDT language conditioning from the encoded instruction embedding.
 # This is separate from VGA language tokens above: when enabled, the text-model

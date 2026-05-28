@@ -8,12 +8,16 @@ from .va_vga_robotwin_cfg import va_vga_robotwin_cfg
 va_vga_robotwin_train_cfg = EasyDict(__name__="Config: VGA robotwin train")
 va_vga_robotwin_train_cfg.update(va_vga_robotwin_cfg)
 
-va_vga_robotwin_train_cfg.dataset_path = "/home/yds/code/StreamVGGT/dataset/adjust_bottle/demo_randomized"
+va_vga_robotwin_train_cfg.dataset_path = "/home/yds/dataset/robotwin_labeled/adjust_bottle/demo_randomized/"
 va_vga_robotwin_train_cfg.empty_emb_path = os.path.join(
     va_vga_robotwin_train_cfg.dataset_path,
     "empty_emb.pt",
 )
-va_vga_robotwin_train_cfg.enable_wandb = True
+# va_vga_robotwin_train_cfg.metric_logger = "wandb"
+va_vga_robotwin_train_cfg.metric_logger = "tensorboard"
+va_vga_robotwin_train_cfg.enable_wandb = True  # Backward-compatible fallback when metric_logger is unset.
+va_vga_robotwin_train_cfg.wandb_mode = "online"
+va_vga_robotwin_train_cfg.tensorboard_log_dir = None
 va_vga_robotwin_train_cfg.load_worker = 2
 va_vga_robotwin_train_cfg.dataset_init_worker = 0
 va_vga_robotwin_train_cfg.dataset_mp_start_method = "spawn"
