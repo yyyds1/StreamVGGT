@@ -350,9 +350,22 @@ class VA_Server:
             image_frame_stride=self.image_frame_stride,
         )
         if self.model_arch == "vga":
+            enable_ee_target_head_eval = bool(
+                getattr(
+                    job_config,
+                    "enable_ee_target_head_eval",
+                    getattr(job_config, "enable_ee_target_loss", False),
+                )
+            )
             self.transformer = VGA(
                 rdt_condition_tokens=getattr(job_config, "rdt_condition_tokens", None),
                 enable_camera_depth_heads=bool(getattr(job_config, "enable_geometry_heads_eval", False)),
+                enable_camera_head=False,
+                enable_depth_head=False,
+                enable_ee_target_head=enable_ee_target_head_eval,
+                ee_target_head_num_heads=int(getattr(job_config, "ee_target_head_num_heads", 8)),
+                ee_target_head_trunk_depth=int(getattr(job_config, "ee_target_head_trunk_depth", 4)),
+                ee_target_head_num_iterations=int(getattr(job_config, "ee_target_head_num_iterations", 4)),
                 **common_kwargs,
             )
             if getattr(job_config, "use_lora", False):
@@ -490,6 +503,14 @@ class VA_Server:
         return self._encode_prompt_text_emb(prompt)
 
     def _preload_text_embedder(self) -> None:
+        cond_cfg = getattr(self.job_config, "rdt_condition_tokens", None)
+        uses_vga_language = bool(getattr(self.job_config, "use_language_condition", False))
+        uses_rdt_language = bool(getattr(self.job_config, "rdt_use_language_condition", False))
+        uses_rdt_language_tokens = bool(getattr(cond_cfg, "use_language_tokens", False)) if cond_cfg is not None else False
+        if not (uses_vga_language or uses_rdt_language or uses_rdt_language_tokens):
+            logger.info("Skipping eval text embedder preload because language conditioning is disabled.")
+            return
+
         if not bool(getattr(self.job_config, "preload_text_embedder_eval", True)):
             logger.info("Skipping eval text embedder preload because preload_text_embedder_eval=False.")
             return

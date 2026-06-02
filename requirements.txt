@@ -3,14 +3,14 @@ torchvision==0.21.0
 numpy==1.26.1
 Pillow==10.3.0
 diffusers==0.36.0
-huggingface_hub
+huggingface_hub>=0.34.2,<1.0
 safetensors
 roma
 gradio
 matplotlib
 tqdm
 opencv-python
-scipy
+scipy==1.11.4
 einops
 trimesh
 tensorboard
@@ -20,8 +20,8 @@ gradio
 lpips
 hydra-core
 h5py
-accelerate
-transformers
+accelerate>=1.7.0
+transformers>=4.50.3,<4.52.0
 scikit-learn
 gsplat
 evo

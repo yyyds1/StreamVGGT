@@ -12,7 +12,7 @@ task_groups=(
 )
 
 save_root=${1:-'./results'}
-task_name=${2:-"click_bell"}
+task_name=${2:-"adjust_bottle"}
 
 policy_name=ACT
 task_config=demo_clean

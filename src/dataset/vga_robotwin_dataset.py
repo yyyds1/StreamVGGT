@@ -60,6 +60,12 @@ class MultiVGARobotwinDataset(Dataset):
         self.chunk_size = max(1, int(getattr(config, "chunk_size", 1)))
         self.multi_view_image_mode = str(getattr(config, "multi_view_image_mode", "vertical"))
         self.action_representation = str(getattr(config, "action_representation", "absolute")).lower()
+        self.rdt_action_target_source = str(getattr(config, "rdt_action_target_source", "endpose")).lower()
+        if self.rdt_action_target_source not in {"endpose", "expert_target"}:
+            raise ValueError(
+                f"Unsupported rdt_action_target_source `{self.rdt_action_target_source}`. "
+                "Expected 'endpose' or 'expert_target'."
+            )
         self.encode_text_in_dataloader = bool(getattr(config, "encode_text_in_dataloader", False))
         self.cfg_prob = float(getattr(config, "cfg_prob", 0.0))
         self.use_marked_rgb = bool(getattr(config, "use_expert_marked_rgb", False))
@@ -357,15 +363,21 @@ class MultiVGARobotwinDataset(Dataset):
         if data_timestep + self.chunk_size > num_frames:
             raise IndexError(f"Not enough future frames for timestep={data_timestep} in episode={episode['path']}")
 
-        raw_actions_16d, action_valid = self._read_compact_sequence(f, "expert_target")
+        raw_ee_targets_16d, ee_target_valid = self._read_compact_sequence(f, "expert_target")
         raw_state_16d, _ = self._read_compact_sequence(f, "endpose")
+        if self.rdt_action_target_source == "expert_target":
+            raw_action_targets_16d = raw_ee_targets_16d
+            action_valid = ee_target_valid
+        else:
+            raw_action_targets_16d = raw_state_16d
+            action_valid = np.ones((raw_state_16d.shape[0], 1), dtype=bool)
 
         if self.action_representation == "relative":
             anchor_pose = raw_state_16d[history_indices[0]]
-            action_model_flat = get_relative_compact_action(raw_actions_16d, anchor_pose)
+            action_model_flat = get_relative_compact_action(raw_action_targets_16d, anchor_pose)
             state_model_flat = get_relative_compact_action(raw_state_16d, anchor_pose)
         elif self.action_representation == "absolute":
-            action_model_flat = raw_actions_16d
+            action_model_flat = raw_action_targets_16d
             state_model_flat = raw_state_16d
         else:
             raise ValueError(
@@ -409,8 +421,8 @@ class MultiVGARobotwinDataset(Dataset):
         action_chunk_mask = torch.cat([state_mask.unsqueeze(-1), future_action_chunk_mask], dim=1)
 
         images, current_image_frame_count, image_time_ids, image_view_ids = self._load_window_images(f, history_indices)
-        ee_target = torch.from_numpy(raw_actions_16d[data_timestep].reshape(2, 8)).float()
-        ee_target_valid = torch.from_numpy(np.asarray(action_valid[data_timestep], dtype=bool)).reshape(1)
+        ee_target = torch.from_numpy(raw_ee_targets_16d[data_timestep].reshape(2, 8)).float()
+        ee_target_valid = torch.from_numpy(np.asarray(ee_target_valid[data_timestep], dtype=bool)).reshape(1)
         ee_target_valid = ee_target_valid.expand(2)
 
         out_dict = {

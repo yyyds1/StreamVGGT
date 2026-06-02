@@ -7,7 +7,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/home/yds/code/RoboTwin")
+robowin_root = Path("/home/yds/code/robotwin-labeled")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -21,6 +21,7 @@ from envs.utils.create_actor import UnStableError
 import numpy as np
 from pathlib import Path
 from collections import deque
+from copy import deepcopy
 import traceback
 
 import yaml
@@ -770,6 +771,9 @@ def eval_policy(task_name,
 
     now_seed = st_seed
     clear_cache_freq = args["clear_cache_freq"]
+    expert_timeline = deepcopy(args.get("expert_timeline", []))
+    left_joint_path = deepcopy(args.get("left_joint_path", []))
+    right_joint_path = deepcopy(args.get("right_joint_path", []))
     single_trajectory = bool(args.get("single_trajectory", False))
     single_trajectory_episode_index = args.get("single_trajectory_episode_index", None)
     if single_trajectory_episode_index is not None:
@@ -807,6 +811,9 @@ def eval_policy(task_name,
                 TASK_ENV.setup_demo(now_ep_num=current_episode_index, seed=current_seed, is_test=True, **args)
                 apply_step_limit_override()
                 episode_info = TASK_ENV.play_once()
+                expert_timeline = deepcopy(getattr(TASK_ENV, "expert_timeline", []))
+                left_joint_path = deepcopy(getattr(TASK_ENV, "left_joint_path", []))
+                right_joint_path = deepcopy(getattr(TASK_ENV, "right_joint_path", []))
                 TASK_ENV.close_env()
             except UnStableError as e:
                 TASK_ENV.close_env()
@@ -841,7 +848,14 @@ def eval_policy(task_name,
 
         args["render_freq"] = render_freq
 
-        TASK_ENV.setup_demo(now_ep_num=current_episode_index, seed=current_seed, is_test=True, **args)
+        rollout_args = deepcopy(args)
+        rollout_args["need_plan"] = False
+        rollout_args["left_joint_path"] = left_joint_path
+        rollout_args["right_joint_path"] = right_joint_path
+        rollout_args["expert_timeline"] = expert_timeline
+        rollout_args["expert_target_progress_mode"] = "state"
+
+        TASK_ENV.setup_demo(now_ep_num=current_episode_index, seed=current_seed, is_test=True, **rollout_args)
         apply_step_limit_override()
         episode_info_list = [episode_info["info"]]
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)

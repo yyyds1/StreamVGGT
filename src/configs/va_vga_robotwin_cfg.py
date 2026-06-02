@@ -22,22 +22,25 @@ va_vga_robotwin_cfg.history_obs_cam_keys = [
 va_vga_robotwin_cfg.view_position_cam_keys = list(va_vga_robotwin_cfg.obs_cam_keys)
 va_vga_robotwin_cfg.separate_history_current_obs_views = True
 va_vga_robotwin_cfg.use_expert_marked_rgb = True
+# RDT action target source. "endpose" trains the action head on dense robot EE
+# states from the dataset; "expert_target" trains it on high-level planner targets.
+va_vga_robotwin_cfg.rdt_action_target_source = "endpose"
 va_vga_robotwin_cfg.streamvggt_pretrained = "/home/yds/code/StreamVGGT/ckpt/checkpoints.pth"
 va_vga_robotwin_cfg.text_tokenizer_name = "gemma"
 va_vga_robotwin_cfg.text_model_name_or_path = "google/embeddinggemma-300M"
 va_vga_robotwin_cfg.max_position_embeddings = 128
 va_vga_robotwin_cfg.text_embedding_shape = [1, 768]
 va_vga_robotwin_cfg.text_embed_dim = 768
-va_vga_robotwin_cfg.preload_text_embedder_eval = True
+va_vga_robotwin_cfg.preload_text_embedder_eval = False
 va_vga_robotwin_cfg.text_embedder_warmup_prompt = "warmup"
 va_vga_robotwin_cfg.use_language_condition = False
 
 # The image/action token layout changed to stride=1; do not resume stride=4 checkpoints.
-va_vga_robotwin_cfg.transformer_resume = False
-va_vga_robotwin_cfg.transformer_resume_from = '/home/yds/code/StreamVGGT/src/train_out/w_text/checkpoint_step_32000/transformer/diffusion_pytorch_model.safetensors'
+va_vga_robotwin_cfg.transformer_resume = True
+va_vga_robotwin_cfg.transformer_resume_from = '/home/yds/code/StreamVGGT/ckpt/transformer/diffusion_pytorch_model.safetensors'
 va_vga_robotwin_cfg.transformer_pretrained = None
-va_vga_robotwin_cfg.action_head_resume = False
-va_vga_robotwin_cfg.action_head_resume_from = '/home/yds/code/StreamVGGT/src/train_out/w_text/checkpoint_step_32000/action_head/diffusion_pytorch_model.safetensors'
+va_vga_robotwin_cfg.action_head_resume = True
+va_vga_robotwin_cfg.action_head_resume_from = '/home/yds/code/StreamVGGT/ckpt/action_head/diffusion_pytorch_model.safetensors'
 va_vga_robotwin_cfg.action_head_pretrained = None
 
 # LoRA settings for the pretrained VGA backbone.
@@ -50,6 +53,7 @@ va_vga_robotwin_cfg.lora_target_modules = ("qkv", "proj", "fc1", "fc2")
 # VGA heads: enabled during train, bypassed during eval for efficiency.
 va_vga_robotwin_cfg.enable_geometry_heads_train = False
 va_vga_robotwin_cfg.enable_geometry_heads_eval = False
+va_vga_robotwin_cfg.enable_ee_target_head_eval = True
 
 # Loss toggles (camera/depth code is kept and can be re-enabled anytime).
 va_vga_robotwin_cfg.enable_camera_loss = False
