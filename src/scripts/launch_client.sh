@@ -1,5 +1,12 @@
 #!/bin/bash
-export LD_LIBRARY_PATH=/usr/lib64:/usr/lib:$LD_LIBRARY_PATH
+# Avoid forcing system library paths by default. On cluster/container machines this
+# can make SAPIEN/Vulkan/CUDA extensions load incompatible native libraries.
+if [[ "${PREPEND_SYSTEM_LIBS:-0}" == "1" ]]; then
+  export LD_LIBRARY_PATH=/usr/lib64:/usr/lib:$LD_LIBRARY_PATH
+fi
+export PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER:-1}
+DEBUG_NATIVE=${DEBUG_NATIVE:-0}
+DEBUG_NATIVE_ONLY=${DEBUG_NATIVE_ONLY:-0}
 
 task_groups=(
   "stack_bowls_three handover_block hanging_mug scan_object lift_pot put_object_cabinet stack_blocks_three place_shoe"
@@ -23,16 +30,57 @@ HOST='127.0.0.1'
 PORT=29055
 HEADLESS=${HEADLESS:-1}
 MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-"200"}
+USE_EXPERT_MARKED_RGB=${USE_EXPERT_MARKED_RGB:-1}
 
 headless_flag=""
 if [[ "${HEADLESS}" == "1" ]]; then
   headless_flag="--headless"
 fi
 
+if [[ "${DEBUG_NATIVE}" == "1" ]]; then
+  python - <<'PY'
+import os
+import sys
+import subprocess
+
+print("python:", sys.executable)
+print("LD_LIBRARY_PATH:", os.environ.get("LD_LIBRARY_PATH", ""))
+print("VK_ICD_FILENAMES:", os.environ.get("VK_ICD_FILENAMES", ""))
+print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+print("DISPLAY:", os.environ.get("DISPLAY", ""))
+print("XDG_RUNTIME_DIR:", os.environ.get("XDG_RUNTIME_DIR", ""))
+
+def check(name, code):
+    print(f"\n[check] {name}")
+    try:
+        ns = {}
+        exec(code, ns, ns)
+        print("[ok]", name)
+    except Exception as exc:
+        print("[fail]", name, repr(exc))
+
+check("torch", "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())")
+check("numpy/scipy", "import numpy, scipy; print(numpy.__version__, scipy.__version__)")
+check("sapien import", "import sapien; print(getattr(sapien, '__version__', 'unknown'))")
+check("sapien renderer", "import sapien.core as sapien; r = sapien.SapienRenderer(); print(type(r).__name__)")
+check("warp", "import warp; print(getattr(warp, '__version__', 'unknown'), hasattr(warp, 'torch'))")
+check("curobo", "from curobo.types.math import Pose; import curobo; print(getattr(curobo, '__file__', 'unknown'))")
+
+print("\n[check] nvidia-smi")
+subprocess.run(["bash", "-lc", "nvidia-smi | head -n 12"], check=False)
+print("\n[check] vulkaninfo summary")
+subprocess.run(["bash", "-lc", "vulkaninfo --summary 2>&1 | sed -n '1,80p'"], check=False)
+PY
+  if [[ "${DEBUG_NATIVE_ONLY}" == "1" ]]; then
+    exit 0
+  fi
+fi
+
 PYTHONWARNINGS=ignore::UserWarning \
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_client_openpi --config policy/$policy_name/deploy_policy.yml \
     ${headless_flag} \
     $(if [ -n "${MAX_EPISODE_STEPS}" ]; then printf '%s' "--max_episode_steps ${MAX_EPISODE_STEPS}"; fi) \
+    $(if [[ "${USE_EXPERT_MARKED_RGB}" == "1" || "${USE_EXPERT_MARKED_RGB}" == "true" || "${USE_EXPERT_MARKED_RGB}" == "True" ]]; then printf '%s' "--use_expert_marked_rgb"; else printf '%s' "--no-use_expert_marked_rgb"; fi) \
     --host ${HOST} \
     --port ${PORT} \
     --overrides \

@@ -21,7 +21,7 @@ va_vga_robotwin_cfg.history_obs_cam_keys = [
 ]
 va_vga_robotwin_cfg.view_position_cam_keys = list(va_vga_robotwin_cfg.obs_cam_keys)
 va_vga_robotwin_cfg.separate_history_current_obs_views = True
-va_vga_robotwin_cfg.use_expert_marked_rgb = True
+va_vga_robotwin_cfg.use_expert_marked_rgb = False
 # RDT action target source. "endpose" trains the action head on dense robot EE
 # states from the dataset; "expert_target" trains it on high-level planner targets.
 va_vga_robotwin_cfg.rdt_action_target_source = "endpose"
@@ -44,7 +44,7 @@ va_vga_robotwin_cfg.action_head_resume_from = '/home/yds/code/StreamVGGT/ckpt/ac
 va_vga_robotwin_cfg.action_head_pretrained = None
 
 # LoRA settings for the pretrained VGA backbone.
-va_vga_robotwin_cfg.use_lora = True
+va_vga_robotwin_cfg.use_lora = False
 va_vga_robotwin_cfg.lora_rank = 128
 va_vga_robotwin_cfg.lora_alpha = 64.0
 va_vga_robotwin_cfg.lora_dropout = 0.05

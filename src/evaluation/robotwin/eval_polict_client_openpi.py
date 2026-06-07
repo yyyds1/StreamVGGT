@@ -416,6 +416,7 @@ def main(usr_args):
     else:
         args["single_trajectory_episode_index"] = None
     args["single_trajectory_repo_id"] = usr_args.get("single_trajectory_repo_id", None)
+    args["use_expert_marked_rgb"] = bool(usr_args.get("use_expert_marked_rgb", True))
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -544,21 +545,31 @@ def format_eef_state(observation):
     )
 
 
-def _get_camera_rgb(observation, camera_name):
+def _get_camera_rgb(observation, camera_name, use_expert_marked_rgb=True):
     camera_obs = observation["observation"][camera_name]
+    if not use_expert_marked_rgb:
+        return camera_obs["rgb"]
     return camera_obs.get("rgb_expert_marked", camera_obs["rgb"])
 
 
-def format_obs(observation, prompt):
+def format_obs(observation, prompt, use_expert_marked_rgb=True):
     return {
-                "head_camera": _get_camera_rgb(observation, "head_camera"),
-                "left_camera": _get_camera_rgb(observation, "left_camera"),
-                "right_camera": _get_camera_rgb(observation, "right_camera"),
-                "front_camera": _get_camera_rgb(observation, "front_camera"),
-                "side_camera": _get_camera_rgb(observation, "side_camera"),
-                "observation.images.cam_high": _get_camera_rgb(observation, "head_camera"),
-                "observation.images.cam_left_wrist": _get_camera_rgb(observation, "left_camera"),
-                "observation.images.cam_right_wrist": _get_camera_rgb(observation, "right_camera"),
+                "head_camera": _get_camera_rgb(observation, "head_camera", use_expert_marked_rgb),
+                "left_camera": _get_camera_rgb(observation, "left_camera", use_expert_marked_rgb),
+                "right_camera": _get_camera_rgb(observation, "right_camera", use_expert_marked_rgb),
+                "front_camera": _get_camera_rgb(observation, "front_camera", use_expert_marked_rgb),
+                "side_camera": _get_camera_rgb(observation, "side_camera", use_expert_marked_rgb),
+                "observation.images.cam_high": _get_camera_rgb(observation, "head_camera", use_expert_marked_rgb),
+                "observation.images.cam_left_wrist": _get_camera_rgb(
+                    observation,
+                    "left_camera",
+                    use_expert_marked_rgb,
+                ),
+                "observation.images.cam_right_wrist": _get_camera_rgb(
+                    observation,
+                    "right_camera",
+                    use_expert_marked_rgb,
+                ),
                 "observation.state": format_eef_state(observation),
                 "task": prompt,
             }
@@ -929,7 +940,8 @@ def eval_policy(task_name,
         inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
         prompt = TASK_ENV.get_instruction()
         episode_index = int(current_episode_index)
-        initial_formatted_obs = format_obs(initial_obs, prompt)
+        use_expert_marked_rgb = bool(args.get("use_expert_marked_rgb", True))
+        initial_formatted_obs = format_obs(initial_obs, prompt, use_expert_marked_rgb=use_expert_marked_rgb)
 
         # StreamVGGT now follows p2p and encodes the prompt on the policy server with
         # EmbeddingGemma. Do not send legacy dataset text_emb tensors from the client.
@@ -949,7 +961,7 @@ def eval_policy(task_name,
         full_obs_list.append(initial_formatted_obs)
         while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
             observation = TASK_ENV.get_obs()
-            current_obs = format_obs(observation, prompt)
+            current_obs = format_obs(observation, prompt, use_expert_marked_rgb=use_expert_marked_rgb)
             current_obs["episode_index"] = episode_index
 
             ret = model.infer(dict(
@@ -999,7 +1011,7 @@ def eval_policy(task_name,
             except Exception as exc:
                 print(f"[eval] warning: failed to send planner feedback to policy server: {exc}")
 
-            obs = format_obs(TASK_ENV.get_obs(), prompt)
+            obs = format_obs(TASK_ENV.get_obs(), prompt, use_expert_marked_rgb=use_expert_marked_rgb)
             full_obs_list.append(obs)
   
             if TASK_ENV.eval_success:
@@ -1066,6 +1078,7 @@ def parse_args_and_config():
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)
     parser.add_argument("--test_num", type=int, default=100)
     parser.add_argument("--max_episode_steps", type=int, default=None)
+    parser.add_argument("--use_expert_marked_rgb", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--single_trajectory", action="store_true")
     parser.add_argument("--single_trajectory_episode_index", type=int, default=None)
     parser.add_argument("--single_trajectory_repo_id", type=str, default=None)
@@ -1101,6 +1114,8 @@ def parse_args_and_config():
     config["test_num"] = args.test_num
     if args.max_episode_steps is not None:
         config["max_episode_steps"] = int(args.max_episode_steps)
+    if args.use_expert_marked_rgb is not None:
+        config["use_expert_marked_rgb"] = bool(args.use_expert_marked_rgb)
     if args.single_trajectory:
         config["single_trajectory"] = True
     if args.single_trajectory_episode_index is not None:
