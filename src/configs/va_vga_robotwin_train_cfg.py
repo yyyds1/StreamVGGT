@@ -8,7 +8,13 @@ from .va_vga_robotwin_cfg import va_vga_robotwin_cfg
 va_vga_robotwin_train_cfg = EasyDict(__name__="Config: VGA robotwin train")
 va_vga_robotwin_train_cfg.update(va_vga_robotwin_cfg)
 
-va_vga_robotwin_train_cfg.dataset_path = "/home/yds/dataset/robotwin_labeled/adjust_bottle/demo_randomized/"
+va_vga_robotwin_train_cfg.dataset_path = "/home/yds/code/StreamVGGT/dataset"
+# Optional multi-task/multi-root training. Each root should contain data/episode*.hdf5.
+# When this is set, it overrides the single dataset_path above.
+# va_vga_robotwin_train_cfg.dataset_paths = [
+#     "/home/yds/dataset/robotwin_labeled/adjust_bottle/demo_randomized/",
+#     "/home/yds/dataset/robotwin_labeled/click_bell/demo_randomized/",
+# ]
 va_vga_robotwin_train_cfg.empty_emb_path = os.path.join(
     va_vga_robotwin_train_cfg.dataset_path,
     "empty_emb.pt",
@@ -22,6 +28,7 @@ va_vga_robotwin_train_cfg.load_worker = 2
 va_vga_robotwin_train_cfg.dataset_init_worker = 0
 va_vga_robotwin_train_cfg.dataset_mp_start_method = "spawn"
 va_vga_robotwin_train_cfg.encode_text_in_dataloader = False
+va_vga_robotwin_train_cfg.sample_by_episode = True
 va_vga_robotwin_train_cfg.dataloader_timeout = 120
 va_vga_robotwin_train_cfg.save_interval = 1000
 va_vga_robotwin_train_cfg.gc_interval = 50

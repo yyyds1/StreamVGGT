@@ -48,10 +48,9 @@ class MultiVGARobotwinDataset(Dataset):
         del num_init_worker
 
         self.config = config
-        self.dataset_path = Path(getattr(config, "dataset_path"))
-        self.data_dir = self.dataset_path / "data"
-        if not self.data_dir.is_dir():
-            raise FileNotFoundError(f"Missing HDF5 data directory: {self.data_dir}")
+        self._file_cache = {}
+        self.dataset_paths = self._resolve_dataset_paths(config)
+        self.dataset_path = self.dataset_paths[0]
 
         self.image_height = int(getattr(config, "image_height", 224))
         self.image_width = int(getattr(config, "image_width", 224))
@@ -69,6 +68,7 @@ class MultiVGARobotwinDataset(Dataset):
         self.encode_text_in_dataloader = bool(getattr(config, "encode_text_in_dataloader", False))
         self.cfg_prob = float(getattr(config, "cfg_prob", 0.0))
         self.use_marked_rgb = bool(getattr(config, "use_expert_marked_rgb", False))
+        self.sample_by_episode = bool(getattr(config, "sample_by_episode", True))
 
         self.obs_cam_keys = list(getattr(config, "obs_cam_keys", list(DEFAULT_CAMERA_KEYS)))
         self.separate_history_current_obs_views = bool(
@@ -90,23 +90,67 @@ class MultiVGARobotwinDataset(Dataset):
 
         self._text_embedding_cache = {}
         self._empty_text_embedding = None
-        self._file_cache = {}
         self._episodes = self._scan_episodes()
         self._samples = self._build_sample_index()
 
         logger.info(
-            f"Loaded VGA robotwin HDF5 dataset from {self.data_dir} "
+            f"Loaded VGA robotwin HDF5 dataset from {len(self.dataset_paths)} dataset root(s) "
             f"with {len(self._episodes)} episodes and {len(self._samples)} samples."
         )
 
-    def _scan_episodes(self):
-        episode_paths = sorted(self.data_dir.glob("episode*.hdf5"), key=_episode_index_from_name)
-        if len(episode_paths) == 0:
-            raise FileNotFoundError(f"No episode*.hdf5 files found under {self.data_dir}")
+    @staticmethod
+    def _resolve_dataset_paths(config):
+        raw_paths = getattr(config, "dataset_paths", None)
+        if raw_paths is None:
+            raw_paths = [getattr(config, "dataset_path")]
+        elif isinstance(raw_paths, (str, os.PathLike)):
+            raw_paths = [raw_paths]
 
+        dataset_paths = []
+        seen = set()
+        for raw_path in raw_paths:
+            path = Path(raw_path).expanduser()
+            candidate_paths = MultiVGARobotwinDataset._discover_dataset_roots(path)
+            if not candidate_paths:
+                raise FileNotFoundError(
+                    f"Missing HDF5 data directory under {path}. Expected either "
+                    f"{path / 'data'} or nested */data/episode*.hdf5 directories."
+                )
+            for candidate_path in candidate_paths:
+                key = str(candidate_path.resolve()) if candidate_path.exists() else str(candidate_path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                dataset_paths.append(candidate_path)
+
+        if len(dataset_paths) == 0:
+            raise ValueError("No RobotWin dataset roots were configured. Set dataset_path or dataset_paths.")
+        return dataset_paths
+
+    @staticmethod
+    def _discover_dataset_roots(path: Path):
+        direct_data_dir = path / "data"
+        if direct_data_dir.is_dir() and any(direct_data_dir.glob("episode*.hdf5")):
+            return [path]
+
+        if not path.is_dir():
+            return []
+
+        roots = []
+        for data_dir in sorted(path.rglob("data")):
+            if any(data_dir.glob("episode*.hdf5")):
+                roots.append(data_dir.parent)
+        return roots
+
+    @staticmethod
+    def _task_name_from_dataset_path(dataset_path: Path) -> str:
+        # Expected layout: <task_name>/<task_config>/data/episode*.hdf5
+        if dataset_path.parent.name:
+            return dataset_path.parent.name
+        return dataset_path.name
+
+    def _scan_episodes(self):
         requested_episode = getattr(self.config, "single_trajectory_episode_index", None)
-        if requested_episode is None:
-            requested_episode = getattr(self.config, "single_trajectory_repo_id", None)
         requested_episode_index = None
         if requested_episode is not None:
             requested_str = str(requested_episode)
@@ -117,50 +161,92 @@ class MultiVGARobotwinDataset(Dataset):
                 if match is not None:
                     requested_episode_index = int(match.group(1))
 
+        requested_dataset = getattr(self.config, "single_trajectory_repo_id", None)
+        requested_dataset_text = str(requested_dataset) if requested_dataset is not None else None
+        if requested_episode_index is None and requested_dataset_text is not None:
+            if requested_dataset_text.isdigit():
+                requested_episode_index = int(requested_dataset_text)
+                requested_dataset_text = None
+            else:
+                match = re.search(r"episode(\d+)", Path(requested_dataset_text).name)
+                if match is not None:
+                    requested_episode_index = int(match.group(1))
+                    requested_dataset_text = None
+
         episodes = []
-        for path in episode_paths:
-            episode_index = _episode_index_from_name(path)
-            if requested_episode_index is not None and episode_index != requested_episode_index:
+        missing_episode_roots = []
+        for dataset_id, dataset_path in enumerate(self.dataset_paths):
+            data_dir = dataset_path / "data"
+            task_name = self._task_name_from_dataset_path(dataset_path)
+            if requested_dataset_text is not None:
+                dataset_candidates = {
+                    str(dataset_id),
+                    dataset_path.name,
+                    task_name,
+                    str(dataset_path),
+                    str(dataset_path.resolve()) if dataset_path.exists() else str(dataset_path),
+                }
+                if requested_dataset_text not in dataset_candidates:
+                    continue
+
+            episode_paths = sorted(data_dir.glob("episode*.hdf5"), key=_episode_index_from_name)
+            if len(episode_paths) == 0:
+                missing_episode_roots.append(data_dir)
                 continue
 
-            with h5py.File(path, "r") as f:
-                num_frames = int(f["joint_action"]["vector"].shape[0])
-                obs_keys = list(f["observation"].keys())
-                required_obs_cam_keys = self.required_obs_cam_keys if self.separate_history_current_obs_views else self.obs_cam_keys
-                if not set(required_obs_cam_keys).issubset(set(obs_keys)):
-                    if set(DEFAULT_CAMERA_KEYS).issubset(set(obs_keys)):
-                        self.obs_cam_keys = list(DEFAULT_CAMERA_KEYS)
-                        self.current_obs_cam_keys = list(getattr(self.config, "current_obs_cam_keys", self.obs_cam_keys))
-                        self.history_obs_cam_keys = list(getattr(self.config, "history_obs_cam_keys", self.current_obs_cam_keys))
-                        self.required_obs_cam_keys = list(
-                            dict.fromkeys(self.history_obs_cam_keys + self.current_obs_cam_keys)
-                        )
-                        self.view_position_cam_keys = list(
-                            dict.fromkeys(
-                                list(getattr(self.config, "view_position_cam_keys", self.obs_cam_keys))
-                                + self.required_obs_cam_keys
-                            )
-                        )
-                    else:
-                        raise KeyError(
-                            f"Episode {path} is missing expected camera keys. "
-                            f"Found={obs_keys}, expected={required_obs_cam_keys}"
-                        )
-                valid = True
-                if "expert_target" in f and "left" in f["expert_target"]:
-                    valid = bool(f["expert_target"]["left"]["valid"][:].all()) and bool(
-                        f["expert_target"]["right"]["valid"][:].all()
+            for path in episode_paths:
+                episode_index = _episode_index_from_name(path)
+                if requested_episode_index is not None and episode_index != requested_episode_index:
+                    continue
+
+                with h5py.File(path, "r") as f:
+                    num_frames = int(f["joint_action"]["vector"].shape[0])
+                    obs_keys = list(f["observation"].keys())
+                    required_obs_cam_keys = (
+                        self.required_obs_cam_keys if self.separate_history_current_obs_views else self.obs_cam_keys
                     )
-            episodes.append(
-                {
-                    "path": path,
-                    "episode_index": episode_index,
-                    "num_frames": num_frames,
-                    "has_all_valid_targets": valid,
-                }
-            )
+                    if not set(required_obs_cam_keys).issubset(set(obs_keys)):
+                        if set(DEFAULT_CAMERA_KEYS).issubset(set(obs_keys)):
+                            self.obs_cam_keys = list(DEFAULT_CAMERA_KEYS)
+                            self.current_obs_cam_keys = list(getattr(self.config, "current_obs_cam_keys", self.obs_cam_keys))
+                            self.history_obs_cam_keys = list(
+                                getattr(self.config, "history_obs_cam_keys", self.current_obs_cam_keys)
+                            )
+                            self.required_obs_cam_keys = list(
+                                dict.fromkeys(self.history_obs_cam_keys + self.current_obs_cam_keys)
+                            )
+                            self.view_position_cam_keys = list(
+                                dict.fromkeys(
+                                    list(getattr(self.config, "view_position_cam_keys", self.obs_cam_keys))
+                                    + self.required_obs_cam_keys
+                                )
+                            )
+                        else:
+                            raise KeyError(
+                                f"Episode {path} is missing expected camera keys. "
+                                f"Found={obs_keys}, expected={required_obs_cam_keys}"
+                            )
+                    valid = True
+                    if "expert_target" in f and "left" in f["expert_target"]:
+                        valid = bool(f["expert_target"]["left"]["valid"][:].all()) and bool(
+                            f["expert_target"]["right"]["valid"][:].all()
+                        )
+                episodes.append(
+                    {
+                        "path": path,
+                        "dataset_id": dataset_id,
+                        "dataset_path": dataset_path,
+                        "task_name": task_name,
+                        "episode_index": episode_index,
+                        "num_frames": num_frames,
+                        "has_all_valid_targets": valid,
+                    }
+                )
 
         if len(episodes) == 0:
+            if missing_episode_roots:
+                roots = ", ".join(str(path) for path in missing_episode_roots)
+                raise FileNotFoundError(f"No episode*.hdf5 files found under configured data directories: {roots}")
             raise RuntimeError("No HDF5 episodes matched the current filter.")
         return episodes
 
@@ -174,8 +260,17 @@ class MultiVGARobotwinDataset(Dataset):
             max_t = num_frames - required_frames_for_chunk
             if max_t < min_t:
                 continue
-            for timestep in range(min_t, max_t + 1):
-                samples.append((episode_id, timestep))
+            if self.sample_by_episode:
+                samples.append(
+                    {
+                        "episode_id": episode_id,
+                        "min_t": min_t,
+                        "max_t": max_t,
+                    }
+                )
+            else:
+                for timestep in range(min_t, max_t + 1):
+                    samples.append((episode_id, timestep))
         if len(samples) == 0:
             raise RuntimeError("No valid training windows were found in the HDF5 dataset.")
         return samples
@@ -454,7 +549,14 @@ class MultiVGARobotwinDataset(Dataset):
         return out_dict
 
     def __getitem__(self, idx) -> dict:
-        episode_id, data_timestep = self._samples[idx]
+        sample = self._samples[idx]
+        if self.sample_by_episode:
+            episode_id = int(sample["episode_id"])
+            min_t = int(sample["min_t"])
+            max_t = int(sample["max_t"])
+            data_timestep = int(torch.randint(min_t, max_t + 1, (1,)).item())
+        else:
+            episode_id, data_timestep = sample
         episode = self._episodes[episode_id]
         return self._build_sample_from_episode(episode, data_timestep)
 
@@ -462,7 +564,7 @@ class MultiVGARobotwinDataset(Dataset):
         return len(self._samples)
 
     def __del__(self):
-        for handle in self._file_cache.values():
+        for handle in getattr(self, "_file_cache", {}).values():
             try:
                 handle.close()
             except Exception:
