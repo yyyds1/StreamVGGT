@@ -22,11 +22,17 @@ class EETargetHead(nn.Module):
         num_iterations: int = 4,
         init_values: float = 0.01,
         dropout: float = 0.0,
+        use_image_tokens: bool = True,
+        image_cross_attn_depth: int = 1,
+        num_waypoints: int = 1,
     ):
         super().__init__()
-        self.target_dim = 8
+        self.target_dim = 4
         self.trunk_depth = int(trunk_depth)
         self.num_iterations = int(num_iterations)
+        self.use_image_tokens = bool(use_image_tokens)
+        self.image_cross_attn_depth = max(1, int(image_cross_attn_depth))
+        self.num_waypoints = max(1, int(num_waypoints))
 
         self.trunk = nn.ModuleList(
             [
@@ -40,11 +46,38 @@ class EETargetHead(nn.Module):
             ]
         )
         self.token_norm = nn.LayerNorm(embed_dim)
+        self.image_norm = nn.LayerNorm(embed_dim)
         self.trunk_norm = nn.LayerNorm(embed_dim)
-        self.empty_pose_tokens = nn.Parameter(torch.zeros(1, 2, self.target_dim))
+        self.arm_embed = nn.Parameter(torch.zeros(1, 2, 1, embed_dim))
+        self.waypoint_embed = nn.Parameter(torch.zeros(1, 1, self.num_waypoints, embed_dim))
+        self.empty_pose_tokens = nn.Parameter(torch.zeros(1, 2, self.num_waypoints, self.target_dim))
         self.embed_pose = nn.Linear(self.target_dim, embed_dim)
         self.poseLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(embed_dim, 3 * embed_dim, bias=True))
         self.adaln_norm = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
+        self.image_cross_attn = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        "q_norm": nn.LayerNorm(embed_dim),
+                        "kv_norm": nn.LayerNorm(embed_dim),
+                        "attn": nn.MultiheadAttention(
+                            embed_dim,
+                            num_heads,
+                            dropout=dropout,
+                            batch_first=True,
+                        ),
+                        "mlp_norm": nn.LayerNorm(embed_dim),
+                        "mlp": Mlp(
+                            in_features=embed_dim,
+                            hidden_features=int(embed_dim * mlp_ratio),
+                            out_features=embed_dim,
+                            drop=dropout,
+                        ),
+                    }
+                )
+                for _ in range(self.image_cross_attn_depth)
+            ]
+        )
         self.pose_branch = Mlp(
             in_features=embed_dim,
             hidden_features=embed_dim // 2,
@@ -52,24 +85,69 @@ class EETargetHead(nn.Module):
             drop=0,
         )
 
-    def _activate_target(self, pred_target: torch.Tensor) -> torch.Tensor:
-        quat = F.normalize(pred_target[..., 3:7], dim=-1, eps=1e-6)
-        return torch.cat([pred_target[..., :3], quat, pred_target[..., 7:8]], dim=-1)
+    def _normalize_image_tokens(self, image_tokens: torch.Tensor | None) -> torch.Tensor | None:
+        if image_tokens is None or not self.use_image_tokens:
+            return None
+        if image_tokens.ndim == 3:
+            image_tokens = image_tokens[:, None]
+        elif image_tokens.ndim != 4:
+            raise ValueError(
+                "image_tokens must be [B,L,D] or [B,N_layers,L,D], "
+                f"got {tuple(image_tokens.shape)}"
+            )
+        return self.image_norm(image_tokens)
 
-    def _trunk_fn(self, pose_tokens: torch.Tensor, num_iterations: int) -> list[torch.Tensor]:
-        batch_size, num_arms, _ = pose_tokens.shape
+    def _cross_attend_image_tokens(
+        self,
+        pose_tokens: torch.Tensor,
+        image_tokens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if image_tokens is None:
+            return pose_tokens
+
+        out = pose_tokens
+        num_layers = image_tokens.shape[1]
+        for layer_idx in range(num_layers):
+            kv = image_tokens[:, layer_idx]
+            for block in self.image_cross_attn:
+                attn_out, _ = block["attn"](
+                    block["q_norm"](out),
+                    block["kv_norm"](kv),
+                    block["kv_norm"](kv),
+                    need_weights=False,
+                )
+                out = out + attn_out
+                out = out + block["mlp"](block["mlp_norm"](out))
+        return out
+
+    def _activate_target(self, pred_target: torch.Tensor) -> torch.Tensor:
+        return pred_target
+
+    def _trunk_fn(
+        self,
+        pose_tokens: torch.Tensor,
+        image_tokens: torch.Tensor | None,
+        num_iterations: int,
+    ) -> list[torch.Tensor]:
+        batch_size, num_targets, _ = pose_tokens.shape
         pred_target = None
         pred_target_list = []
 
         for _ in range(num_iterations):
             if pred_target is None:
-                module_input = self.embed_pose(self.empty_pose_tokens.expand(batch_size, num_arms, -1))
+                module_input = self.embed_pose(
+                    self.empty_pose_tokens.reshape(1, -1, self.target_dim).expand(batch_size, num_targets, -1)
+                )
             else:
                 module_input = self.embed_pose(pred_target.detach())
 
             shift_msa, scale_msa, gate_msa = self.poseLN_modulation(module_input).chunk(3, dim=-1)
             pose_tokens_modulated = gate_msa * modulate(self.adaln_norm(pose_tokens), shift_msa, scale_msa)
             pose_tokens_modulated = pose_tokens_modulated + pose_tokens
+            pose_tokens_modulated = self._cross_attend_image_tokens(
+                pose_tokens_modulated,
+                image_tokens,
+            )
 
             for block in self.trunk:
                 pose_tokens_modulated = block(pose_tokens_modulated)
@@ -84,7 +162,12 @@ class EETargetHead(nn.Module):
 
         return pred_target_list
 
-    def forward(self, ee_tokens: torch.Tensor, num_iterations: int | None = None) -> dict:
+    def forward(
+        self,
+        ee_tokens: torch.Tensor,
+        image_tokens: torch.Tensor | None = None,
+        num_iterations: int | None = None,
+    ) -> dict:
         if ee_tokens.ndim != 3:
             raise ValueError(f"ee_tokens must be [B, 2, D], got {tuple(ee_tokens.shape)}")
         if ee_tokens.shape[1] != 2:
@@ -93,12 +176,26 @@ class EETargetHead(nn.Module):
         if num_iterations is None:
             num_iterations = self.num_iterations
 
-        pose_tokens = self.token_norm(ee_tokens)
-        pred_target_list = self._trunk_fn(pose_tokens, num_iterations=num_iterations)
+        batch_size = ee_tokens.shape[0]
+        base_tokens = self.token_norm(ee_tokens)[:, :, None].expand(-1, -1, self.num_waypoints, -1)
+        pose_tokens = base_tokens + self.arm_embed + self.waypoint_embed
+        pose_tokens = pose_tokens.reshape(batch_size, 2 * self.num_waypoints, -1)
+        image_tokens = self._normalize_image_tokens(image_tokens)
+        pred_target_list = self._trunk_fn(
+            pose_tokens,
+            image_tokens=image_tokens,
+            num_iterations=num_iterations,
+        )
+        pred_target_list = [
+            pred_target.reshape(batch_size, 2, self.num_waypoints, self.target_dim)
+            for pred_target in pred_target_list
+        ]
         pred = pred_target_list[-1]
+        first_pred = pred[:, :, 0]
         return {
             "ee_target": pred,
             "ee_target_list": pred_target_list,
-            "left_ee_target": pred[:, 0],
-            "right_ee_target": pred[:, 1],
+            "left_ee_target": first_pred[:, 0],
+            "right_ee_target": first_pred[:, 1],
+            "ee_target_first": first_pred,
         }

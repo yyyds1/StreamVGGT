@@ -21,6 +21,7 @@ __pycache__/
 
 src/train_out**/**
 src/train_out/**
+src/results/
 
 src/logs/**
 

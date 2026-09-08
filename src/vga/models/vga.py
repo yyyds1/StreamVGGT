@@ -46,6 +46,9 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         ee_target_head_num_heads=8,
         ee_target_head_trunk_depth=4,
         ee_target_head_num_iterations=4,
+        ee_target_head_use_image_tokens=True,
+        ee_target_head_image_cross_attn_depth=1,
+        ee_target_sequence_len=1,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -58,6 +61,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         self.num_image_views = num_image_views
         self.image_frame_stride = image_frame_stride
         self.text_embed_dim = int(text_embed_dim)
+        self.ee_target_sequence_len = max(1, int(ee_target_sequence_len))
 
         self.rdt_img_cond_mode = rdt_img_cond_mode
         self.rdt_img_pool_size = max(int(rdt_img_pool_size), 1)
@@ -66,6 +70,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         self.rdt_cond_use_action_queries = bool(cond_cfg.get("use_action_queries", True))
         self.rdt_cond_use_image_tokens = bool(cond_cfg.get("use_image_tokens", True))
         self.rdt_cond_use_language_tokens = bool(cond_cfg.get("use_language_tokens", True))
+        self.rdt_cond_use_ee_target_tokens = bool(cond_cfg.get("use_ee_target_tokens", False))
         self.rdt_condition_layer_mode = str(cond_cfg.get("layer_mode", "last")).lower()
         if self.rdt_condition_layer_mode not in {"last", "selected"}:
             raise ValueError(
@@ -123,9 +128,30 @@ class VGA(nn.Module, PyTorchModelHubMixin):
                 num_heads=int(ee_target_head_num_heads),
                 trunk_depth=int(ee_target_head_trunk_depth),
                 num_iterations=int(ee_target_head_num_iterations),
+                use_image_tokens=bool(ee_target_head_use_image_tokens),
+                image_cross_attn_depth=int(ee_target_head_image_cross_attn_depth),
+                num_waypoints=self.ee_target_sequence_len,
             )
         else:
             self.ee_target_head = None
+        if self.rdt_cond_use_ee_target_tokens:
+            if self.ee_target_head is None:
+                raise ValueError("rdt_condition_tokens.use_ee_target_tokens=True requires enable_ee_target_head=True")
+            self.ee_target_fourier_bands = 4
+            xyz_dim = 3 + 2 * self.ee_target_fourier_bands * 3
+            self.ee_target_condition_num_tokens = 4 * self.ee_target_sequence_len
+            self.ee_target_cond_proj = nn.ModuleDict(
+                {
+                    "left_xyz": nn.Linear(xyz_dim, embed_dim),
+                    "left_gripper": nn.Linear(1, embed_dim),
+                    "right_xyz": nn.Linear(xyz_dim, embed_dim),
+                    "right_gripper": nn.Linear(1, embed_dim),
+                }
+            )
+        else:
+            self.ee_target_fourier_bands = 0
+            self.ee_target_condition_num_tokens = 0
+            self.ee_target_cond_proj = None
 
         self.lora_replaced_modules = []
         self.lora_config = None
@@ -217,7 +243,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             geometry["depth_conf"] = depth_conf
         return geometry
 
-    def _compose_rdt_condition_tokens(self, img_c, act_c, lang_c):
+    def _compose_rdt_condition_tokens(self, img_c, act_c, lang_c, ee_c=None):
         cond_parts = []
         if self.rdt_cond_use_action_queries:
             cond_parts.append(act_c)
@@ -225,6 +251,8 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             cond_parts.append(img_c)
         if self.rdt_cond_use_language_tokens:
             cond_parts.append(lang_c)
+        if ee_c is not None:
+            cond_parts.append(ee_c)
         if len(cond_parts) == 0:
             raise ValueError("No RDT condition token source is enabled")
         flat_parts = [
@@ -232,6 +260,118 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             for cond in cond_parts
         ]
         return torch.cat(flat_parts, dim=1)
+
+    def _fourier_encode_xyz(self, xyz: torch.Tensor) -> torch.Tensor:
+        bands = int(getattr(self, "ee_target_fourier_bands", 0))
+        if bands <= 0:
+            return xyz
+        freq = (2.0 ** torch.arange(bands, device=xyz.device, dtype=xyz.dtype)) * torch.pi
+        angles = xyz[..., None] * freq
+        sincos = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1).flatten(start_dim=-2)
+        return torch.cat([xyz, sincos], dim=-1)
+
+    def _build_ee_target_condition_tokens(
+        self,
+        ee_target: torch.Tensor,
+        current_ee: Optional[torch.Tensor],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.ee_target_cond_proj is None:
+            raise ValueError("ee_target condition projection is disabled")
+        proj_param = next(self.ee_target_cond_proj.parameters())
+        ee_target = ee_target.to(device=proj_param.device, dtype=proj_param.dtype)
+        if ee_target.ndim == 3:
+            ee_target = ee_target[:, :, None]
+        elif ee_target.ndim != 4:
+            raise ValueError(
+                f"ee_target condition must be [B,2,4] or [B,2,K,4], got {tuple(ee_target.shape)}"
+            )
+        if ee_target.shape[1] != 2 or ee_target.shape[-1] != 4:
+            raise ValueError(
+                f"ee_target condition must have left/right arms and 4 channels, got {tuple(ee_target.shape)}"
+            )
+        if current_ee is None:
+            current_ee = torch.zeros_like(ee_target)
+        else:
+            current_ee = current_ee.to(device=proj_param.device, dtype=proj_param.dtype)
+            if current_ee.ndim == 3:
+                current_ee = current_ee[:, :, None].expand(-1, -1, ee_target.shape[2], -1)
+            elif current_ee.ndim != 4:
+                raise ValueError(
+                    f"current ee-target condition must be [B,2,4] or [B,2,K,4], got {tuple(current_ee.shape)}"
+                )
+            if current_ee.shape[2] == 1 and ee_target.shape[2] != 1:
+                current_ee = current_ee.expand(-1, -1, ee_target.shape[2], -1)
+            if current_ee.shape != ee_target.shape:
+                raise ValueError(
+                    f"current ee-target condition shape mismatch: got {tuple(current_ee.shape)}, "
+                    f"expected {tuple(ee_target.shape)}"
+                )
+
+        delta = ee_target - current_ee
+        left_xyz = self._fourier_encode_xyz(delta[:, 0, :, :3])
+        left_gripper = delta[:, 0, :, 3:4]
+        right_xyz = self._fourier_encode_xyz(delta[:, 1, :, :3])
+        right_gripper = delta[:, 1, :, 3:4]
+
+        tokens = [
+            self.ee_target_cond_proj["left_xyz"](left_xyz),
+            self.ee_target_cond_proj["left_gripper"](left_gripper),
+            self.ee_target_cond_proj["right_xyz"](right_xyz),
+            self.ee_target_cond_proj["right_gripper"](right_gripper),
+        ]
+        return torch.stack(tokens, dim=2).flatten(1, 2).to(dtype=dtype)
+
+    def _append_ee_target_condition_tokens(
+        self,
+        act_tokens: torch.Tensor,
+        ee_target: torch.Tensor,
+        current_ee: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.ee_target_cond_proj is None:
+            return act_tokens
+        ee_tokens = self._build_ee_target_condition_tokens(
+            ee_target=ee_target,
+            current_ee=current_ee,
+            dtype=act_tokens.dtype,
+        ).to(device=act_tokens.device)
+        if act_tokens.dim() == 3:
+            return torch.cat([act_tokens, ee_tokens], dim=1)
+        if act_tokens.dim() == 4:
+            ee_tokens = ee_tokens[:, None].expand(-1, act_tokens.shape[1], -1, -1)
+            return torch.cat([act_tokens, ee_tokens], dim=2)
+        raise ValueError(
+            f"RDT action tokens must be [B,L,D] or [B,N_layers,L,D], got {tuple(act_tokens.shape)}"
+        )
+
+    def _mix_ee_target_condition_override(
+        self,
+        pred_ee_target: torch.Tensor,
+        override_ee_target: Optional[torch.Tensor],
+        override_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if override_ee_target is None or override_mask is None:
+            return pred_ee_target
+        override_ee_target = override_ee_target.to(device=pred_ee_target.device, dtype=pred_ee_target.dtype)
+        override_mask = override_mask.to(device=pred_ee_target.device, dtype=torch.bool)
+        if override_ee_target.shape != pred_ee_target.shape:
+            raise ValueError(
+                "ee_target_condition_override shape mismatch: "
+                f"got {tuple(override_ee_target.shape)}, expected {tuple(pred_ee_target.shape)}"
+            )
+        if override_mask.ndim == 1:
+            override_mask = override_mask[:, None, None, None]
+        elif override_mask.ndim == 2:
+            override_mask = override_mask[:, :, None, None]
+        elif override_mask.ndim == 3:
+            override_mask = override_mask[..., None]
+        elif override_mask.ndim != 4:
+            raise ValueError(
+                "ee_target_condition_override_mask must be [B], [B,2], [B,2,K], or [B,2,K,1], "
+                f"got {tuple(override_mask.shape)}"
+            )
+        override_mask = override_mask.expand_as(pred_ee_target)
+        return torch.where(override_mask, override_ee_target.detach(), pred_ee_target)
 
     @staticmethod
     def _normalize_layer_indices(layer_indices, num_layers: int, name: str):
@@ -324,6 +464,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         )
 
         current_ee_tokens = ee_tokens.mean(dim=1)
+        ee_target_image_tokens = img_tokens
         if self.rdt_condition_layer_mode == "selected":
             num_layers = len(aggregated_tokens_list)
             img_layer_idx = self._normalize_layer_indices(
@@ -347,6 +488,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
                 ],
                 dim=1,
             )
+            ee_target_image_tokens = img_tokens
             act_tokens = torch.stack(
                 [
                     self._split_rdt_tokens_from_layer(
@@ -359,15 +501,6 @@ class VGA(nn.Module, PyTorchModelHubMixin):
                 dim=1,
             )
 
-        rdt_img_tokens = img_tokens
-        rdt_act_tokens = act_tokens
-        rdt_lang_tokens = lang_tokens
-        rdt_cond_c = self._compose_rdt_condition_tokens(
-            img_c=rdt_img_tokens,
-            act_c=rdt_act_tokens,
-            lang_c=rdt_lang_tokens,
-        )
-
         geometry = None
         if predict_geometry and self.enable_camera_depth_heads:
             geometry = self._extract_geometry_predictions(
@@ -378,16 +511,52 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         if self.ee_target_head is not None:
             if geometry is None:
                 geometry = {}
-            geometry.update(self.ee_target_head(current_ee_tokens))
+            geometry.update(
+                self.ee_target_head(
+                    current_ee_tokens,
+                    image_tokens=ee_target_image_tokens,
+                )
+            )
+
+        rdt_img_tokens = img_tokens
+        rdt_act_tokens = act_tokens
+        rdt_lang_tokens = lang_tokens
+        rdt_ee_tokens = None
+        if (
+            geometry is not None
+            and "ee_target" in geometry
+            and self.rdt_cond_use_ee_target_tokens
+            and self.ee_target_cond_proj is not None
+        ):
+            ee_target_condition = self._mix_ee_target_condition_override(
+                geometry["ee_target"],
+                input_dict.get("ee_target_condition_override", None),
+                input_dict.get("ee_target_condition_override_mask", None),
+            )
+            rdt_ee_tokens = self._build_ee_target_condition_tokens(
+                ee_target=ee_target_condition,
+                current_ee=None,
+                dtype=rdt_act_tokens.dtype,
+            )
+            if rdt_act_tokens.dim() == 4:
+                rdt_ee_tokens = rdt_ee_tokens[:, None].expand(-1, rdt_act_tokens.shape[1], -1, -1)
+        rdt_cond_c = self._compose_rdt_condition_tokens(
+            img_c=rdt_img_tokens,
+            act_c=rdt_act_tokens,
+            lang_c=rdt_lang_tokens,
+            ee_c=rdt_ee_tokens,
+        )
 
         return VGAOutput(
             ress={
                 "rdt_cond_c": rdt_cond_c,
                 "rdt_img_c": rdt_img_tokens,
                 "rdt_act_c": rdt_act_tokens,
+                "rdt_ee_c": rdt_ee_tokens,
                 "rdt_lang_c": rdt_lang_tokens,
                 "rdt_img_tokens": rdt_img_tokens,
                 "rdt_action_query_tokens": rdt_act_tokens,
+                "rdt_ee_target_tokens": rdt_ee_tokens,
             },
             geometry=geometry,
             views=images,
@@ -457,5 +626,6 @@ class VGA(nn.Module, PyTorchModelHubMixin):
                 "image_view_ids": frames[0].get("image_view_ids", None),
             },
             "action_dict": action_dict,
+            "ee_target_condition_current": frames[0].get("ee_target_condition_current", None),
         }
         return self.forward(input_dict=input_dict, predict_geometry=False)

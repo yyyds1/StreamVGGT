@@ -10,7 +10,9 @@ from collections import deque
 from pathlib import Path
 from typing import Optional
 
+from easydict import EasyDict
 import numpy as np
+from evaluation.ee_target_waypoints import build_linear_ee_target_transitions
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -33,6 +35,33 @@ from utils import (
     run_async_server_mode,
 )
 from utils.text_embedding import encode_prompt, get_text_embedder
+
+
+def _to_easydict(value):
+    if isinstance(value, dict):
+        return EasyDict({str(k): _to_easydict(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return [_to_easydict(v) for v in value]
+    return value
+
+
+def _coerce_config_runtime_types(config):
+    dtype = getattr(config, "param_dtype", None)
+    if isinstance(dtype, str):
+        dtype_name = dtype.removeprefix("torch.")
+        if not hasattr(torch, dtype_name):
+            raise ValueError(f"Unsupported param_dtype in evaluation config: {dtype}")
+        config.param_dtype = getattr(torch, dtype_name)
+    return config
+
+
+def _load_eval_config(config_path):
+    config_path = Path(config_path)
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Evaluation config not found: {config_path}")
+    with config_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    return _coerce_config_runtime_types(_to_easydict(payload))
 
 
 def get_effective_num_image_views(config):
@@ -173,6 +202,13 @@ def get_rdt_depth_from_condition_config(config):
         if len(action_layers) == 0:
             raise ValueError("rdt_condition_tokens.action_layers must be set when layer_mode='selected'")
         depth += len(action_layers)
+    if bool(getattr(cond_cfg, "use_ee_target_tokens", False)):
+        ee_target_layers = get_rdt_condition_layer_indices(config, "ee_target_layers")
+        if len(ee_target_layers) == 0:
+            ee_target_layers = get_rdt_condition_layer_indices(config, "action_layers")
+        if len(ee_target_layers) == 0:
+            raise ValueError("rdt_condition_tokens.ee_target_layers must be set when layer_mode='selected'")
+        depth += len(ee_target_layers)
     if bool(getattr(cond_cfg, "use_language_tokens", False)):
         language_layers = get_rdt_condition_layer_indices(config, "language_layers")
         depth += max(1, len(language_layers))
@@ -213,7 +249,7 @@ def _adapt_rdt_state_for_model(state, model):
     adapted = _adapt_rdt_state_for_depth(state, target_depth=model.depth)
     model_state = model.state_dict()
 
-    for pos_key in ["x_pos_emb", "img_pos_emb", "act_pos_emb"]:
+    for pos_key in ["x_pos_emb", "img_pos_emb", "act_pos_emb", "ee_pos_emb"]:
         if pos_key not in adapted or pos_key not in model_state:
             continue
         src_pos = adapted[pos_key]
@@ -253,6 +289,40 @@ class VA_Server:
         self.rdt_horizon = self.chunk_size + 1
         self.action_chunk_exec_steps = max(1, int(getattr(job_config, "action_chunk_exec_steps", 1)))
         self.image_frame_stride = int(getattr(job_config, "image_frame_stride", 8))
+        self.robotwin_action_space = str(getattr(job_config, "robotwin_action_space", "ee")).lower()
+        if self.robotwin_action_space not in {"ee", "joint"}:
+            raise ValueError(
+                f"Unsupported robotwin_action_space `{self.robotwin_action_space}`. Expected 'ee' or 'joint'."
+            )
+        self.joint_action_representation = str(
+            getattr(job_config, "joint_action_representation", "absolute")
+        ).lower()
+        if self.joint_action_representation not in {"absolute", "delta"}:
+            raise ValueError(
+                f"Unsupported joint_action_representation `{self.joint_action_representation}`. "
+                "Expected 'absolute' or 'delta'."
+            )
+        norm_stats_by_action_mode = getattr(job_config, "norm_stats_by_action_mode", None)
+        if norm_stats_by_action_mode:
+            if self.robotwin_action_space == "joint":
+                norm_key = f"joint_{self.joint_action_representation}"
+                if norm_key not in norm_stats_by_action_mode:
+                    raise KeyError(f"Missing RobotWin normalization stats for `{norm_key}`")
+                job_config.norm_stat = norm_stats_by_action_mode[norm_key]
+                job_config.joint_norm_stat = norm_stats_by_action_mode[norm_key]
+                if "joint_absolute" not in norm_stats_by_action_mode:
+                    raise KeyError("Missing RobotWin normalization stats for `joint_absolute`")
+                job_config.joint_state_norm_stat = norm_stats_by_action_mode["joint_absolute"]
+            else:
+                norm_key = f"ee_{getattr(job_config, 'action_representation', 'absolute')}"
+                if norm_key not in norm_stats_by_action_mode:
+                    raise KeyError(f"Missing RobotWin normalization stats for `{norm_key}`")
+                job_config.norm_stat = norm_stats_by_action_mode[norm_key]
+        if self.robotwin_action_space == "joint":
+            job_config.action_dim = 14
+            job_config.rdt.action_dim = 14
+            job_config.used_action_channel_ids = list(range(14))
+            job_config.inverse_used_action_channel_ids = list(range(14))
         self.action_dim = int(job_config.action_dim)
         self.patch_size = tuple(getattr(job_config, "patch_size", (1, 14, 14)))
         self.multi_view_image_mode = getattr(job_config, "multi_view_image_mode", "vertical")
@@ -270,6 +340,24 @@ class VA_Server:
         )
         self.model_arch = str(getattr(job_config, "model_arch", "actionvggt")).lower()
         self.rdt_use_language_condition = bool(getattr(job_config, "rdt_use_language_condition", False))
+        self.enable_ee_target_module = bool(getattr(job_config, "enable_ee_target_module", True))
+        if not self.enable_ee_target_module:
+            job_config.enable_ee_target_loss = False
+            job_config.enable_ee_target_head_eval = False
+            job_config.use_ee_target_as_rdt_condition = False
+            job_config.ee_target_condition_gt_mix_enabled = False
+            cond_cfg = getattr(job_config, "rdt_condition_tokens", None)
+            if cond_cfg is not None:
+                cond_cfg.use_ee_target_tokens = False
+                cond_cfg.ee_target_layers = []
+        self.rdt_ee_target_condition_source = str(
+            getattr(job_config, "rdt_ee_target_condition_source", "predicted")
+        ).lower()
+        if self.rdt_ee_target_condition_source not in {"predicted", "oracle"}:
+            raise ValueError(
+                "rdt_ee_target_condition_source must be one of {'predicted', 'oracle'}, "
+                f"got `{self.rdt_ee_target_condition_source}`"
+            )
         self.action_representation = str(getattr(job_config, "action_representation", "relative")).lower()
         if self.action_representation not in {"relative", "absolute"}:
             raise ValueError(
@@ -309,8 +397,21 @@ class VA_Server:
         self.warm_start_noise_std = float(max(0.0, getattr(rdt_cfg, "warm_start_noise_std", 0.03)))
         self.warm_start_sigma = float(max(0.0, min(1.0, getattr(rdt_cfg, "warm_start_sigma", 0.5))))
         self.action_smoothing_alpha = float(max(0.0, min(1.0, getattr(rdt_cfg, "action_smoothing_alpha", 0.35))))
+        if self.robotwin_action_space == "joint" and self.joint_action_representation == "delta":
+            joint_delta_exec_steps = int(
+                getattr(job_config, "joint_delta_action_chunk_exec_steps", 1)
+            )
+            self.action_chunk_exec_steps = max(1, min(self.action_chunk_exec_steps, joint_delta_exec_steps))
+            if bool(getattr(job_config, "disable_joint_delta_warm_start_eval", False)):
+                self.warm_start_blend = 0.0
+            logger.info(
+                f"Joint-delta eval: action_chunk_exec_steps={self.action_chunk_exec_steps}, "
+                f"warm_start_blend={self.warm_start_blend}"
+            )
         self.unexecuted_action_buffer = deque()
         self.actions_served_since_last_prediction = 0
+        self._logged_image_payload_debug = False
+        self._logged_oracle_ee_target_condition = False
         guard_cfg = getattr(job_config, "ee_target_guard", None)
         self.ee_target_guard_enabled = bool(getattr(guard_cfg, "enabled", False)) if guard_cfg is not None else False
         self.ee_target_guard_max_delta_xyz = float(getattr(guard_cfg, "max_delta_xyz", 0.0)) if guard_cfg is not None else 0.0
@@ -348,13 +449,27 @@ class VA_Server:
             action_dim=self.action_dim,
             aggregator_depth=int(getattr(job_config, "actionvggt_depth", 24)),
             image_frame_stride=self.image_frame_stride,
+            ee_target_sequence_len=max(1, int(getattr(job_config, "ee_target_sequence_len", 1))),
         )
         if self.model_arch == "vga":
+            cond_cfg = getattr(job_config, "rdt_condition_tokens", None)
+            cond_cfg_dict = dict(cond_cfg or {})
+            self.use_ee_target_as_rdt_condition = bool(
+                self.enable_ee_target_module
+                and (
+                    getattr(job_config, "use_ee_target_as_rdt_condition", False)
+                    or cond_cfg_dict.get("use_ee_target_tokens", False)
+                )
+            )
             enable_ee_target_head_eval = bool(
-                getattr(
-                    job_config,
-                    "enable_ee_target_head_eval",
-                    getattr(job_config, "enable_ee_target_loss", False),
+                self.enable_ee_target_module
+                and (
+                    getattr(
+                        job_config,
+                        "enable_ee_target_head_eval",
+                        getattr(job_config, "enable_ee_target_loss", False),
+                    )
+                    or self.use_ee_target_as_rdt_condition
                 )
             )
             self.transformer = VGA(
@@ -366,6 +481,10 @@ class VA_Server:
                 ee_target_head_num_heads=int(getattr(job_config, "ee_target_head_num_heads", 8)),
                 ee_target_head_trunk_depth=int(getattr(job_config, "ee_target_head_trunk_depth", 4)),
                 ee_target_head_num_iterations=int(getattr(job_config, "ee_target_head_num_iterations", 4)),
+                ee_target_head_use_image_tokens=bool(getattr(job_config, "ee_target_head_use_image_tokens", True)),
+                ee_target_head_image_cross_attn_depth=int(
+                    getattr(job_config, "ee_target_head_image_cross_attn_depth", 1)
+                ),
                 **common_kwargs,
             )
             if getattr(job_config, "use_lora", False):
@@ -410,6 +529,15 @@ class VA_Server:
         rdt_x_pos_emb_config = [("act", rdt_horizon + self.job_config.rdt.num_register_tokens)]
         num_rdt_act_frames = 1
         rdt_act_pos_emb_config = [("action", (num_rdt_act_frames, rdt_horizon))]
+        ee_target_sequence_len = max(1, int(getattr(self.job_config, "ee_target_sequence_len", 1)))
+        ee_condition_tokens = (
+            4 * ee_target_sequence_len
+            if getattr(self, "use_ee_target_as_rdt_condition", False)
+            else 0
+        )
+        max_act_len = num_rdt_act_frames * rdt_horizon
+        rdt_ee_pos_emb_config = [("ee_target", ee_condition_tokens)] if ee_condition_tokens else None
+        self.ee_target_condition_num_tokens = ee_condition_tokens
 
         self.action_head = RDT(
             horizon=rdt_horizon,
@@ -421,7 +549,9 @@ class VA_Server:
             img_pos_emb_config=rdt_img_pos_emb_config,
             max_img_len=self.num_input_frames * img_tokens_per_frame,
             act_pos_emb_config=rdt_act_pos_emb_config,
-            max_act_len=num_rdt_act_frames * rdt_horizon,
+            max_act_len=max_act_len,
+            ee_pos_emb_config=rdt_ee_pos_emb_config,
+            max_ee_len=ee_condition_tokens,
             text_embed_dim=int(getattr(job_config, "text_embed_dim", 4096)),
             dtype=self.dtype,
         )
@@ -437,6 +567,11 @@ class VA_Server:
         self.action_mask[self.used_action_channel_ids] = True
         self.actions_q01 = torch.tensor(self.job_config.norm_stat["q01"], dtype=torch.float32).reshape(-1, 1, 1)
         self.actions_q99 = torch.tensor(self.job_config.norm_stat["q99"], dtype=torch.float32).reshape(-1, 1, 1)
+        state_norm_stat = getattr(self.job_config, "joint_state_norm_stat", None) if self.robotwin_action_space == "joint" else None
+        if state_norm_stat is None:
+            state_norm_stat = self.job_config.norm_stat
+        self.states_q01 = torch.tensor(state_norm_stat["q01"], dtype=torch.float32).reshape(-1)
+        self.states_q99 = torch.tensor(state_norm_stat["q99"], dtype=torch.float32).reshape(-1)
         self.action_norm_method = self.job_config.action_norm_method
         self._text_emb_cache = {}
         self._text_emb_search_files = None
@@ -499,15 +634,28 @@ class VA_Server:
             f"from {dataset_root}"
         )
 
-    def _resolve_text_emb_from_dataset(self, prompt: Optional[str]) -> Optional[torch.Tensor]:
-        return self._encode_prompt_text_emb(prompt)
-
-    def _preload_text_embedder(self) -> None:
+    def _uses_language_condition(self) -> bool:
+        if bool(
+            getattr(
+                self.job_config,
+                "disable_eval_text_embedder",
+                getattr(self.job_config, "disable_text_embedder_eval", True),
+            )
+        ):
+            return False
         cond_cfg = getattr(self.job_config, "rdt_condition_tokens", None)
         uses_vga_language = bool(getattr(self.job_config, "use_language_condition", False))
         uses_rdt_language = bool(getattr(self.job_config, "rdt_use_language_condition", False))
         uses_rdt_language_tokens = bool(getattr(cond_cfg, "use_language_tokens", False)) if cond_cfg is not None else False
-        if not (uses_vga_language or uses_rdt_language or uses_rdt_language_tokens):
+        return uses_vga_language or uses_rdt_language or uses_rdt_language_tokens
+
+    def _resolve_text_emb_from_dataset(self, prompt: Optional[str]) -> Optional[torch.Tensor]:
+        if not self._uses_language_condition():
+            return None
+        return self._encode_prompt_text_emb(prompt)
+
+    def _preload_text_embedder(self) -> None:
+        if not self._uses_language_condition():
             logger.info("Skipping eval text embedder preload because language conditioning is disabled.")
             return
 
@@ -560,6 +708,9 @@ class VA_Server:
             logger.info(f"Eval text embedder preload took {(time.monotonic() - start_time):.2f}s.")
 
     def _encode_prompt_text_emb(self, prompt: Optional[str]) -> Optional[torch.Tensor]:
+        if not self._uses_language_condition():
+            return None
+
         prompt_norm = self._normalize_prompt_text(prompt)
         if not prompt_norm:
             return None
@@ -670,6 +821,14 @@ class VA_Server:
             adapted,
             target_depth=model.aggregator.depth,
         )
+        for key in list(adapted.keys()):
+            if key in model_state and adapted[key].shape != model_state[key].shape:
+                if key.startswith("ee_target_cond_proj."):
+                    logger.warning(
+                        f"Skip loading {key}: checkpoint shape {tuple(adapted[key].shape)} "
+                        f"!= model shape {tuple(model_state[key].shape)}"
+                    )
+                    adapted.pop(key, None)
         return adapted
 
     def _resolve_latest_ckpt(self, root_dir, subdir_name):
@@ -723,7 +882,7 @@ class VA_Server:
         logger.info(f"Loading transformer checkpoint from: {transformer_path}")
         transformer_state = self._load_checkpoint_state(transformer_path)
         transformer_state = self._adapt_transformer_state_for_resolution(self.transformer, transformer_state)
-        logger.info(self.transformer.load_state_dict(transformer_state, strict=True))
+        logger.info(self.transformer.load_state_dict(transformer_state, strict=False))
 
         action_head_path = None
         if getattr(self.job_config, "action_head_resume", False):
@@ -783,12 +942,13 @@ class VA_Server:
         self.exp_save_root = os.path.join(self.save_root, "real", self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
         self.ee_target_log_path = os.path.join(self.exp_save_root, "ee_target_log.jsonl")
+        self.joint_action_log_path = os.path.join(self.exp_save_root, "joint_action_log.jsonl")
         self._last_ee_target_log_record = None
 
     def _get_valid_obs_state(self, current_obs):
         if current_obs is None or current_obs.get("observation.state", None) is None:
             return None
-        state = np.asarray(current_obs["observation.state"], dtype=np.float32).reshape(-1)
+        state = self._coerce_observation_state(current_obs["observation.state"])
         if state.size != len(self.used_action_channel_ids):
             logger.warning(
                 f"Skip eval warm start: expected observation.state with "
@@ -990,8 +1150,58 @@ class VA_Server:
 
         return action_model_input.unsqueeze(0).unsqueeze(-1)  # [B, C, F, N, 1]
 
+    def _coerce_observation_state(self, state):
+        state = np.asarray(state, dtype=np.float32).reshape(-1)
+        if self.robotwin_action_space != "joint":
+            return state
+        if state.size == 14 and len(self.used_action_channel_ids) == 14:
+            left_xyz = state[:3]
+            right_xyz = state[7:10]
+            looks_like_compact_ee = (
+                left_xyz[0] < -0.05
+                and right_xyz[0] > 0.05
+                and left_xyz[1] < -0.05
+                and right_xyz[1] < -0.05
+                and left_xyz[2] > 0.2
+                and right_xyz[2] > 0.2
+                and 0.4 <= abs(float(state[3])) <= 1.1
+                and 0.4 <= abs(float(state[10])) <= 1.1
+            )
+            if looks_like_compact_ee:
+                raise ValueError(
+                    "Joint-mode server received a 14D compact end-effector pose as observation.state. "
+                    "The eval client must send 14D compact joint qpos state from "
+                    "robot.get_*_arm_jointState(), not endpose. Restart the patched launch_client.sh "
+                    "and confirm the client prints `live_robot_qpos_v2`."
+                )
+        if state.size == len(self.used_action_channel_ids):
+            return state
+        if state.size == 16 and len(self.used_action_channel_ids) == 14:
+            left_quat_like = np.linalg.norm(state[3:7])
+            right_quat_like = np.linalg.norm(state[11:15])
+            if (
+                0.8 <= left_quat_like <= 1.2
+                and 0.8 <= right_quat_like <= 1.2
+                and abs(float(state[2])) > 0.2
+                and abs(float(state[10])) > 0.2
+            ):
+                raise ValueError(
+                    "Joint-mode server received a 16D end-effector pose as observation.state. "
+                    "The eval client must send 14D joint qpos state from robot.get_*_arm_jointState(), "
+                    "not endpose. Restart the patched launch_client.sh."
+                )
+            return np.concatenate(
+                [
+                    state[:6],
+                    state[7:8],
+                    state[8:14],
+                    state[15:16],
+                ]
+            ).astype(np.float32)
+        return state
+
     def preprocess_state(self, state):
-        state = torch.from_numpy(np.asarray(state, dtype=np.float32)).flatten()
+        state = torch.from_numpy(self._coerce_observation_state(state)).flatten()
         if state.numel() != len(self.used_action_channel_ids):
             raise ValueError(
                 f"Expected state with {len(self.used_action_channel_ids)} values, got shape {tuple(state.shape)}"
@@ -1001,8 +1211,8 @@ class VA_Server:
         state_aligned = state_padded[self.inverse_used_action_channel_ids]
 
         if self.action_norm_method == "quantiles":
-            q01 = self.actions_q01[:, 0, 0]
-            q99 = self.actions_q99[:, 0, 0]
+            q01 = self.states_q01
+            q99 = self.states_q99
             state_aligned = (state_aligned - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
         else:
             raise NotImplementedError
@@ -1072,6 +1282,8 @@ class VA_Server:
         return state_aligned.unsqueeze(0).unsqueeze(1)  # [B, 1, C]
 
     def preprocess_action_state(self, state, anchor_state=None):
+        if self.robotwin_action_space == "joint":
+            return self.preprocess_state(state)
         if self.action_representation == "absolute":
             return self.preprocess_state(state)
         return self.preprocess_relative_state(state, anchor_state=anchor_state)
@@ -1242,6 +1454,58 @@ class VA_Server:
                 f.write(json.dumps(record) + "\n")
         self._last_ee_target_log_record = record
 
+    def _log_joint_action_chunk(self, current_obs, pred, served_action_14d):
+        if self.robotwin_action_space != "joint":
+            return
+
+        current_state = None
+        raw_state_shape = None
+        if current_obs is not None and current_obs.get("observation.state", None) is not None:
+            raw_state_shape = list(np.asarray(current_obs["observation.state"]).shape)
+            current_state = self._coerce_observation_state(current_obs["observation.state"])
+
+        absolute_action = np.asarray(pred["absolute_action"], dtype=np.float32)
+        relative_action = np.asarray(pred["relative_action"], dtype=np.float32)
+        if absolute_action.ndim == 2:
+            absolute_action = absolute_action[:, :, None]
+        if relative_action.ndim == 2:
+            relative_action = relative_action[:, :, None]
+
+        def stats_payload(value):
+            value = np.asarray(value, dtype=np.float32)
+            return {
+                "min": float(np.min(value)),
+                "max": float(np.max(value)),
+                "mean": float(np.mean(value)),
+                "abs_max": float(np.max(np.abs(value))),
+            }
+
+        first_abs = absolute_action[:, 0, 0]
+        first_rel = relative_action[:, 0, 0]
+        record = {
+            "server_step": int(self.frame_st_id),
+            "action_chunk_exec_steps": int(self.action_chunk_exec_steps),
+            "buffer_remaining": int(len(self.unexecuted_action_buffer)),
+            "actions_served_since_last_prediction": int(self.actions_served_since_last_prediction),
+            "joint_action_representation": self.joint_action_representation,
+            "warm_start_blend": float(self.warm_start_blend),
+            "warm_start_sigma": float(self.warm_start_sigma),
+            "raw_observation_state_shape": raw_state_shape,
+            "current_state": None if current_state is None else current_state.astype(float).tolist(),
+            "first_absolute_action": first_abs.astype(float).tolist(),
+            "first_relative_action": first_rel.astype(float).tolist(),
+            "served_action": np.asarray(served_action_14d, dtype=np.float32).reshape(-1).astype(float).tolist(),
+            "first_delta_from_current": (
+                None if current_state is None else (first_abs - current_state).astype(float).tolist()
+            ),
+            "absolute_chunk_stats": stats_payload(absolute_action),
+            "relative_chunk_stats": stats_payload(relative_action),
+        }
+        log_path = getattr(self, "joint_action_log_path", None)
+        if log_path is not None:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+
     def _action_chunk_to_normalized_tensor(self, absolute_action_chunk, anchor_state=None):
         absolute_action_chunk = np.asarray(absolute_action_chunk, dtype=np.float32)
         if absolute_action_chunk.ndim == 3:
@@ -1303,10 +1567,18 @@ class VA_Server:
         else:
             shifted_chunk[...] = prev_chunk[:, -1:, :]
 
-        future_x0 = self._action_chunk_to_normalized_tensor(
-            shifted_chunk,
-            anchor_state=self.current_anchor_abs_state,
-        ).to(self.device, dtype=dtype)
+        if self.robotwin_action_space == "joint" and self.joint_action_representation == "delta":
+            current_state = self._coerce_observation_state(obs_state)
+            delta_chunk = np.empty_like(shifted_chunk, dtype=np.float32)
+            delta_chunk[:, 0, 0] = shifted_chunk[:, 0, 0] - current_state
+            if shifted_chunk.shape[1] > 1:
+                delta_chunk[:, 1:, :] = shifted_chunk[:, 1:, :] - shifted_chunk[:, :-1, :]
+            future_x0 = self.preprocess_action(delta_chunk).to(self.device, dtype=dtype)
+        else:
+            future_x0 = self._action_chunk_to_normalized_tensor(
+                shifted_chunk,
+                anchor_state=self.current_anchor_abs_state,
+            ).to(self.device, dtype=dtype)
         current_state_x0 = self.preprocess_action_state(
             obs_state,
             anchor_state=self.current_anchor_abs_state,
@@ -1359,6 +1631,8 @@ class VA_Server:
         return action_sample
 
     def _apply_action_smoothing(self, absolute_action, relative_action, anchor_state):
+        if self.robotwin_action_space == "joint":
+            return absolute_action, relative_action
         if self.prev_executed_absolute_action_16d is None or self.action_smoothing_alpha >= 1.0:
             return absolute_action, relative_action
 
@@ -1555,11 +1829,121 @@ class VA_Server:
         ]
         return [max(0, min(length - 1, idx)) for idx in indices]
 
+    def _extract_oracle_ee_target_from_obs(self, current_obs):
+        if not isinstance(current_obs, dict):
+            return None
+        payload = current_obs.get("expert_target", None)
+        if payload is None:
+            return None
+        value = payload.get("value", payload) if isinstance(payload, dict) else payload
+        try:
+            ee_target = np.asarray(value, dtype=np.float32)
+        except Exception:
+            return None
+        if ee_target.shape == (16,):
+            ee_target = ee_target.reshape(2, 8)
+        if ee_target.shape != (2, 8):
+            return None
+        valid = payload.get("valid", None) if isinstance(payload, dict) else None
+        if valid is not None:
+            valid = np.asarray(valid, dtype=bool).reshape(-1)
+        return torch.from_numpy(ee_target).unsqueeze(0)
+
+    def _extract_current_ee_state_from_obs(self, current_obs):
+        if not isinstance(current_obs, dict):
+            return None
+        payload = current_obs.get("ee_state", None)
+        if payload is None:
+            return None
+        try:
+            ee_state = np.asarray(payload, dtype=np.float32)
+        except Exception:
+            return None
+        if ee_state.shape == (16,):
+            ee_state = ee_state.reshape(2, 8)
+        if ee_state.shape != (2, 8):
+            return None
+        return torch.from_numpy(ee_state).unsqueeze(0)
+
+    def _replace_ee_target_condition_with_oracle(self, conds, current_obs):
+        if (
+            self.rdt_ee_target_condition_source != "oracle"
+            or not getattr(self, "use_ee_target_as_rdt_condition", False)
+            or self.model_arch != "vga"
+        ):
+            return conds
+
+        if not isinstance(conds, dict):
+            return conds
+        proj = getattr(self.transformer, "ee_target_cond_proj", None)
+        if proj is None:
+            return conds
+
+        oracle = self._extract_oracle_ee_target_from_obs(current_obs)
+        if oracle is None:
+            if not self._logged_oracle_ee_target_condition:
+                logger.warning(
+                    "Oracle ee-target condition requested, but current observation has no valid expert_target; "
+                    "falling back to predicted ee-target tokens."
+                )
+                self._logged_oracle_ee_target_condition = True
+            return conds
+
+        proj_param = next(proj.parameters())
+        oracle = oracle.to(device=proj_param.device, dtype=proj_param.dtype)
+        token_count = int(getattr(self, "ee_target_condition_num_tokens", 0))
+        if token_count <= 0:
+            return conds
+        current_ee = self._extract_current_ee_state_from_obs(current_obs)
+        if current_ee is None:
+            if not self._logged_oracle_ee_target_condition:
+                logger.warning(
+                    "Oracle EE waypoint conditioning requested, but current observation has no valid ee_state; "
+                    "falling back to predicted ee-target tokens."
+                )
+                self._logged_oracle_ee_target_condition = True
+            return conds
+
+        sequence_len = max(1, int(getattr(self.job_config, "ee_target_sequence_len", 1)))
+        valid = current_obs.get("expert_target", {}).get("valid", None)
+        transitions = build_linear_ee_target_transitions(
+            current_ee.squeeze(0).detach().cpu().numpy(),
+            oracle.squeeze(0).detach().cpu().numpy(),
+            sequence_len,
+            valid=valid,
+        )
+        oracle = torch.from_numpy(transitions).unsqueeze(0).to(device=oracle.device, dtype=oracle.dtype)
+        reference_tokens = conds.get("rdt_ee_c", conds.get("rdt_act_c"))
+        if reference_tokens is None:
+            return conds
+        oracle_tokens = self.transformer._build_ee_target_condition_tokens(
+            ee_target=oracle,
+            current_ee=None,
+            dtype=reference_tokens.dtype,
+        ).to(device=reference_tokens.device)
+        conds = dict(conds)
+        if reference_tokens.ndim == 3:
+            conds["rdt_ee_c"] = oracle_tokens
+        elif reference_tokens.ndim == 4:
+            conds["rdt_ee_c"] = oracle_tokens[:, None].expand(-1, reference_tokens.shape[1], -1, -1)
+        else:
+            raise ValueError(
+                f"RDT condition must be [B,L,D] or [B,N,L,D], got {tuple(reference_tokens.shape)}"
+            )
+
+        if not self._logged_oracle_ee_target_condition:
+            logger.info(
+                "Oracle EE waypoint condition mode is active: using linear current-state-to-next-target "
+                f"transitions with K={sequence_len}."
+            )
+            self._logged_oracle_ee_target_condition = True
+        return conds
+
     def _update_transformer_cache_with_frame(self, frame_tensor=None, current_obs=None, build_conds=True):
         transformer_dtype = next(self.transformer.aggregator.patch_embed.parameters()).dtype
         current_pose = None
         if current_obs is not None and current_obs.get("observation.state", None) is not None:
-            current_pose = np.asarray(current_obs["observation.state"], dtype=np.float32).reshape(-1)
+            current_pose = self._coerce_observation_state(current_obs["observation.state"])
         if self.separate_history_current_obs_views:
             if current_obs is None:
                 raise ValueError("current_obs is required for compact history/current view selection")
@@ -1687,13 +2071,36 @@ class VA_Server:
             "current_image_frame_count": current_image_frame_count,
             "image_time_ids": image_time_ids,
             "image_view_ids": image_view_ids,
+            "ee_target_condition_current": self._extract_current_ee_state_from_obs(current_obs),
         }
+        if not self._logged_image_payload_debug:
+            if self.separate_history_current_obs_views:
+                logger.info(
+                    "Image payload debug: compact mode, "
+                    f"history_cam_keys={self.history_obs_cam_keys}, "
+                    f"current_cam_keys={self.current_obs_cam_keys}, "
+                    f"view_position_cam_keys={self.view_position_cam_keys}, "
+                    f"img_shape={tuple(frame_payload['img'].shape)}, "
+                    f"image_time_ids={image_time_ids.detach().cpu().tolist()}, "
+                    f"image_view_ids={image_view_ids.detach().cpu().tolist()}, "
+                    f"current_image_frame_count={int(current_image_frame_count)}"
+                )
+            else:
+                logger.info(
+                    "Image payload debug: merged mode, "
+                    f"obs_cam_keys={self.job_config.obs_cam_keys}, "
+                    f"multi_view_image_mode={self.multi_view_image_mode}, "
+                    f"img_shape={tuple(frame_payload['img'].shape)}, "
+                    f"current_image_frame_count={int(current_image_frame_count)}"
+                )
+            self._logged_image_payload_debug = True
         with torch.cuda.amp.autocast(enabled=False):
             transformer_out = self.transformer.inference(
                 [frame_payload],
                 past_key_values=None,
             )
         conds = transformer_out.ress
+        conds = self._replace_ee_target_condition_with_oracle(conds, current_obs)
         return conds
 
     def _append_rdt_condition_history(self, conds):
@@ -1713,6 +2120,8 @@ class VA_Server:
             "rdt_img_c": frame_conds["rdt_img_c"].to(self.device, dtype=self.dtype),
             "rdt_act_c": frame_conds["rdt_act_c"].to(self.device, dtype=self.dtype),
         }
+        if frame_conds.get("rdt_ee_c", None) is not None:
+            conds["rdt_ee_c"] = frame_conds["rdt_ee_c"].to(self.device, dtype=self.dtype)
         return conds
 
     @staticmethod
@@ -1752,6 +2161,9 @@ class VA_Server:
             action_head_dtype = next(self.action_head.parameters()).dtype
             conds_img_c = conds["rdt_img_c"].to(self.device, dtype=action_head_dtype)
             conds_act_c = conds["rdt_act_c"].to(self.device, dtype=action_head_dtype)
+            conds_ee_c = conds.get("rdt_ee_c", None)
+            if conds_ee_c is not None:
+                conds_ee_c = conds_ee_c.to(self.device, dtype=action_head_dtype)
             expected_act_cond_len = self.pred_frames * self.tokens_per_frame
             act_cond_len = self._rdt_condition_token_len(conds_act_c)
             if act_cond_len != expected_act_cond_len:
@@ -1759,6 +2171,14 @@ class VA_Server:
                     f"RDT action condition length mismatch: act_c={act_cond_len}, "
                     f"noisy_action={expected_act_cond_len}"
                 )
+            expected_ee_cond_len = int(getattr(self, "ee_target_condition_num_tokens", 0))
+            if expected_ee_cond_len > 0:
+                ee_cond_len = self._rdt_condition_token_len(conds_ee_c)
+                if ee_cond_len != expected_ee_cond_len:
+                    raise ValueError(
+                        f"RDT ee-target condition length mismatch: ee_c={ee_cond_len}, "
+                        f"expected={expected_ee_cond_len}"
+                    )
 
             obs_state = current_obs.get("observation.state", None)
             action_sample, timestep_start_idx = self._build_warm_start_action_sample(
@@ -1826,6 +2246,7 @@ class VA_Server:
                     lang_c=self._get_rdt_lang_condition(dtype=action_head_dtype),
                     img_c=conds_img_c,
                     act_c=conds_act_c,
+                    ee_c=conds_ee_c,
                     state_c=state_c,
                     embed_input=True,
                     decode_output=True,
@@ -1844,6 +2265,46 @@ class VA_Server:
         action_tokens = rearrange(action_sample, "b c f n 1 -> b c (f n) 1 1")
         future_action_tokens = action_tokens[:, :, 1 : self.chunk_size + 1]
         predicted_action = self.postprocess_action(future_action_tokens)
+        if self.robotwin_action_space == "joint":
+            if self.joint_action_representation == "delta":
+                if current_obs.get("observation.state", None) is not None:
+                    base_state = self._coerce_observation_state(current_obs["observation.state"])
+                elif self.current_anchor_abs_state is not None:
+                    base_state = np.asarray(self.current_anchor_abs_state, dtype=np.float32).reshape(-1)
+                else:
+                    base_state = np.zeros(len(self.used_action_channel_ids), dtype=np.float32)
+                delta_action = predicted_action
+                absolute_action = base_state[:, None, None] + np.cumsum(delta_action, axis=1)
+                relative_action = delta_action
+            else:
+                absolute_action = predicted_action
+                if current_obs.get("observation.state", None) is not None:
+                    base_state = self._coerce_observation_state(current_obs["observation.state"])
+                    relative_action = absolute_action - base_state[:, None, None]
+                else:
+                    relative_action = absolute_action.copy()
+            action_reference = (
+                self._coerce_observation_state(current_obs["observation.state"])
+                if current_obs.get("observation.state", None) is not None
+                else np.zeros(len(self.used_action_channel_ids), dtype=np.float32)
+            )
+            absolute_action = np.nan_to_num(
+                absolute_action,
+                nan=0.0,
+                posinf=1e3,
+                neginf=-1e3,
+            ).astype(np.float32)
+            relative_action = np.nan_to_num(
+                relative_action,
+                nan=0.0,
+                posinf=1e3,
+                neginf=-1e3,
+            ).astype(np.float32)
+            return {
+                "relative_action": relative_action,
+                "absolute_action": absolute_action,
+                "action_reference": action_reference,
+            }
         if self.action_representation == "relative":
             relative_action = predicted_action
             if self.current_anchor_abs_state is None:
@@ -1884,6 +2345,14 @@ class VA_Server:
     def infer(self, obs):
         if "planner_feedback" in obs:
             planner_feedback = obs.get("planner_feedback")
+            if (
+                self.robotwin_action_space == "joint"
+                or (
+                    isinstance(planner_feedback, dict)
+                    and str(planner_feedback.get("action_type", "")).startswith("qpos")
+                )
+            ):
+                return {"planner_feedback_logged": False, "planner_feedback_ignored": "joint_action"}
             merged = self._merge_latest_ee_target_log(
                 {
                     "planner_feedback": planner_feedback,
@@ -1923,7 +2392,8 @@ class VA_Server:
                 self.runtime_text_emb = self._encode_prompt_text_emb(prompt)
         elif (self.runtime_text_emb is None) and prompt is not None:
             self.prompt = prompt
-            self.runtime_text_emb = self._encode_prompt_text_emb(prompt)
+            if self._uses_language_condition():
+                self.runtime_text_emb = self._encode_prompt_text_emb(prompt)
 
         if compute_kv_cache:
             key_frames = obs.get("obs", [])
@@ -1998,38 +2468,52 @@ class VA_Server:
             logger.info(
                 f"################# Pop Buffered Action ({len(self.unexecuted_action_buffer)} remaining) #################"
             )
+            pred = None
 
         if len(self.unexecuted_action_buffer) == 0:
             raise RuntimeError("Action buffer is empty after inference; cannot serve an action.")
 
-        action_16d = self.unexecuted_action_buffer.popleft().astype(np.float32)
-        buffered_action_16d = action_16d.copy()
-        action = action_16d.reshape(len(self.used_action_channel_ids), 1, 1)
-        if self.current_anchor_abs_state is None:
+        action_step = self.unexecuted_action_buffer.popleft().astype(np.float32)
+        buffered_action_step = action_step.copy()
+        action = action_step.reshape(len(self.used_action_channel_ids), 1, 1)
+        if self.robotwin_action_space == "joint":
             relative_action = action.copy()
-        else:
-            relative_action = self._absolute_action_chunk_to_relative(
-                action,
-                self.current_anchor_abs_state,
+            if pred is None:
+                pred = {
+                    "absolute_action": action,
+                    "relative_action": relative_action,
+                }
+            self._log_joint_action_chunk(
+                current_obs=current_obs,
+                pred=pred,
+                served_action_14d=action[:, 0, 0],
             )
-        action, relative_action = self._apply_action_smoothing(
-            action,
-            relative_action,
-            anchor_state=self.current_anchor_abs_state,
-        )
-        action = self._apply_ee_target_guard(action, current_obs=current_obs)
-        if self.current_anchor_abs_state is None:
-            relative_action = action.copy()
         else:
-            relative_action = self._absolute_action_chunk_to_relative(
+            if self.current_anchor_abs_state is None:
+                relative_action = action.copy()
+            else:
+                relative_action = self._absolute_action_chunk_to_relative(
+                    action,
+                    self.current_anchor_abs_state,
+                )
+            action, relative_action = self._apply_action_smoothing(
                 action,
-                self.current_anchor_abs_state,
+                relative_action,
+                anchor_state=self.current_anchor_abs_state,
             )
-        self._log_executed_ee_target(
-            current_obs=current_obs,
-            buffered_action_16d=buffered_action_16d,
-            served_action_16d=action[:, 0, 0],
-        )
+            action = self._apply_ee_target_guard(action, current_obs=current_obs)
+            if self.current_anchor_abs_state is None:
+                relative_action = action.copy()
+            else:
+                relative_action = self._absolute_action_chunk_to_relative(
+                    action,
+                    self.current_anchor_abs_state,
+                )
+            self._log_executed_ee_target(
+                current_obs=current_obs,
+                buffered_action_16d=buffered_action_step,
+                served_action_16d=action[:, 0, 0],
+            )
 
         current_action_abs = torch.from_numpy(action[:, 0, 0]).float()
         self.action_history.append(current_action_abs.detach().cpu())
@@ -2058,15 +2542,44 @@ class VA_Server:
             "action_absolute": action,
             "action_relative": relative_action,
             "action_reference": action_reference,
+            "action_type": "qpos" if self.robotwin_action_space == "joint" else "ee",
+            "robotwin_action_space": self.robotwin_action_space,
+            "joint_action_representation": self.joint_action_representation,
         }
 
 
 def run(args):
     config = VA_CONFIGS[args.config_name]
+    checkpoint_dir = Path(args.checkpoint_dir).expanduser().resolve() if args.checkpoint_dir else None
+    eval_config_path = Path(args.eval_config).expanduser().resolve() if args.eval_config else None
+    if eval_config_path is None and checkpoint_dir is not None:
+        eval_config_path = checkpoint_dir / "training_config.json"
+    if eval_config_path is not None:
+        logger.info(f"Loading evaluation config from: {eval_config_path}")
+        config = _load_eval_config(eval_config_path)
+    elif checkpoint_dir is not None:
+        raise FileNotFoundError(f"Missing training_config.json under checkpoint dir: {checkpoint_dir}")
+
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
-        config.ckpt_root = config.save_root
+        if checkpoint_dir is None and eval_config_path is None:
+            config.ckpt_root = config.save_root
         config.save_root = args.save_root
+
+    if checkpoint_dir is not None:
+        transformer_ckpt = checkpoint_dir / "transformer" / "diffusion_pytorch_model.safetensors"
+        action_head_ckpt = checkpoint_dir / "action_head" / "diffusion_pytorch_model.safetensors"
+        if not transformer_ckpt.is_file():
+            raise FileNotFoundError(f"Transformer checkpoint not found: {transformer_ckpt}")
+        if not action_head_ckpt.is_file():
+            raise FileNotFoundError(f"Action-head checkpoint not found: {action_head_ckpt}")
+        config.ckpt_root = str(checkpoint_dir)
+        config.transformer_resume = True
+        config.transformer_resume_from = str(transformer_ckpt)
+        config.transformer_pretrained = None
+        config.action_head_resume = True
+        config.action_head_resume_from = str(action_head_ckpt)
+        config.action_head_pretrained = None
 
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -2086,6 +2599,20 @@ def run(args):
     if args.single_trajectory_repo_id is not None:
         config.single_trajectory_repo_id = args.single_trajectory_repo_id
         config.single_trajectory = True
+    if args.robotwin_action_space is not None:
+        config.robotwin_action_space = args.robotwin_action_space
+    if args.action_representation is not None:
+        config.action_representation = args.action_representation
+    if args.joint_action_representation is not None:
+        config.joint_action_representation = args.joint_action_representation
+    if args.action_chunk_exec_steps is not None:
+        config.action_chunk_exec_steps = int(args.action_chunk_exec_steps)
+    if args.joint_delta_action_chunk_exec_steps is not None:
+        config.joint_delta_action_chunk_exec_steps = int(args.joint_delta_action_chunk_exec_steps)
+    if args.disable_joint_delta_warm_start_eval:
+        config.disable_joint_delta_warm_start_eval = True
+    if args.rdt_ee_target_condition_source is not None:
+        config.rdt_ee_target_condition_source = args.rdt_ee_target_condition_source
 
     model = VA_Server(config)
     run_async_server_mode(model, local_rank, config.host, port)
@@ -2113,6 +2640,18 @@ def main():
         help="save root",
     )
     parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="Checkpoint directory containing training_config.json, transformer/, and action_head/.",
+    )
+    parser.add_argument(
+        "--eval-config",
+        type=str,
+        default=None,
+        help="Evaluation config JSON, usually <checkpoint-dir>/training_config.json.",
+    )
+    parser.add_argument(
         "--single-trajectory",
         action="store_true",
         help="Enable single trajectory (single episode) debug mode during evaluation.",
@@ -2128,6 +2667,50 @@ def main():
         type=str,
         default=None,
         help="Exact RobotWin repo folder name/path for --single-trajectory.",
+    )
+    parser.add_argument(
+        "--robotwin-action-space",
+        choices=["ee", "joint"],
+        default=None,
+        help="Override RobotWin evaluation action space.",
+    )
+    parser.add_argument(
+        "--action-representation",
+        choices=["absolute", "relative"],
+        default=None,
+        help="Override EE action representation when --robotwin-action-space=ee.",
+    )
+    parser.add_argument(
+        "--joint-action-representation",
+        choices=["absolute", "delta"],
+        default=None,
+        help="Override joint action representation when --robotwin-action-space=joint.",
+    )
+    parser.add_argument(
+        "--action-chunk-exec-steps",
+        type=int,
+        default=None,
+        help="Override how many cached actions are served from each predicted chunk.",
+    )
+    parser.add_argument(
+        "--joint-delta-action-chunk-exec-steps",
+        type=int,
+        default=None,
+        help="Cap cached chunk execution steps for joint-delta evaluation.",
+    )
+    parser.add_argument(
+        "--disable-joint-delta-warm-start-eval",
+        action="store_true",
+        help="Disable online warm start for joint-delta evaluation.",
+    )
+    parser.add_argument(
+        "--rdt-ee-target-condition-source",
+        choices=["predicted", "oracle"],
+        default=None,
+        help=(
+            "Evaluation-only debug switch for ee-target RDT tokens. "
+            "`predicted` uses the VGA ee-target head; `oracle` uses env expert_target from the client."
+        ),
     )
     args = parser.parse_args()
     run(args)

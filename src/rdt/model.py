@@ -24,6 +24,8 @@ class RDT(nn.Module):
         max_img_len: int,
         act_pos_emb_config: Optional[List[Tuple]] = None,
         max_act_len: int = 0,
+        ee_pos_emb_config: Optional[List[Tuple]] = None,
+        max_ee_len: int = 0,
         text_embed_dim: Optional[int] = None,
         dtype=torch.bfloat16
     ):
@@ -72,6 +74,12 @@ class RDT(nn.Module):
         self.act_pos_emb = nn.Parameter(torch.zeros(
             1, max_act_len, self.hidden_size)) \
                 if act_pos_emb_config is not None else None
+
+        # Optional: positional embeddings for ee-target condition
+        self.ee_pos_emb_config = ee_pos_emb_config
+        self.ee_pos_emb = nn.Parameter(torch.zeros(
+            1, max_ee_len, self.hidden_size)) \
+                if ee_pos_emb_config is not None else None
         
         # Required: positional embeddings for state
         self.state_pos_emb_config = [
@@ -129,6 +137,14 @@ class RDT(nn.Module):
             self.act_pos_emb.data.copy_(
                 torch.from_numpy(act_pos_embed).float().unsqueeze(0))
 
+        if self.ee_pos_emb is not None:
+            ee_pos_embed = get_multimodal_pos_embed(
+                embed_dim=self.hidden_size,
+                mm_lens=OrderedDict(self.ee_pos_emb_config)
+            ) # (L_ee, D)
+            self.ee_pos_emb.data.copy_(
+                torch.from_numpy(ee_pos_embed).float().unsqueeze(0))
+
         state_pos_emb = get_multimodal_pos_embed(
             embed_dim=self.hidden_size,
             mm_lens=OrderedDict(self.state_pos_emb_config)
@@ -163,10 +179,12 @@ class RDT(nn.Module):
         lang_c_kv: Optional[List[Tuple[torch.Tensor]]] = None, 
         img_c: Optional[torch.Tensor] = None, 
         act_c: Optional[torch.Tensor] = None,
+        ee_c: Optional[torch.Tensor] = None,
         state_c: Optional[torch.Tensor] = None, 
         lang_mask: Optional[torch.Tensor] = None, 
         img_mask: Optional[torch.Tensor] = None,
         act_mask: Optional[torch.Tensor] = None,
+        ee_mask: Optional[torch.Tensor] = None,
         embed_input: bool = False,
         decode_output: bool = False,
     ):
@@ -184,6 +202,8 @@ class RDT(nn.Module):
             img_c: (B, L_img, D), (B, N_img_layers, L_img, D), or None, image condition tokens,
                 dimension D is assumed to be the same as the hidden size.
             act_c: (B, L_act, D), (B, N_act_layers, L_act, D), or None, action condition tokens,
+                dimension D is assumed to be the same as the hidden size.
+            ee_c: (B, L_ee, D), (B, N_ee_layers, L_ee, D), or None, ee-target condition tokens,
                 dimension D is assumed to be the same as the hidden size.
             state_c: (B, 1, D) or None, state condition tokens (fixed length),
             lang_mask: (B, L_lang) or None, language condition mask (True for valid).
@@ -227,6 +247,8 @@ class RDT(nn.Module):
             img_c = img_c + self.img_pos_emb.unsqueeze(1) if img_c.dim() == 4 else img_c + self.img_pos_emb
         if act_c is not None and self.act_pos_emb is not None:
             act_c = act_c + self.act_pos_emb.unsqueeze(1) if act_c.dim() == 4 else act_c + self.act_pos_emb
+        if ee_c is not None and self.ee_pos_emb is not None:
+            ee_c = ee_c + self.ee_pos_emb.unsqueeze(1) if ee_c.dim() == 4 else ee_c + self.ee_pos_emb
         
         conds = []
         masks = []
@@ -239,9 +261,12 @@ class RDT(nn.Module):
         if act_c is not None:
             conds.append(act_c)
             masks.append(act_mask)
+        if ee_c is not None:
+            conds.append(ee_c)
+            masks.append(ee_mask)
 
         if len(conds) == 0:
-            raise ValueError("At least one condition (lang_c/img_c/act_c) must be provided.")
+            raise ValueError("At least one condition (lang_c/img_c/act_c/ee_c) must be provided.")
         
         num_conds = len(conds)
         cond_use_counts = [0 for _ in conds]

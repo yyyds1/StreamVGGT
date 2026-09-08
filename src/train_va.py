@@ -35,6 +35,7 @@ from torch.distributed.checkpoint.state_dict import (
 from safetensors.torch import save_file, load_file
 from safetensors import safe_open
 import json
+import pprint
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -63,7 +64,7 @@ from vga.models.vga import VGA
 from rdt.model import RDT
 from vga.utils.lora import extract_lora_state_dict, load_lora_state_dict
 
-from dataset import MultiLatentLeRobotDataset, MultiVGARobotwinDataset
+from dataset import MultiLatentLeRobotDataset, MultiRobotwinLeRobotDataset, MultiVGARobotwinDataset
 import gc
 
 
@@ -151,6 +152,18 @@ def _atomic_json_dump(payload, dst_path):
     tmp_path = dst_path.with_name(f".{dst_path.name}.tmp")
     with open(tmp_path, "w") as f:
         json.dump(payload, f, indent=2)
+    os.replace(tmp_path, dst_path)
+
+
+def _atomic_python_config_dump(payload, dst_path, config_name="training_cfg"):
+    dst_path = Path(dst_path)
+    tmp_path = dst_path.with_name(f".{dst_path.name}.tmp")
+    with open(tmp_path, "w") as f:
+        f.write("# Auto-generated from the effective training config saved with this checkpoint.\n")
+        f.write("from easydict import EasyDict\n\n")
+        f.write(f"{config_name} = EasyDict(")
+        f.write(pprint.pformat(payload, width=120, sort_dicts=False))
+        f.write(")\n")
     os.replace(tmp_path, dst_path)
 
 
@@ -344,6 +357,13 @@ def get_rdt_depth_from_condition_config(config):
         if len(action_layers) == 0:
             raise ValueError("rdt_condition_tokens.action_layers must be set when layer_mode='selected'")
         depth += len(action_layers)
+    if bool(getattr(cond_cfg, "use_ee_target_tokens", False)):
+        ee_target_layers = get_rdt_condition_layer_indices(config, "ee_target_layers")
+        if len(ee_target_layers) == 0:
+            ee_target_layers = get_rdt_condition_layer_indices(config, "action_layers")
+        if len(ee_target_layers) == 0:
+            raise ValueError("rdt_condition_tokens.ee_target_layers must be set when layer_mode='selected'")
+        depth += len(ee_target_layers)
     if bool(getattr(cond_cfg, "use_language_tokens", False)):
         language_layers = get_rdt_condition_layer_indices(config, "language_layers")
         depth += max(1, len(language_layers))
@@ -412,6 +432,17 @@ class Trainer:
         # Load models
         logger.info("Loading models...")
 
+        self.enable_ee_target_module = bool(getattr(config, "enable_ee_target_module", True))
+        if not self.enable_ee_target_module:
+            config.enable_ee_target_loss = False
+            config.enable_ee_target_head_eval = False
+            config.use_ee_target_as_rdt_condition = False
+            config.ee_target_condition_gt_mix_enabled = False
+            cond_cfg = getattr(config, "rdt_condition_tokens", None)
+            if cond_cfg is not None:
+                cond_cfg.use_ee_target_tokens = False
+                cond_cfg.ee_target_layers = []
+
         self.enable_camera_loss = bool(getattr(config, "enable_camera_loss", False))
         self.enable_depth_loss = bool(getattr(config, "enable_depth_loss", False))
         self.enable_ee_target_loss = bool(getattr(config, "enable_ee_target_loss", False))
@@ -419,9 +450,42 @@ class Trainer:
         self.loss_weight_depth = float(getattr(config, "loss_weight_depth", 0.0))
         self.loss_weight_ee_target = float(getattr(config, "loss_weight_ee_target", 0.0))
         self.loss_weight_ee_target_xyz = float(getattr(config, "loss_weight_ee_target_xyz", 1.0))
-        self.loss_weight_ee_target_quat = float(getattr(config, "loss_weight_ee_target_quat", 1.0))
         self.loss_weight_ee_target_gripper = float(getattr(config, "loss_weight_ee_target_gripper", 0.2))
+        self.ee_target_sequence_len = max(1, int(getattr(config, "ee_target_sequence_len", 1)))
         self.loss_weight_action = float(getattr(config, "loss_weight_action", 1.0))
+        self.ee_target_condition_gt_mix_enabled = bool(
+            getattr(config, "ee_target_condition_gt_mix_enabled", False)
+        )
+        self.ee_target_condition_gt_prob = getattr(config, "ee_target_condition_gt_prob", None)
+        if self.ee_target_condition_gt_prob is not None:
+            self.ee_target_condition_gt_prob = max(
+                0.0,
+                min(1.0, float(self.ee_target_condition_gt_prob)),
+            )
+        self.ee_target_condition_gt_prob_min = float(
+            getattr(config, "ee_target_condition_gt_prob_min", 0.0)
+        )
+        self.ee_target_condition_gt_prob_max = float(
+            getattr(config, "ee_target_condition_gt_prob_max", 0.8)
+        )
+        self.ee_target_condition_loss_low = float(
+            getattr(config, "ee_target_condition_loss_low", 0.005)
+        )
+        self.ee_target_condition_loss_high = float(
+            getattr(config, "ee_target_condition_loss_high", 0.05)
+        )
+        self.ee_target_condition_loss_ema_decay = float(
+            getattr(config, "ee_target_condition_loss_ema_decay", 0.98)
+        )
+        self.ee_target_condition_loss_ema = float(
+            getattr(config, "ee_target_condition_initial_loss", self.ee_target_condition_loss_high)
+        )
+        cond_cfg = getattr(config, "rdt_condition_tokens", None)
+        cond_cfg_dict = dict(cond_cfg or {})
+        self.use_ee_target_as_rdt_condition = bool(
+            getattr(config, "use_ee_target_as_rdt_condition", False)
+            or cond_cfg_dict.get("use_ee_target_tokens", False)
+        )
         self.state_noise_std = float(getattr(config, "state_noise_std", 0.0))
         self.state_noise_clip = bool(getattr(config, "state_noise_clip", True))
         self.rdt_state_token_loss_weight = float(getattr(config, "rdt_state_token_loss_weight", 0.1))
@@ -448,7 +512,10 @@ class Trainer:
         # Bypass geometry heads when corresponding losses are disabled.
         enable_camera_head = self.enable_camera_loss and self.loss_weight_camera > 0.0
         enable_depth_head = self.enable_depth_loss and self.loss_weight_depth > 0.0
-        enable_ee_target_head = self.enable_ee_target_loss and self.loss_weight_ee_target > 0.0
+        enable_ee_target_head = (
+            self.use_ee_target_as_rdt_condition
+            or (self.enable_ee_target_loss and self.loss_weight_ee_target > 0.0)
+        )
         enable_geometry_heads_train = enable_camera_head or enable_depth_head or enable_ee_target_head
 
         # Load and shard transformer with FSDP
@@ -471,6 +538,11 @@ class Trainer:
             ee_target_head_num_heads=int(getattr(config, "ee_target_head_num_heads", 8)),
             ee_target_head_trunk_depth=int(getattr(config, "ee_target_head_trunk_depth", 4)),
             ee_target_head_num_iterations=int(getattr(config, "ee_target_head_num_iterations", 4)),
+            ee_target_head_use_image_tokens=bool(getattr(config, "ee_target_head_use_image_tokens", True)),
+            ee_target_head_image_cross_attn_depth=int(
+                getattr(config, "ee_target_head_image_cross_attn_depth", 1)
+            ),
+            ee_target_sequence_len=self.ee_target_sequence_len,
         )
         self.transformer = VGA(
             rdt_condition_tokens=getattr(config, "rdt_condition_tokens", None),
@@ -493,6 +565,27 @@ class Trainer:
             "rdt_img_pool_size": self.transformer.rdt_img_pool_size,
             "rdt_img_keep_summary_tokens": self.transformer.rdt_img_keep_summary_tokens,
             "rdt_condition_tokens": getattr(config, "rdt_condition_tokens", None),
+            "enable_ee_target_module": self.enable_ee_target_module,
+            "use_ee_target_as_rdt_condition": self.use_ee_target_as_rdt_condition,
+            "enable_ee_target_head": enable_ee_target_head,
+            "ee_target_head_num_heads": int(getattr(config, "ee_target_head_num_heads", 8)),
+            "ee_target_head_trunk_depth": int(getattr(config, "ee_target_head_trunk_depth", 4)),
+            "ee_target_head_num_iterations": int(getattr(config, "ee_target_head_num_iterations", 4)),
+            "ee_target_head_use_image_tokens": bool(getattr(config, "ee_target_head_use_image_tokens", True)),
+            "ee_target_head_image_cross_attn_depth": int(
+                getattr(config, "ee_target_head_image_cross_attn_depth", 1)
+            ),
+            "ee_target_sequence_len": self.ee_target_sequence_len,
+            "ee_target_condition_num_tokens": (
+                4 * self.ee_target_sequence_len if self.use_ee_target_as_rdt_condition else 0
+            ),
+            "ee_target_condition_gt_mix_enabled": self.ee_target_condition_gt_mix_enabled,
+            "ee_target_condition_gt_prob": self.ee_target_condition_gt_prob,
+            "ee_target_condition_gt_prob_min": self.ee_target_condition_gt_prob_min,
+            "ee_target_condition_gt_prob_max": self.ee_target_condition_gt_prob_max,
+            "ee_target_condition_loss_low": self.ee_target_condition_loss_low,
+            "ee_target_condition_loss_high": self.ee_target_condition_loss_high,
+            "ee_target_condition_loss_ema_decay": self.ee_target_condition_loss_ema_decay,
             "use_language_condition": self.use_language_condition,
             "rdt_use_language_condition": self.rdt_use_language_condition,
             "aggregator_depth": self.transformer.aggregator.depth,
@@ -532,8 +625,12 @@ class Trainer:
             ]
         rdt_horizon = self.config.chunk_size + 1
         act_tokens_per_frame = rdt_horizon
+        ee_condition_tokens = 4 * self.ee_target_sequence_len if self.use_ee_target_as_rdt_condition else 0
+        self.ee_target_condition_num_tokens = ee_condition_tokens
         rdt_x_pos_emb_config = [("act", rdt_horizon + self.config.rdt.num_register_tokens)]
         rdt_act_pos_emb_config = [("action", (num_rdt_act_frames, act_tokens_per_frame))]
+        max_act_len = num_rdt_act_frames * act_tokens_per_frame
+        rdt_ee_pos_emb_config = [("ee_target", ee_condition_tokens)] if ee_condition_tokens else None
 
         self.action_head = RDT(
             horizon=rdt_horizon,
@@ -545,7 +642,9 @@ class Trainer:
             img_pos_emb_config=rdt_img_pos_emb_config,
             max_img_len=num_rdt_img_frames * img_tokens_per_frame,
             act_pos_emb_config=rdt_act_pos_emb_config,
-            max_act_len=num_rdt_act_frames * act_tokens_per_frame,
+            max_act_len=max_act_len,
+            ee_pos_emb_config=rdt_ee_pos_emb_config,
+            max_ee_len=ee_condition_tokens,
             text_embed_dim=int(getattr(config, "text_embed_dim", 4096)),
             dtype=self.dtype,
         )
@@ -560,7 +659,9 @@ class Trainer:
             "img_pos_emb_config": rdt_img_pos_emb_config,
             "max_img_len": num_rdt_img_frames * img_tokens_per_frame,
             "act_pos_emb_config": rdt_act_pos_emb_config,
-            "max_act_len": num_rdt_act_frames * act_tokens_per_frame,
+            "max_act_len": max_act_len,
+            "ee_pos_emb_config": rdt_ee_pos_emb_config,
+            "max_ee_len": ee_condition_tokens,
             "text_embed_dim": int(getattr(config, "text_embed_dim", 4096)),
             "dtype": self.dtype,
         })
@@ -633,6 +734,29 @@ class Trainer:
                             f"Resized {pos_key} from {tuple(src_pos.shape)} to {tuple(dst_pos.shape)}"
                         )
 
+            for key in list(adapted.keys()):
+                if key in model_state and adapted[key].shape != model_state[key].shape:
+                    if key.startswith("ee_target_cond_proj."):
+                        logger.warning(
+                            f"Skip loading {key}: checkpoint shape {tuple(adapted[key].shape)} "
+                            f"!= model shape {tuple(model_state[key].shape)}"
+                        )
+                        adapted.pop(key, None)
+
+            return adapted
+
+        def _adapt_action_head_state_for_condition_shape(model: torch.nn.Module, state: dict):
+            if not isinstance(state, dict):
+                return state
+            adapted = dict(state)
+            model_state = model.state_dict()
+            for key in ("act_pos_emb", "ee_pos_emb"):
+                if key in adapted and key in model_state and adapted[key].shape != model_state[key].shape:
+                    logger.warning(
+                        f"Skip loading {key}: checkpoint shape {tuple(adapted[key].shape)} "
+                        f"!= model shape {tuple(model_state[key].shape)}"
+                    )
+                    adapted.pop(key, None)
             return adapted
 
         streamvggt_pretrained = getattr(config, "streamvggt_pretrained", None)
@@ -708,7 +832,7 @@ class Trainer:
 
             self._resume_checkpoint_dir = self._transformer_resume_checkpoint_dir
             lora_state_path = self._transformer_resume_checkpoint_dir / "transformer" / "lora_weights.safetensors"
-            if lora_state_path.exists():
+            if self.use_lora and lora_state_path.exists():
                 logger.info(f"Loading LoRA delta from {lora_state_path}")
                 lora_state = _load_checkpoint_state(lora_state_path)
                 logger.info(load_lora_state_dict(self.transformer, lora_state, strict=False))
@@ -750,6 +874,7 @@ class Trainer:
                 f"Action head init method: resume | checkpoint={action_head_resume_from}"
             )
             action_head_state = _load_checkpoint_state(action_head_resume_from)
+            action_head_state = _adapt_action_head_state_for_condition_shape(self.action_head, action_head_state)
             logger.info(self.action_head.load_state_dict(action_head_state, strict=False))
             if self._resume_checkpoint_dir is None:
                 self._resume_checkpoint_dir = self._action_head_resume_checkpoint_dir
@@ -798,6 +923,7 @@ class Trainer:
                     or name.startswith("aggregator.action_embedder.")
                     or name.startswith("text_token_proj.")
                     or name.startswith("ee_target_head.")
+                    or name.startswith("ee_target_cond_proj.")
                 )
                 param.requires_grad = should_train
             else:
@@ -839,6 +965,8 @@ class Trainer:
         dataset_type = str(getattr(config, "dataset_type", "robotwin")).lower()
         if dataset_type == "vga_robotwin":
             train_dataset = MultiVGARobotwinDataset(config=config)
+        elif dataset_type == "robotwin_lerobot":
+            train_dataset = MultiRobotwinLeRobotDataset(config=config)
         else:
             train_dataset = MultiLatentLeRobotDataset(config=config)
         train_sampler = DistributedSampler(
@@ -1152,6 +1280,8 @@ class Trainer:
             'chunk_size': rdt_horizon,
             'future_action_chunk_size': chunk_size,
         }
+        if 'ee_state' in batch_dict:
+            input_dict['ee_target_condition_current'] = batch_dict['ee_state']
         episode_initial_state = actions[:, :, 0, 0, 0]  # [B, C_action], first token of current sequence
         input_dict['episode_initial_state_c'] = episode_initial_state.unsqueeze(1)  # [B, 1, C_action]
         if 'state' in batch_dict:
@@ -1406,36 +1536,87 @@ class Trainer:
             "added_ee_target": zero,
         }
 
+    def _get_ee_transition_target_and_valid(self, batch, device, dtype):
+        target = batch.get("ee_target_sequence", batch.get("ee_target", None))
+        if target is None:
+            return None, None
+        target = target.to(device=device, dtype=dtype)
+        if target.ndim == 3:
+            target = target[:, :, None]
+        elif target.ndim != 4:
+            raise ValueError(
+                f"ee target supervision must be [B,2,8] or [B,2,K,8], got {tuple(target.shape)}"
+            )
+        if target.shape[1] != 2 or target.shape[-1] != 8:
+            raise ValueError(
+                f"ee target supervision must have left/right arms and 8 channels, got {tuple(target.shape)}"
+            )
+
+        current_ee = batch.get("ee_state", None)
+        if current_ee is None:
+            current_ee = torch.zeros_like(target)
+        else:
+            current_ee = current_ee.to(device=device, dtype=dtype)
+            if current_ee.ndim == 3:
+                current_ee = current_ee[:, :, None].expand(-1, -1, target.shape[2], -1)
+            elif current_ee.ndim != 4:
+                raise ValueError(f"ee_state must be [B,2,8] or [B,2,K,8], got {tuple(current_ee.shape)}")
+            if current_ee.shape[2] == 1 and target.shape[2] != 1:
+                current_ee = current_ee.expand(-1, -1, target.shape[2], -1)
+            if current_ee.shape != target.shape:
+                raise ValueError(
+                    f"ee_state shape mismatch: got {tuple(current_ee.shape)}, expected {tuple(target.shape)}"
+                )
+        target_transition = torch.cat(
+            [
+                target[..., :3] - current_ee[..., :3],
+                target[..., 7:8] - current_ee[..., 7:8],
+            ],
+            dim=-1,
+        )
+
+        valid = batch.get("ee_target_sequence_valid", batch.get("ee_target_valid", None))
+        if valid is None:
+            valid = torch.ones(target.shape[:3], device=device, dtype=torch.bool)
+        else:
+            valid = valid.to(device=device, dtype=torch.bool)
+            if valid.ndim == 1:
+                valid = valid[:, None, None].expand(-1, 2, target.shape[2])
+            elif valid.ndim == 2:
+                valid = valid[:, :, None].expand(-1, -1, target.shape[2])
+            elif valid.ndim != 3:
+                raise ValueError(f"ee target valid mask must be [B], [B,2], or [B,2,K], got {tuple(valid.shape)}")
+            if valid.shape != target.shape[:3]:
+                raise ValueError(
+                    f"ee target valid mask shape mismatch: got {tuple(valid.shape)}, "
+                    f"expected {tuple(target.shape[:3])}"
+                )
+        return target_transition, valid
+
     def _compute_ee_target_loss_dict(self, batch, model_output):
         geometry = getattr(model_output, "geometry", None)
         if not isinstance(geometry, dict):
             return self._zero_ee_target_loss_dict()
 
         pred = geometry.get("ee_target", None)
-        target = batch.get("ee_target", None)
-        valid = batch.get("ee_target_valid", None)
-        if pred is None or target is None:
+        if pred is None:
             return self._zero_ee_target_loss_dict(device=pred.device if pred is not None else self.device)
 
         zero = torch.zeros((), device=pred.device, dtype=pred.dtype)
-        target = target.to(device=pred.device, dtype=pred.dtype)
-        if target.ndim == 2:
-            target = target.unsqueeze(0)
-        if valid is None:
-            valid = torch.ones(target.shape[:2], device=pred.device, dtype=pred.dtype)
-        else:
-            valid = valid.to(device=pred.device, dtype=pred.dtype)
-            if valid.ndim == 1:
-                valid = valid.unsqueeze(0)
+        if pred.ndim == 3:
+            pred = pred[:, :, None]
+        elif pred.ndim != 4:
+            raise ValueError(f"predicted ee_target must be [B,2,4] or [B,2,K,4], got {tuple(pred.shape)}")
+        target, valid = self._get_ee_transition_target_and_valid(batch, pred.device, pred.dtype)
+        if target is None:
+            return self._zero_ee_target_loss_dict(device=pred.device)
+        if target.shape != pred.shape:
+            raise ValueError(f"ee target prediction shape mismatch: pred={tuple(pred.shape)}, target={tuple(target.shape)}")
+        valid = valid.to(device=pred.device, dtype=pred.dtype)
 
         xyz_loss = F.smooth_l1_loss(pred[..., :3], target[..., :3], reduction="none").mean(dim=-1)
-        quat_loss = F.smooth_l1_loss(pred[..., 3:7], target[..., 3:7], reduction="none").mean(dim=-1)
-        gripper_loss = F.smooth_l1_loss(pred[..., 7:], target[..., 7:], reduction="none").mean(dim=-1)
-        per_arm = (
-            self.loss_weight_ee_target_xyz * xyz_loss
-            + self.loss_weight_ee_target_quat * quat_loss
-            + self.loss_weight_ee_target_gripper * gripper_loss
-        )
+        gripper_loss = F.smooth_l1_loss(pred[..., 3:], target[..., 3:], reduction="none").mean(dim=-1)
+        per_arm = self.loss_weight_ee_target_xyz * xyz_loss + self.loss_weight_ee_target_gripper * gripper_loss
         ee_target_loss = self._masked_loss_mean(per_arm, valid)
         left_ee_target_loss = self._masked_loss_mean(per_arm[:, 0], valid[:, 0]) if per_arm.shape[1] > 0 else zero
         right_ee_target_loss = self._masked_loss_mean(per_arm[:, 1], valid[:, 1]) if per_arm.shape[1] > 1 else zero
@@ -1448,6 +1629,58 @@ class Trainer:
 
     def _compute_ee_target_loss(self, batch, model_output):
         return self._compute_ee_target_loss_dict(batch, model_output)["ee_target"]
+
+    def _current_ee_target_gt_condition_prob(self):
+        if self.ee_target_condition_gt_prob is not None:
+            if not self.use_ee_target_as_rdt_condition:
+                return 0.0
+            return float(self.ee_target_condition_gt_prob)
+        if (
+            not self.ee_target_condition_gt_mix_enabled
+            or not self.use_ee_target_as_rdt_condition
+            or self.ee_target_condition_gt_prob_max <= 0.0
+        ):
+            return 0.0
+        low = self.ee_target_condition_loss_low
+        high = self.ee_target_condition_loss_high
+        if high <= low:
+            high = low + 1e-8
+        ratio = (float(self.ee_target_condition_loss_ema) - low) / (high - low)
+        ratio = max(0.0, min(1.0, ratio))
+        p_min = max(0.0, min(1.0, self.ee_target_condition_gt_prob_min))
+        p_max = max(0.0, min(1.0, self.ee_target_condition_gt_prob_max))
+        if p_max < p_min:
+            p_min, p_max = p_max, p_min
+        return p_min + (p_max - p_min) * ratio
+
+    def _update_ee_target_loss_ema(self, ee_target_loss):
+        if ee_target_loss is None:
+            return
+        loss_value = float(ee_target_loss.detach().float().cpu().item())
+        if not math.isfinite(loss_value):
+            return
+        decay = max(0.0, min(0.9999, self.ee_target_condition_loss_ema_decay))
+        self.ee_target_condition_loss_ema = (
+            decay * float(self.ee_target_condition_loss_ema)
+            + (1.0 - decay) * loss_value
+        )
+
+    def _attach_ee_target_condition_override(self, input_dict, batch, gt_prob):
+        if gt_prob <= 0.0 or not self.use_ee_target_as_rdt_condition:
+            return 0.0
+        ee_target, valid_mask = self._get_ee_transition_target_and_valid(
+            batch,
+            self.device,
+            torch.float32,
+        )
+        if ee_target is None:
+            return 0.0
+
+        sample_mask = torch.rand((ee_target.shape[0],), device=ee_target.device) < float(gt_prob)
+        override_mask = sample_mask[:, None, None].expand_as(valid_mask) & valid_mask
+        input_dict["ee_target_condition_override"] = ee_target
+        input_dict["ee_target_condition_override_mask"] = override_mask
+        return override_mask.flatten(1).any(dim=1).float().mean().detach().cpu().item()
 
     def train_epoch(self):
         self.transformer.train()
@@ -1473,11 +1706,19 @@ class Trainer:
         accumulated_left_ee_target_losses = []
         accumulated_right_ee_target_losses = []
         accumulated_added_ee_target_losses = []
+        accumulated_ee_target_gt_probs = []
+        accumulated_ee_target_gt_rates = []
 
         for batch_idx, batch in enumerate(self.train_loader):
             batch = self.convert_input_format(batch)
 
             input_dict = self._prepare_input_dict(batch)
+            ee_target_gt_prob = self._current_ee_target_gt_condition_prob()
+            ee_target_gt_rate = self._attach_ee_target_condition_override(
+                input_dict,
+                batch,
+                ee_target_gt_prob,
+            )
 
             should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader)
             
@@ -1488,16 +1729,32 @@ class Trainer:
 
             output = self.transformer(input_dict)
             rdt_conds = output.ress
+            if self.model_arch == "vga" and self.enable_ee_target_loss:
+                ee_target_loss_dict = self._compute_ee_target_loss_dict(batch, output)
+            else:
+                ee_target_loss_dict = self._zero_ee_target_loss_dict()
+            ee_target_loss = ee_target_loss_dict["ee_target"]
+            self._update_ee_target_loss_ema(ee_target_loss)
 
             action_chunk = input_dict['pred_action_chunk_dict']['noisy_latents']  # [B, C_action, chunk_size]
             action_chunk = action_chunk.permute(0, 2, 1) # [B, chunk_size, C_action]
             timesteps = input_dict['pred_action_chunk_dict']['timesteps']
             rdt_act_cond_len = self._rdt_condition_token_len(rdt_conds['rdt_act_c'])
-            if rdt_act_cond_len != action_chunk.shape[1]:
+            expected_rdt_act_cond_len = action_chunk.shape[1]
+            if rdt_act_cond_len != expected_rdt_act_cond_len:
                 raise ValueError(
                     f"RDT action condition length mismatch: act_c={rdt_act_cond_len}, "
-                    f"noisy_action={action_chunk.shape[1]}"
+                    f"expected={expected_rdt_act_cond_len}, noisy_action={action_chunk.shape[1]}"
                 )
+            rdt_ee_c = rdt_conds.get("rdt_ee_c", None)
+            expected_rdt_ee_cond_len = int(getattr(self, "ee_target_condition_num_tokens", 0))
+            if expected_rdt_ee_cond_len > 0:
+                rdt_ee_cond_len = self._rdt_condition_token_len(rdt_ee_c)
+                if rdt_ee_cond_len != expected_rdt_ee_cond_len:
+                    raise ValueError(
+                        f"RDT ee-target condition length mismatch: ee_c={rdt_ee_cond_len}, "
+                        f"expected={expected_rdt_ee_cond_len}"
+                    )
             if self.state_condition_mode == "null":
                 state_c = torch.zeros(
                     (action_chunk.shape[0], 1, self.transformer.action_dim),
@@ -1528,6 +1785,7 @@ class Trainer:
                 lang_c=self._get_rdt_lang_condition(input_dict, dtype=action_chunk.dtype),
                 img_c=rdt_conds['rdt_img_c'],
                 act_c=self._maybe_add_noise_to_action_condition(rdt_conds['rdt_act_c']),
+                ee_c=rdt_ee_c,
                 state_c=state_c,
                 embed_input=True,
                 decode_output=True,
@@ -1541,12 +1799,6 @@ class Trainer:
                 else:
                     zero = torch.zeros((), device=self.device, dtype=torch.float32)
                     camera_loss, depth_loss = zero, zero
-
-                if self.enable_ee_target_loss:
-                    ee_target_loss_dict = self._compute_ee_target_loss_dict(batch, output)
-                else:
-                    ee_target_loss_dict = self._zero_ee_target_loss_dict()
-                ee_target_loss = ee_target_loss_dict["ee_target"]
 
                 loss = (
                     self.loss_weight_action * action_loss
@@ -1565,6 +1817,20 @@ class Trainer:
                 )
                 accumulated_added_ee_target_losses.append(
                     (ee_target_loss_dict["added_ee_target"] / self.gradient_accumulation_steps).detach()
+                )
+                accumulated_ee_target_gt_probs.append(
+                    torch.tensor(
+                        ee_target_gt_prob / self.gradient_accumulation_steps,
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+                )
+                accumulated_ee_target_gt_rates.append(
+                    torch.tensor(
+                        ee_target_gt_rate / self.gradient_accumulation_steps,
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
                 )
             else:
                 loss = action_loss
@@ -1638,11 +1904,19 @@ class Trainer:
                     added_ee_target_loss_show = dist_mean(
                         torch.stack(accumulated_added_ee_target_losses).sum()
                     ).detach().cpu().item()
+                    ee_target_gt_prob_show = dist_mean(
+                        torch.stack(accumulated_ee_target_gt_probs).sum()
+                    ).detach().cpu().item() if len(accumulated_ee_target_gt_probs) > 0 else 0.0
+                    ee_target_gt_rate_show = dist_mean(
+                        torch.stack(accumulated_ee_target_gt_rates).sum()
+                    ).detach().cpu().item() if len(accumulated_ee_target_gt_rates) > 0 else 0.0
                 else:
                     ee_target_loss_show = 0.0
                     left_ee_target_loss_show = 0.0
                     right_ee_target_loss_show = 0.0
                     added_ee_target_loss_show = 0.0
+                    ee_target_gt_prob_show = 0.0
+                    ee_target_gt_rate_show = 0.0
 
                 # Clear accumulated losses
                 accumulated_latent_losses = []
@@ -1656,6 +1930,8 @@ class Trainer:
                 accumulated_left_ee_target_losses = []
                 accumulated_right_ee_target_losses = []
                 accumulated_added_ee_target_losses = []
+                accumulated_ee_target_gt_probs = []
+                accumulated_ee_target_gt_rates = []
 
                 torch.cuda.synchronize()
                 if self.step % self.config.gc_interval == 0:
@@ -1674,6 +1950,8 @@ class Trainer:
                         'camera_loss': f'{camera_loss_show:.4f}',
                         'depth_loss': f'{depth_loss_show:.4f}',
                         'ee_target_loss': f'{ee_target_loss_show:.4f}',
+                        'ee_gt_prob': f'{ee_target_gt_prob_show:.3f}',
+                        'ee_gt_rate': f'{ee_target_gt_rate_show:.3f}',
                         'left_ee_target_loss': f'{left_ee_target_loss_show:.4f}',
                         'right_ee_target_loss': f'{right_ee_target_loss_show:.4f}',
                         'added_ee_target_loss': f'{added_ee_target_loss_show:.4f}',
@@ -1693,6 +1971,9 @@ class Trainer:
                         'loss_metrics/global_avg_left_ee_target_loss': left_ee_target_loss_show,
                         'loss_metrics/global_avg_right_ee_target_loss': right_ee_target_loss_show,
                         'loss_metrics/global_avg_ee_target_loss': ee_target_loss_show,
+                        'ee_target_condition/gt_prob': ee_target_gt_prob_show,
+                        'ee_target_condition/gt_rate': ee_target_gt_rate_show,
+                        'ee_target_condition/loss_ema': float(self.ee_target_condition_loss_ema),
                         'grad_norm': total_norm.item(),
                         'lr': lr,
                     }, step=self.step)
@@ -1776,23 +2057,27 @@ class Trainer:
                 action_head_config_dict.pop('_name_or_path', None)
                 _atomic_json_dump(action_head_config_dict, action_head_config_file)
 
-                lora_state_dict = {
-                    key: value.detach().to(dtype=torch.bfloat16, device="cpu").contiguous().clone()
-                    for key, value in state_dict.items()
-                    if "lora_" in key
-                    or key.endswith("action_query_tokens")
-                    or key.endswith("ee_target_token")
-                    or "ee_target_head" in key
-                }
-                if lora_state_dict:
-                    lora_file = transformer_dir / "lora_weights.safetensors"
-                    logger.info(f"Saving LoRA delta to {lora_file}")
-                    _atomic_safetensors_save(lora_state_dict, lora_file)
+                if self.use_lora:
+                    lora_state_dict = {
+                        key: value.detach().to(dtype=torch.bfloat16, device="cpu").contiguous().clone()
+                        for key, value in state_dict.items()
+                        if "lora_" in key
+                        or key.endswith("action_query_tokens")
+                        or key.endswith("ee_target_token")
+                        or "ee_target_head" in key
+                    }
+                    if lora_state_dict:
+                        lora_file = transformer_dir / "lora_weights.safetensors"
+                        logger.info(f"Saving LoRA delta to {lora_file}")
+                        _atomic_safetensors_save(lora_state_dict, lora_file)
 
                 plain_training_config = _to_plain_config(dict(vars(self.config)))
                 training_config_path = checkpoint_tmp_dir / "training_config.json"
                 logger.info(f"Saving training config to {training_config_path}")
                 _atomic_json_dump(plain_training_config, training_config_path)
+                training_config_py_path = checkpoint_tmp_dir / "training_config.py"
+                logger.info(f"Saving importable training config to {training_config_py_path}")
+                _atomic_python_config_dump(plain_training_config, training_config_py_path)
 
                 training_state_path = checkpoint_tmp_dir / "training_state.pt"
                 logger.info(f"Saving training state to {training_state_path}")
@@ -1920,6 +2205,66 @@ def run(args):
         config.enable_wandb = args.metric_logger == "wandb"
     if args.tensorboard_log_dir is not None:
         config.tensorboard_log_dir = args.tensorboard_log_dir
+    if args.dataset_type is not None:
+        config.dataset_type = args.dataset_type
+    if args.dataset_path is not None:
+        config.dataset_path = args.dataset_path
+    if args.robotwin_lerobot_epoch_unit is not None:
+        config.robotwin_lerobot_epoch_unit = args.robotwin_lerobot_epoch_unit
+    if args.robotwin_lerobot_windows_per_episode_stride is not None:
+        config.robotwin_lerobot_windows_per_episode_stride = args.robotwin_lerobot_windows_per_episode_stride
+    if args.robotwin_lerobot_max_windows_per_episode is not None:
+        config.robotwin_lerobot_max_windows_per_episode = args.robotwin_lerobot_max_windows_per_episode
+    if args.robotwin_action_space is not None:
+        config.robotwin_action_space = args.robotwin_action_space
+    if args.action_representation is not None:
+        config.action_representation = args.action_representation
+    if args.joint_action_representation is not None:
+        config.joint_action_representation = args.joint_action_representation
+    if args.use_expert_marked_rgb is not None:
+        config.use_expert_marked_rgb = bool(args.use_expert_marked_rgb)
+    if args.resume or args.resume_checkpoint_dir is not None:
+        config.transformer_resume = True
+        config.action_head_resume = True
+        if args.resume_checkpoint_dir is not None:
+            resume_checkpoint_dir = Path(args.resume_checkpoint_dir).expanduser().resolve()
+            config.transformer_resume_from = str(
+                resume_checkpoint_dir / "transformer" / "diffusion_pytorch_model.safetensors"
+            )
+            config.action_head_resume_from = str(
+                resume_checkpoint_dir / "action_head" / "diffusion_pytorch_model.safetensors"
+            )
+        else:
+            config.transformer_resume_from = None
+            config.action_head_resume_from = None
+    norm_stats_by_action_mode = getattr(config, "norm_stats_by_action_mode", None)
+    if norm_stats_by_action_mode:
+        if getattr(config, "robotwin_action_space", "ee") == "joint":
+            norm_key = f"joint_{getattr(config, 'joint_action_representation', 'absolute')}"
+            if norm_key not in norm_stats_by_action_mode:
+                raise KeyError(f"Missing RobotWin normalization stats for `{norm_key}`")
+            config.joint_norm_stat = norm_stats_by_action_mode[norm_key]
+            config.norm_stat = norm_stats_by_action_mode[norm_key]
+            if "joint_absolute" not in norm_stats_by_action_mode:
+                raise KeyError("Missing RobotWin normalization stats for `joint_absolute`")
+            config.joint_state_norm_stat = norm_stats_by_action_mode["joint_absolute"]
+        else:
+            norm_key = f"ee_{getattr(config, 'action_representation', 'absolute')}"
+            if norm_key not in norm_stats_by_action_mode:
+                raise KeyError(f"Missing RobotWin normalization stats for `{norm_key}`")
+            config.norm_stat = norm_stats_by_action_mode[norm_key]
+    if getattr(config, "robotwin_action_space", "ee") == "joint":
+        config.action_dim = 14
+        config.rdt.action_dim = 14
+        config.used_action_channel_ids = list(range(14))
+        config.inverse_used_action_channel_ids = list(range(14))
+        if not getattr(config, "joint_norm_stat", None):
+            config.joint_norm_stat = {
+                "q01": [-1.0] * 14,
+                "q99": [1.0] * 14,
+            }
+        if not getattr(config, "joint_state_norm_stat", None):
+            config.joint_state_norm_stat = getattr(config, "joint_norm_stat", None)
 
     if args.single_task is not None:
         config.single_task = args.single_task
@@ -1978,6 +2323,75 @@ def main():
         type=str,
         default=None,
         help="TensorBoard event directory. Defaults to <run_root>/tensorboard.",
+    )
+    parser.add_argument(
+        "--dataset-type",
+        type=str,
+        default=None,
+        help="Dataset loader type override, e.g. robotwin_lerobot or vga_robotwin.",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Dataset root path override.",
+    )
+    parser.add_argument(
+        "--robotwin-lerobot-epoch-unit",
+        type=str,
+        choices=["window", "episode", "episode_strided"],
+        default=None,
+        help="For robotwin_lerobot: use one dataset element per window, episode, or capped episode-strided sampling.",
+    )
+    parser.add_argument(
+        "--robotwin-lerobot-windows-per-episode-stride",
+        type=int,
+        default=None,
+        help="For episode_strided mode: add one epoch element per this many valid windows.",
+    )
+    parser.add_argument(
+        "--robotwin-lerobot-max-windows-per-episode",
+        type=int,
+        default=None,
+        help="For episode_strided mode: cap epoch elements per episode.",
+    )
+    parser.add_argument(
+        "--robotwin-action-space",
+        type=str,
+        choices=["ee", "joint"],
+        default=None,
+        help="Action space for RobotWin data: end-effector pose or joint pose.",
+    )
+    parser.add_argument(
+        "--action-representation",
+        type=str,
+        choices=["absolute", "relative"],
+        default=None,
+        help="For --robotwin-action-space ee: predict absolute EE pose or history-anchor-relative EE pose.",
+    )
+    parser.add_argument(
+        "--joint-action-representation",
+        type=str,
+        choices=["absolute", "delta"],
+        default=None,
+        help="For --robotwin-action-space joint: predict absolute joint pose or per-step joint delta.",
+    )
+    parser.add_argument(
+        "--use-expert-marked-rgb",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use RoboTwin rgb_expert_marked videos instead of raw RGB when available.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume transformer, action head, optimizer, scheduler, and step from the latest complete checkpoint under save_root.",
+    )
+    parser.add_argument(
+        "--resume-checkpoint-dir",
+        type=str,
+        default=None,
+        help="Explicit checkpoint_step_* directory to resume from. Implies --resume when set.",
     )
     parser.add_argument(
         "--single-task",

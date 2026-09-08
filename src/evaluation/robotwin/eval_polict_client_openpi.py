@@ -7,7 +7,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/home/yds/code/robotwin-labeled")
+robowin_root = Path("/inspire/hdd/global_user/yangdongshen-253108120197/code/robotwin-labeled")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -44,6 +44,8 @@ import json
 from pathlib import Path
 
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
+from envs.utils.expert_marker import draw_expert_target_sequence_on_rgb
+from evaluation.ee_target_waypoints import build_linear_ee_target_transitions
 
 
 DATASET_ROOT = Path("/home/yds/code/StreamVGGT/dataset")
@@ -389,6 +391,7 @@ def get_embodiment_config(robot_file):
 
 
 def main(usr_args):
+    print("[eval_client] StreamVGGT joint-state patch: live_robot_qpos_v2")
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     task_name = usr_args["task_name"]
     task_config = usr_args["task_config"]
@@ -417,6 +420,27 @@ def main(usr_args):
         args["single_trajectory_episode_index"] = None
     args["single_trajectory_repo_id"] = usr_args.get("single_trajectory_repo_id", None)
     args["use_expert_marked_rgb"] = bool(usr_args.get("use_expert_marked_rgb", True))
+    args["live_waypoint_labels"] = bool(usr_args.get("live_waypoint_labels", True))
+    args["ee_target_sequence_len"] = int(usr_args.get("ee_target_sequence_len", 6))
+    checkpoint_dir = usr_args.get("checkpoint_dir", None)
+    if checkpoint_dir is not None:
+        training_config_path = Path(checkpoint_dir) / "training_config.json"
+        if training_config_path.is_file():
+            try:
+                training_config = json.loads(training_config_path.read_text(encoding="utf-8"))
+                if "norm_stats_by_action_mode" in training_config:
+                    args["norm_stats_by_action_mode"] = training_config["norm_stats_by_action_mode"]
+                for key in (
+                    "robotwin_action_space",
+                    "action_representation",
+                    "joint_action_representation",
+                    "use_expert_marked_rgb",
+                    "ee_target_sequence_len",
+                ):
+                    if key in training_config and key not in args:
+                        args[key] = training_config[key]
+            except Exception as exc:
+                print(f"[eval] warning: failed to load checkpoint training_config.json: {exc}")
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -545,34 +569,375 @@ def format_eef_state(observation):
     )
 
 
-def _get_camera_rgb(observation, camera_name, use_expert_marked_rgb=True):
-    camera_obs = observation["observation"][camera_name]
+def format_joint_state(observation):
+    joint_action = observation["joint_action"]
+    if "vector" in joint_action:
+        joint_state = np.asarray(joint_action["vector"], dtype=np.float32).reshape(-1)
+        if joint_state.size == 16:
+            return np.concatenate(
+                [
+                    joint_state[:6],
+                    joint_state[7:8],
+                    joint_state[8:14],
+                    joint_state[15:16],
+                ]
+            ).astype(np.float32)
+        return joint_state
+    left_arm = np.asarray(joint_action["left_arm"], dtype=np.float32).reshape(-1)
+    right_arm = np.asarray(joint_action["right_arm"], dtype=np.float32).reshape(-1)
+    if left_arm.size == 7 and right_arm.size == 7:
+        left_arm = left_arm[:6]
+        right_arm = right_arm[:6]
+    return np.concatenate(
+        [
+            left_arm,
+            np.asarray([joint_action["left_gripper"]], dtype=np.float32),
+            right_arm,
+            np.asarray([joint_action["right_gripper"]], dtype=np.float32),
+        ]
+    ).astype(np.float32)
+
+
+def format_robot_joint_state(task_env):
+    robot = getattr(task_env, "robot", None)
+    if robot is None:
+        raise RuntimeError("TASK_ENV has no robot; cannot read live joint state.")
+    joint_state = np.asarray(
+        robot.get_left_arm_jointState() + robot.get_right_arm_jointState(),
+        dtype=np.float32,
+    ).reshape(-1)
+    if joint_state.size == 16:
+        return np.concatenate(
+            [
+                joint_state[:6],
+                joint_state[7:8],
+                joint_state[8:14],
+                joint_state[15:16],
+            ]
+        ).astype(np.float32)
+    return joint_state
+
+
+def _compact_ee_state_14(observation):
+    try:
+        eef_state = format_eef_state(observation).reshape(-1)
+    except Exception:
+        return None
+    if eef_state.size == 16:
+        return np.concatenate(
+            [
+                eef_state[:6],
+                eef_state[7:8],
+                eef_state[8:14],
+                eef_state[15:16],
+            ]
+        ).astype(np.float32)
+    return None
+
+
+def expand_compact_joint_action_for_robotwin(action, observation):
+    action = np.asarray(action, dtype=np.float32).reshape(-1)
+    joint_action = observation.get("joint_action", {})
+    if "vector" in joint_action:
+        live_state = np.asarray(joint_action["vector"], dtype=np.float32).reshape(-1)
+        if action.size == live_state.size:
+            return action
+        if action.size == 14 and live_state.size == 16:
+            return np.concatenate(
+                [
+                    action[:6],
+                    live_state[6:7],
+                    action[6:7],
+                    action[7:13],
+                    live_state[14:15],
+                    action[13:14],
+                ]
+            ).astype(np.float32)
+
+    left_arm = np.asarray(joint_action.get("left_arm", []), dtype=np.float32).reshape(-1)
+    right_arm = np.asarray(joint_action.get("right_arm", []), dtype=np.float32).reshape(-1)
+    if action.size == left_arm.size + 1 + right_arm.size + 1:
+        return action
+    if action.size == 14 and left_arm.size == 7 and right_arm.size == 7:
+        return np.concatenate(
+            [
+                action[:6],
+                left_arm[6:7],
+                action[6:7],
+                action[7:13],
+                right_arm[6:7],
+                action[13:14],
+            ]
+        ).astype(np.float32)
+    return action
+
+
+def execute_dense_qpos_action(task_env, qpos_action, num_steps=15):
+    """Execute a qpos target as dense drive targets instead of TOPP planning.
+
+    RobotWin's take_action(qpos) treats qpos as a high-level endpoint and sends it
+    through TOPP. The learned joint policy predicts dense saved-frame drive
+    targets, so apply them directly for a few simulator steps.
+    """
+    if task_env.take_action_cnt == task_env.step_lim or task_env.eval_success:
+        return {
+            "planner_success": False,
+            "action_type": "qpos_direct",
+            "skipped": True,
+            "reason": "episode_done",
+            "take_action_cnt": int(getattr(task_env, "take_action_cnt", -1)),
+        }
+
+    qpos_action = np.asarray(qpos_action, dtype=np.float32).reshape(-1)
+    robot = getattr(task_env, "robot", None)
+    if robot is None:
+        raise RuntimeError("TASK_ENV has no robot; cannot execute dense qpos action.")
+
+    left_jointstate = robot.get_left_arm_jointState()
+    right_jointstate = robot.get_right_arm_jointState()
+    left_arm_dim = len(left_jointstate) - 1
+    right_arm_dim = len(right_jointstate) - 1
+    expected_dim = left_arm_dim + 1 + right_arm_dim + 1
+    if qpos_action.size != expected_dim:
+        raise ValueError(
+            f"Dense qpos action dim mismatch: expected {expected_dim} "
+            f"({left_arm_dim}+gripper+{right_arm_dim}+gripper), got {qpos_action.size}"
+        )
+
+    left_arm_target = qpos_action[:left_arm_dim]
+    left_gripper_target = float(qpos_action[left_arm_dim])
+    right_start = left_arm_dim + 1
+    right_arm_target = qpos_action[right_start : right_start + right_arm_dim]
+    right_gripper_target = float(qpos_action[right_start + right_arm_dim])
+
+    eval_video_freq = 1
+    if task_env.eval_video_path is not None and task_env.take_action_cnt % eval_video_freq == 0:
+        task_env.eval_video_ffmpeg.stdin.write(
+            task_env.now_obs["observation"]["head_camera"]["rgb"].tobytes()
+        )
+
+    task_env.take_action_cnt += 1
+    print(f"step: \033[92m{task_env.take_action_cnt} / {task_env.step_lim}\033[0m", end="\r")
+
+    zero_left_vel = np.zeros(left_arm_dim, dtype=np.float32)
+    zero_right_vel = np.zeros(right_arm_dim, dtype=np.float32)
+    num_steps = max(1, int(num_steps))
+    for _ in range(num_steps):
+        robot.set_arm_joints(left_arm_target, zero_left_vel, "left")
+        robot.set_arm_joints(right_arm_target, zero_right_vel, "right")
+        robot.set_gripper(left_gripper_target, "left")
+        robot.set_gripper(right_gripper_target, "right")
+        task_env.scene.step()
+        task_env._update_render()
+        if task_env.render_freq:
+            task_env.viewer.render()
+        if task_env.check_success():
+            task_env.eval_success = True
+            task_env.get_obs()
+            if task_env.eval_video_path is not None:
+                task_env.eval_video_ffmpeg.stdin.write(
+                    task_env.now_obs["observation"]["head_camera"]["rgb"].tobytes()
+                )
+            break
+
+    return {
+        "planner_success": True,
+        "action_type": "qpos_direct",
+        "direct_control_steps": int(num_steps),
+        "raw_action_dim": int(qpos_action.size),
+        "executed_action_dim": int(qpos_action.size),
+        "left_arm_dim": int(left_arm_dim),
+        "right_arm_dim": int(right_arm_dim),
+        "take_action_cnt": int(getattr(task_env, "take_action_cnt", -1)),
+    }
+
+
+def clip_joint_action_to_dataset_bounds(qpos_action, args):
+    if not bool(args.get("clip_joint_action_to_dataset_bounds", True)):
+        return np.asarray(qpos_action, dtype=np.float32).reshape(-1), False
+    stats_by_mode = args.get("norm_stats_by_action_mode", None)
+    if not isinstance(stats_by_mode, dict) or "joint_absolute" not in stats_by_mode:
+        return np.asarray(qpos_action, dtype=np.float32).reshape(-1), False
+    stats = stats_by_mode["joint_absolute"]
+    q01 = np.asarray(stats.get("q01", []), dtype=np.float32).reshape(-1)
+    q99 = np.asarray(stats.get("q99", []), dtype=np.float32).reshape(-1)
+    action = np.asarray(qpos_action, dtype=np.float32).reshape(-1)
+    if q01.size != action.size or q99.size != action.size:
+        return action, False
+    clipped = np.clip(action, q01, q99)
+    return clipped.astype(np.float32), bool(np.any(np.abs(clipped - action) > 1e-6))
+
+
+def _get_camera_rgb(observation, camera_name, use_expert_marked_rgb=True, required=True):
+    cameras = observation.get("observation", {})
+    if camera_name not in cameras:
+        if required:
+            raise KeyError(
+                f"Observation is missing camera `{camera_name}`. "
+                f"Available cameras={sorted(cameras.keys())}"
+            )
+        return None
+    camera_obs = cameras[camera_name]
     if not use_expert_marked_rgb:
         return camera_obs["rgb"]
     return camera_obs.get("rgb_expert_marked", camera_obs["rgb"])
 
 
-def format_obs(observation, prompt, use_expert_marked_rgb=True):
+def _compact_expert_target(observation):
+    expert_target = observation.get("expert_target", None)
+    if not isinstance(expert_target, dict):
+        return None
+
+    compact = []
+    valid = []
+    command_id = []
+    for arm in ("left", "right"):
+        arm_target = expert_target.get(arm, {})
+        try:
+            pose = np.asarray(arm_target["pose_7d"], dtype=np.float32).reshape(-1)
+            gripper = np.asarray(arm_target["gripper"], dtype=np.float32).reshape(-1)
+        except Exception:
+            return None
+        if pose.shape[0] != 7 or gripper.shape[0] < 1:
+            return None
+        compact.append(np.concatenate([pose, gripper[:1]], axis=0).astype(np.float32))
+        valid.append(bool(np.asarray(arm_target.get("valid", [True])).reshape(-1)[0]))
+        command_id.append(int(np.asarray(arm_target.get("command_id", [-1])).reshape(-1)[0]))
+
     return {
-                "head_camera": _get_camera_rgb(observation, "head_camera", use_expert_marked_rgb),
-                "left_camera": _get_camera_rgb(observation, "left_camera", use_expert_marked_rgb),
-                "right_camera": _get_camera_rgb(observation, "right_camera", use_expert_marked_rgb),
-                "front_camera": _get_camera_rgb(observation, "front_camera", use_expert_marked_rgb),
-                "side_camera": _get_camera_rgb(observation, "side_camera", use_expert_marked_rgb),
-                "observation.images.cam_high": _get_camera_rgb(observation, "head_camera", use_expert_marked_rgb),
-                "observation.images.cam_left_wrist": _get_camera_rgb(
-                    observation,
-                    "left_camera",
-                    use_expert_marked_rgb,
-                ),
-                "observation.images.cam_right_wrist": _get_camera_rgb(
-                    observation,
-                    "right_camera",
-                    use_expert_marked_rgb,
-                ),
-                "observation.state": format_eef_state(observation),
-                "task": prompt,
-            }
+        "value": np.stack(compact, axis=0).tolist(),
+        "valid": valid,
+        "command_id": command_id,
+    }
+
+
+def _live_waypoint_sequence(observation, sequence_len):
+    """Build projected-pose labels from live EE state to current expert targets."""
+    target = _compact_expert_target(observation)
+    if target is None:
+        return None
+    try:
+        current = format_eef_state(observation).reshape(2, 8).astype(np.float32)
+        target_value = np.asarray(target["value"], dtype=np.float32).reshape(2, 8)
+        transitions = build_linear_ee_target_transitions(
+            current,
+            target_value,
+            sequence_len,
+            valid=target["valid"],
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    horizon = transitions.shape[1]
+    alpha = np.arange(1, horizon + 1, dtype=np.float32) / float(horizon)
+    sequence = {}
+    for arm_idx, arm in enumerate(("left", "right")):
+        pose = np.zeros((horizon + 1, 7), dtype=np.float64)
+        gripper = np.ones((horizon + 1,), dtype=np.float64)
+        pose[0] = current[arm_idx, :7]
+        gripper[0] = current[arm_idx, 7]
+        pose[1:, :3] = current[arm_idx, None, :3] + alpha[:, None] * (
+            target_value[arm_idx, None, :3] - current[arm_idx, None, :3]
+        )
+        # Orientation is not predicted by the EE-target head; retain the live
+        # orientation only so the projected point label has a valid pose.
+        pose[1:, 3:7] = current[arm_idx, None, 3:7]
+        gripper[1:] = current[arm_idx, 7] + transitions[arm_idx, :, 3]
+        valid = np.concatenate([[True], np.full((horizon,), bool(target["valid"][arm_idx]))])
+        sequence[arm] = {"pose_7d": pose, "gripper": gripper, "valid": valid}
+    return sequence
+
+
+def _get_live_marked_camera_rgb(observation, camera_name, sequence_len):
+    cameras = observation.get("observation", {})
+    camera_obs = cameras.get(camera_name)
+    if camera_obs is None:
+        raise KeyError(
+            f"Observation is missing camera `{camera_name}`. "
+            f"Available cameras={sorted(cameras.keys())}"
+        )
+    sequence = _live_waypoint_sequence(observation, sequence_len)
+    if sequence is None:
+        return camera_obs["rgb"]
+    marked, _ = draw_expert_target_sequence_on_rgb(camera_obs["rgb"], camera_obs, sequence)
+    return marked
+
+
+def format_obs(
+    observation,
+    prompt,
+    use_expert_marked_rgb=True,
+    robotwin_action_space="ee",
+    live_waypoint_labels=False,
+    ee_target_sequence_len=6,
+):
+    robotwin_action_space = str(robotwin_action_space or "ee").lower()
+    state = format_joint_state(observation) if robotwin_action_space == "joint" else format_eef_state(observation)
+    camera_rgb = lambda name: (
+        _get_live_marked_camera_rgb(observation, name, ee_target_sequence_len)
+        if live_waypoint_labels
+        else _get_camera_rgb(observation, name, use_expert_marked_rgb)
+    )
+    obs = {
+        "head_camera": camera_rgb("head_camera"),
+        "left_camera": camera_rgb("left_camera"),
+        "right_camera": camera_rgb("right_camera"),
+        "side_camera": camera_rgb("side_camera"),
+        "observation.images.cam_high": camera_rgb("head_camera"),
+        "observation.images.cam_left_wrist": camera_rgb("left_camera"),
+        "observation.images.cam_right_wrist": camera_rgb("right_camera"),
+        "observation.state": state,
+        "task": prompt,
+    }
+    front_camera = _get_camera_rgb(
+        observation,
+        "front_camera",
+        use_expert_marked_rgb,
+        required=False,
+    )
+    if front_camera is not None:
+        obs["front_camera"] = (
+            _get_live_marked_camera_rgb(observation, "front_camera", ee_target_sequence_len)
+            if live_waypoint_labels
+            else front_camera
+        )
+    expert_target = _compact_expert_target(observation)
+    if expert_target is not None:
+        obs["expert_target"] = expert_target
+    try:
+        obs["ee_state"] = format_eef_state(observation).reshape(2, 8).tolist()
+    except Exception:
+        pass
+    return obs
+
+
+def format_policy_obs(
+    task_env,
+    observation,
+    prompt,
+    use_expert_marked_rgb=True,
+    robotwin_action_space="ee",
+    live_waypoint_labels=True,
+    ee_target_sequence_len=6,
+):
+    obs = format_obs(
+        observation,
+        prompt,
+        use_expert_marked_rgb=use_expert_marked_rgb,
+        robotwin_action_space=robotwin_action_space,
+        live_waypoint_labels=live_waypoint_labels,
+        ee_target_sequence_len=ee_target_sequence_len,
+    )
+    if str(robotwin_action_space or "ee").lower() == "joint":
+        obs["observation.state"] = format_robot_joint_state(task_env)
+        compact_ee = _compact_ee_state_14(observation)
+        if compact_ee is not None and np.allclose(obs["observation.state"], compact_ee, atol=1e-5, rtol=1e-5):
+            raise RuntimeError(
+                "Joint-mode policy observation is using end-effector pose as joint state. "
+                "This would create invalid joint targets. Check that the updated eval client is running "
+                "and that robot.get_*_arm_jointState() returns qpos drive targets."
+            )
+    return obs
 
 
 def safe_normalize_quat(quat, eps=1e-8):
@@ -941,7 +1306,16 @@ def eval_policy(task_name,
         prompt = TASK_ENV.get_instruction()
         episode_index = int(current_episode_index)
         use_expert_marked_rgb = bool(args.get("use_expert_marked_rgb", True))
-        initial_formatted_obs = format_obs(initial_obs, prompt, use_expert_marked_rgb=use_expert_marked_rgb)
+        robotwin_action_space = str(args.get("robotwin_action_space", "ee")).lower()
+        initial_formatted_obs = format_policy_obs(
+            TASK_ENV,
+        initial_obs,
+        prompt,
+        use_expert_marked_rgb=use_expert_marked_rgb,
+        robotwin_action_space=robotwin_action_space,
+        live_waypoint_labels=bool(args.get("live_waypoint_labels", True)),
+        ee_target_sequence_len=int(args.get("ee_target_sequence_len", 6)),
+        )
 
         # StreamVGGT now follows p2p and encodes the prompt on the policy server with
         # EmbeddingGemma. Do not send legacy dataset text_emb tensors from the client.
@@ -961,7 +1335,15 @@ def eval_policy(task_name,
         full_obs_list.append(initial_formatted_obs)
         while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
             observation = TASK_ENV.get_obs()
-            current_obs = format_obs(observation, prompt, use_expert_marked_rgb=use_expert_marked_rgb)
+            current_obs = format_policy_obs(
+                TASK_ENV,
+                observation,
+                prompt,
+                use_expert_marked_rgb=use_expert_marked_rgb,
+                robotwin_action_space=robotwin_action_space,
+                live_waypoint_labels=bool(args.get("live_waypoint_labels", True)),
+                ee_target_sequence_len=int(args.get("ee_target_sequence_len", 6)),
+            )
             current_obs["episode_index"] = episode_index
 
             ret = model.infer(dict(
@@ -980,16 +1362,33 @@ def eval_policy(task_name,
             raw_action_step = action[:, 0, 0].flatten()
             full_action_history.append(raw_action_step)
 
-            ee_action = action[:, 0, 0]
-            if action.shape[0] == 14:
-                ee_action = np.concatenate([
-                    ee_action[:3],
-                    euler2quat(ee_action[3], ee_action[4], ee_action[5]),
-                    ee_action[6:10],
-                    euler2quat(ee_action[10], ee_action[11], ee_action[12]),
-                    ee_action[13:14]
-                ])
-            elif action.shape[0] == 16:
+            action_type = ret.get(
+                "action_type",
+                "qpos" if ret.get("robotwin_action_space", robotwin_action_space) == "joint" else "ee",
+            )
+            if action_type == "qpos":
+                qpos_action = expand_compact_joint_action_for_robotwin(raw_action_step, observation)
+                qpos_action, clipped_to_bounds = clip_joint_action_to_dataset_bounds(qpos_action, args)
+                if bool(args.get("joint_use_direct_control", True)):
+                    planner_feedback = execute_dense_qpos_action(
+                        TASK_ENV,
+                        qpos_action,
+                        num_steps=int(args.get("joint_direct_control_steps", 15)),
+                    )
+                    planner_feedback["raw_action_dim"] = int(raw_action_step.size)
+                    planner_feedback["clipped_to_dataset_bounds"] = bool(clipped_to_bounds)
+                else:
+                    TASK_ENV.take_action(qpos_action, action_type="qpos")
+                    planner_feedback = {
+                        "planner_success": True,
+                        "action_type": "qpos_topp",
+                        "raw_action_dim": int(raw_action_step.size),
+                        "executed_action_dim": int(qpos_action.size),
+                        "clipped_to_dataset_bounds": bool(clipped_to_bounds),
+                        "take_action_cnt": int(getattr(TASK_ENV, "take_action_cnt", -1)),
+                    }
+            elif action_type == "ee":
+                ee_action = action[:, 0, 0]
                 if not has_absolute_action:
                     action_reference = ret.get('action_reference', inint_eef_pose)
                     ee_action = add_init_pose(ee_action, action_reference)
@@ -1000,10 +1399,10 @@ def eval_policy(task_name,
                     safe_normalize_quat(ee_action[11:15]),
                     ee_action[15:16]
                 ])
+                ee_action = sanitize_ee_action(ee_action)
+                planner_feedback = take_ee_action_with_planner_feedback(TASK_ENV, ee_action)
             else:
-                raise NotImplementedError
-            ee_action = sanitize_ee_action(ee_action)
-            planner_feedback = take_ee_action_with_planner_feedback(TASK_ENV, ee_action)
+                raise NotImplementedError(f"Unsupported action_type `{action_type}`")
             try:
                 model.infer(dict(
                     planner_feedback=planner_feedback,
@@ -1011,7 +1410,15 @@ def eval_policy(task_name,
             except Exception as exc:
                 print(f"[eval] warning: failed to send planner feedback to policy server: {exc}")
 
-            obs = format_obs(TASK_ENV.get_obs(), prompt, use_expert_marked_rgb=use_expert_marked_rgb)
+            obs = format_policy_obs(
+                TASK_ENV,
+                TASK_ENV.get_obs(),
+                prompt,
+                use_expert_marked_rgb=use_expert_marked_rgb,
+                robotwin_action_space=robotwin_action_space,
+                live_waypoint_labels=bool(args.get("live_waypoint_labels", True)),
+                ee_target_sequence_len=int(args.get("ee_target_sequence_len", 6)),
+            )
             full_obs_list.append(obs)
   
             if TASK_ENV.eval_success:
@@ -1079,6 +1486,9 @@ def parse_args_and_config():
     parser.add_argument("--test_num", type=int, default=100)
     parser.add_argument("--max_episode_steps", type=int, default=None)
     parser.add_argument("--use_expert_marked_rgb", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--joint_use_direct_control", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--joint_direct_control_steps", type=int, default=None)
+    parser.add_argument("--clip_joint_action_to_dataset_bounds", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--single_trajectory", action="store_true")
     parser.add_argument("--single_trajectory_episode_index", type=int, default=None)
     parser.add_argument("--single_trajectory_repo_id", type=str, default=None)
@@ -1116,6 +1526,18 @@ def parse_args_and_config():
         config["max_episode_steps"] = int(args.max_episode_steps)
     if args.use_expert_marked_rgb is not None:
         config["use_expert_marked_rgb"] = bool(args.use_expert_marked_rgb)
+    if args.joint_use_direct_control is not None:
+        config["joint_use_direct_control"] = bool(args.joint_use_direct_control)
+    else:
+        config.setdefault("joint_use_direct_control", True)
+    if args.joint_direct_control_steps is not None:
+        config["joint_direct_control_steps"] = int(args.joint_direct_control_steps)
+    else:
+        config.setdefault("joint_direct_control_steps", 15)
+    if args.clip_joint_action_to_dataset_bounds is not None:
+        config["clip_joint_action_to_dataset_bounds"] = bool(args.clip_joint_action_to_dataset_bounds)
+    else:
+        config.setdefault("clip_joint_action_to_dataset_bounds", True)
     if args.single_trajectory:
         config["single_trajectory"] = True
     if args.single_trajectory_episode_index is not None:
