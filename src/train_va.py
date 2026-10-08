@@ -993,13 +993,20 @@ class Trainer:
             shuffle=True,
             seed=42
         ) if config.world_size > 1 else None
+        load_worker = int(getattr(config, "load_worker", 0))
+        # Some distributed-training images expose the RoboTwin2 environment
+        # only through a process-local Python runtime. Keep worker count
+        # configurable and allow single-task smoke tests to avoid shared-memory
+        # failures from forked DataLoader workers.
+        if bool(getattr(config, "single_task", False)):
+            load_worker = int(getattr(config, "single_task_load_worker", load_worker))
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
-            shuffle=(train_sampler is None), 
-            num_workers=config.load_worker,
+            shuffle=(train_sampler is None),
+            num_workers=load_worker,
             sampler=train_sampler,
-            timeout=int(getattr(config, "dataloader_timeout", 0)),
+            timeout=int(getattr(config, "dataloader_timeout", 0)) if load_worker > 0 else 0,
         )
 
         rdt_cfg = self.config.rdt

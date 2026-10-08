@@ -22,3 +22,5 @@ head_camera_temporal_cfg.image_frame_stride = 1
 # Stage 1 uses this switch; stage 2 scripts override it explicitly.
 head_camera_temporal_cfg.freeze_visual_backbone = False
 head_camera_temporal_cfg.use_lora = True
+# Single-task smoke tests default to main-process loading to avoid /dev/shm pressure.
+head_camera_temporal_cfg.single_task_load_worker = 0

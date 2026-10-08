@@ -21,3 +21,5 @@ head_camera_temporal_train_cfg.use_lora = True
 head_camera_temporal_train_cfg.lora_rank = 128
 head_camera_temporal_train_cfg.lora_alpha = 64.0
 head_camera_temporal_train_cfg.lora_dropout = 0.05
+# Single-task smoke tests default to main-process loading to avoid /dev/shm pressure.
+head_camera_temporal_train_cfg.single_task_load_worker = 0
