@@ -30,6 +30,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_DIR="$(cd "${SRC_DIR}/.." && pwd)"
 cd "${SRC_DIR}"
+# Make module resolution independent of the caller's working directory and any
+# stale installed StreamVGGT package on the evaluation machine.
+export PYTHONPATH="${SRC_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+echo "[launch_client] python: $(command -v python)"
+echo "[launch_client] source root: ${SRC_DIR}"
 
 TRAIN_OUT_ROOT=${TRAIN_OUT_ROOT:-"${SRC_DIR}/train_out"}
 HOST=${HOST:-127.0.0.1}
@@ -46,9 +51,15 @@ CKPT_SETTING=${CKPT_SETTING:-}
 SEED=${SEED:-0}
 HEADLESS=${HEADLESS:-1}
 MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-400}
-EXPERT_TARGET_POS_THRESHOLD=${EXPERT_TARGET_POS_THRESHOLD:-0.10}
-EXPERT_TARGET_ROT_THRESHOLD=${EXPERT_TARGET_ROT_THRESHOLD:-60.0}
-EXPERT_TARGET_GRIPPER_THRESHOLD=${EXPERT_TARGET_GRIPPER_THRESHOLD:-0.2}
+EXPERT_TARGET_POS_THRESHOLD=${EXPERT_TARGET_POS_THRESHOLD:-}
+EXPERT_TARGET_ROT_THRESHOLD=${EXPERT_TARGET_ROT_THRESHOLD:-}
+EXPERT_TARGET_GRIPPER_THRESHOLD=${EXPERT_TARGET_GRIPPER_THRESHOLD:-}
+EXPERT_TARGET_SEQUENCE_LEN=${EXPERT_TARGET_SEQUENCE_LEN:-}
+EXPERT_TARGET_WAYPOINT_DISTANCE=${EXPERT_TARGET_WAYPOINT_DISTANCE:-}
+EE_TARGET_SEQUENCE_LEN=${EE_TARGET_SEQUENCE_LEN:-}
+EE_TARGET_WAYPOINT_DISTANCE=${EE_TARGET_WAYPOINT_DISTANCE:-}
+LIVE_WAYPOINT_LABELS=${LIVE_WAYPOINT_LABELS:-}
+USE_EXPERT_PLAN_MARKED_RGB=${USE_EXPERT_PLAN_MARKED_RGB:-}
 VIDEO_GUIDANCE_SCALE=${VIDEO_GUIDANCE_SCALE:-5}
 ACTION_GUIDANCE_SCALE=${ACTION_GUIDANCE_SCALE:-1}
 TEST_NUM=${TEST_NUM:-10}
@@ -161,6 +172,30 @@ values = {
     "CFG_ACTION_REPRESENTATION": cfg.get("action_representation", "absolute"),
     "CFG_JOINT_ACTION_REPRESENTATION": cfg.get("joint_action_representation", "absolute"),
     "CFG_USE_EXPERT_MARKED_RGB": cfg.get("use_expert_marked_rgb", False),
+    "CFG_USE_EXPERT_PLAN_MARKED_RGB": cfg.get("use_expert_plan_marked_rgb", False),
+    "CFG_LIVE_WAYPOINT_LABELS": cfg.get("live_waypoint_labels", True),
+    "CFG_EE_TARGET_SEQUENCE_LEN": cfg.get(
+        "ee_target_sequence_len",
+        cfg.get("expert_target_sequence_len", 6),
+    ),
+    "CFG_EE_TARGET_WAYPOINT_DISTANCE": cfg.get(
+        "ee_target_waypoint_distance",
+        cfg.get("expert_target_waypoint_distance", 0.05),
+    ),
+    "CFG_EXPERT_TARGET_POS_THRESHOLD": cfg.get("expert_target_pos_threshold", 0.05),
+    "CFG_EXPERT_TARGET_ROT_THRESHOLD": cfg.get("expert_target_rot_threshold", 45.0),
+    "CFG_EXPERT_TARGET_GRIPPER_THRESHOLD": cfg.get(
+        "expert_target_gripper_threshold",
+        0.2,
+    ),
+    "CFG_EXPERT_TARGET_KEYPOINT_MODE": cfg.get(
+        "expert_target_keypoint_mode",
+        "sparse_gripper",
+    ),
+    "CFG_EXPERT_TARGET_GRIPPER_CHANGE_THRESHOLD": cfg.get(
+        "expert_target_gripper_change_threshold",
+        0.2,
+    ),
 }
 for key, value in values.items():
     print(f"{key}={shlex.quote(str(value))}")
@@ -171,6 +206,17 @@ ROBOTWIN_ACTION_SPACE=${ROBOTWIN_ACTION_SPACE:-${CFG_ROBOTWIN_ACTION_SPACE}}
 ACTION_REPRESENTATION=${ACTION_REPRESENTATION:-${CFG_ACTION_REPRESENTATION}}
 JOINT_ACTION_REPRESENTATION=${JOINT_ACTION_REPRESENTATION:-${CFG_JOINT_ACTION_REPRESENTATION}}
 USE_EXPERT_MARKED_RGB=${USE_EXPERT_MARKED_RGB:-${CFG_USE_EXPERT_MARKED_RGB}}
+USE_EXPERT_PLAN_MARKED_RGB=${USE_EXPERT_PLAN_MARKED_RGB:-${CFG_USE_EXPERT_PLAN_MARKED_RGB}}
+LIVE_WAYPOINT_LABELS=${LIVE_WAYPOINT_LABELS:-${CFG_LIVE_WAYPOINT_LABELS}}
+EE_TARGET_SEQUENCE_LEN=${EE_TARGET_SEQUENCE_LEN:-${CFG_EE_TARGET_SEQUENCE_LEN}}
+EE_TARGET_WAYPOINT_DISTANCE=${EE_TARGET_WAYPOINT_DISTANCE:-${CFG_EE_TARGET_WAYPOINT_DISTANCE}}
+EXPERT_TARGET_SEQUENCE_LEN=${EXPERT_TARGET_SEQUENCE_LEN:-${EE_TARGET_SEQUENCE_LEN}}
+EXPERT_TARGET_WAYPOINT_DISTANCE=${EXPERT_TARGET_WAYPOINT_DISTANCE:-${EE_TARGET_WAYPOINT_DISTANCE}}
+EXPERT_TARGET_POS_THRESHOLD=${EXPERT_TARGET_POS_THRESHOLD:-${CFG_EXPERT_TARGET_POS_THRESHOLD:-0.05}}
+EXPERT_TARGET_ROT_THRESHOLD=${EXPERT_TARGET_ROT_THRESHOLD:-${CFG_EXPERT_TARGET_ROT_THRESHOLD:-45.0}}
+EXPERT_TARGET_GRIPPER_THRESHOLD=${EXPERT_TARGET_GRIPPER_THRESHOLD:-${CFG_EXPERT_TARGET_GRIPPER_THRESHOLD:-0.2}}
+EXPERT_TARGET_KEYPOINT_MODE=${EXPERT_TARGET_KEYPOINT_MODE:-${CFG_EXPERT_TARGET_KEYPOINT_MODE:-sparse_gripper}}
+EXPERT_TARGET_GRIPPER_CHANGE_THRESHOLD=${EXPERT_TARGET_GRIPPER_CHANGE_THRESHOLD:-${CFG_EXPERT_TARGET_GRIPPER_CHANGE_THRESHOLD:-0.2}}
 if [[ -z "${CKPT_SETTING}" ]]; then
     CKPT_SETTING="$(basename "${CKPT_DIR}")"
 fi
@@ -191,6 +237,16 @@ fi
 rgb_flag=(--no-use_expert_marked_rgb)
 if [[ "${USE_EXPERT_MARKED_RGB}" == "1" || "${USE_EXPERT_MARKED_RGB}" == "true" || "${USE_EXPERT_MARKED_RGB}" == "True" ]]; then
     rgb_flag=(--use_expert_marked_rgb)
+fi
+
+plan_rgb_flag=(--no-use_expert_plan_marked_rgb)
+if [[ "${USE_EXPERT_PLAN_MARKED_RGB}" == "1" || "${USE_EXPERT_PLAN_MARKED_RGB}" == "true" || "${USE_EXPERT_PLAN_MARKED_RGB}" == "True" ]]; then
+    plan_rgb_flag=(--use_expert_plan_marked_rgb)
+fi
+
+live_waypoint_flag=(--no-live_waypoint_labels)
+if [[ "${LIVE_WAYPOINT_LABELS}" == "1" || "${LIVE_WAYPOINT_LABELS}" == "true" || "${LIVE_WAYPOINT_LABELS}" == "True" ]]; then
+    live_waypoint_flag=(--live_waypoint_labels)
 fi
 
 if [[ "${DEBUG_NATIVE}" == "1" ]]; then
@@ -239,6 +295,9 @@ echo "[launch_client] ee representation: ${ACTION_REPRESENTATION}"
 echo "[launch_client] joint representation: ${JOINT_ACTION_REPRESENTATION}"
 echo "[launch_client] task config: ${TASK_CONFIG}"
 echo "[launch_client] use expert marked RGB: ${USE_EXPERT_MARKED_RGB}"
+echo "[launch_client] use expert plan marked RGB: ${USE_EXPERT_PLAN_MARKED_RGB}"
+echo "[launch_client] live waypoint labels: ${LIVE_WAYPOINT_LABELS}"
+echo "[launch_client] waypoint layout: K=${EE_TARGET_SEQUENCE_LEN}, distance=${EE_TARGET_WAYPOINT_DISTANCE}"
 echo "[launch_client] expert target thresholds: pos=${EXPERT_TARGET_POS_THRESHOLD}, rot=${EXPERT_TARGET_ROT_THRESHOLD}, gripper=${EXPERT_TARGET_GRIPPER_THRESHOLD}"
 echo "[launch_client] joint direct control: ${JOINT_USE_DIRECT_CONTROL}, steps=${JOINT_DIRECT_CONTROL_STEPS}"
 echo "[launch_client] clip joint action to dataset bounds: ${CLIP_JOINT_ACTION_TO_DATASET_BOUNDS}"
@@ -336,6 +395,19 @@ run_one_task() {
             --joint_direct_control_steps "${JOINT_DIRECT_CONTROL_STEPS}" \
             "${joint_clip_flag[@]}" \
             "${rgb_flag[@]}" \
+            "${plan_rgb_flag[@]}" \
+            "${live_waypoint_flag[@]}" \
+            --ee-target-sequence-len "${EE_TARGET_SEQUENCE_LEN}" \
+            --ee-target-waypoint-distance "${EE_TARGET_WAYPOINT_DISTANCE}" \
+            --expert-target-pos-threshold "${EXPERT_TARGET_POS_THRESHOLD}" \
+            --expert-target-rot-threshold "${EXPERT_TARGET_ROT_THRESHOLD}" \
+            --expert-target-gripper-threshold "${EXPERT_TARGET_GRIPPER_THRESHOLD}" \
+            --expert-target-keypoint-mode "${EXPERT_TARGET_KEYPOINT_MODE}" \
+            --expert-target-gripper-change-threshold "${EXPERT_TARGET_GRIPPER_CHANGE_THRESHOLD}" \
+            --robotwin_action_space "${ROBOTWIN_ACTION_SPACE}" \
+            --action_representation "${ACTION_REPRESENTATION}" \
+            --joint_action_representation "${JOINT_ACTION_REPRESENTATION}" \
+            --checkpoint_dir "${CKPT_DIR}" \
             --overrides \
             --task_name "${task}" \
             --task_config "${TASK_CONFIG}" \
@@ -344,13 +416,8 @@ run_one_task() {
             --ckpt_setting "${CKPT_SETTING}" \
             --seed "${SEED}" \
             --policy_name "${POLICY_NAME}" \
-            --robotwin_action_space "${ROBOTWIN_ACTION_SPACE}" \
-            --action_representation "${ACTION_REPRESENTATION}" \
-            --joint_action_representation "${JOINT_ACTION_REPRESENTATION}" \
-            --expert_target_pos_threshold "${EXPERT_TARGET_POS_THRESHOLD}" \
-            --expert_target_rot_threshold "${EXPERT_TARGET_ROT_THRESHOLD}" \
-            --expert_target_gripper_threshold "${EXPERT_TARGET_GRIPPER_THRESHOLD}" \
-            --checkpoint_dir "${CKPT_DIR}"; then
+            --expert_target_sequence_len "${EXPERT_TARGET_SEQUENCE_LEN}" \
+            --expert_target_waypoint_distance "${EXPERT_TARGET_WAYPOINT_DISTANCE}"; then
         status="failed"
     fi
 

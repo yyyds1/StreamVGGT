@@ -9,6 +9,7 @@ from transformers.file_utils import ModelOutput
 
 from streamvggt.heads.camera_head import CameraHead
 from streamvggt.heads.dpt_head import DPTHead
+from vga.ee_target_mask import build_ee_target_token_mask
 from vga.heads import EETargetHead
 from vga.models.aggregator import VGAAggregator
 from vga.utils import apply_lora_to_module
@@ -522,6 +523,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         rdt_act_tokens = act_tokens
         rdt_lang_tokens = lang_tokens
         rdt_ee_tokens = None
+        rdt_ee_mask = None
         if (
             geometry is not None
             and "ee_target" in geometry
@@ -538,6 +540,12 @@ class VGA(nn.Module, PyTorchModelHubMixin):
                 current_ee=None,
                 dtype=rdt_act_tokens.dtype,
             )
+            rdt_ee_mask = build_ee_target_token_mask(
+                input_dict.get("ee_target_condition_valid", None),
+                sequence_len=geometry["ee_target"].shape[2],
+                batch_size=geometry["ee_target"].shape[0],
+                device=rdt_ee_tokens.device,
+            )
             if rdt_act_tokens.dim() == 4:
                 rdt_ee_tokens = rdt_ee_tokens[:, None].expand(-1, rdt_act_tokens.shape[1], -1, -1)
         rdt_cond_c = self._compose_rdt_condition_tokens(
@@ -553,6 +561,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
                 "rdt_img_c": rdt_img_tokens,
                 "rdt_act_c": rdt_act_tokens,
                 "rdt_ee_c": rdt_ee_tokens,
+                "rdt_ee_mask": rdt_ee_mask,
                 "rdt_lang_c": rdt_lang_tokens,
                 "rdt_img_tokens": rdt_img_tokens,
                 "rdt_action_query_tokens": rdt_act_tokens,
@@ -627,5 +636,6 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             },
             "action_dict": action_dict,
             "ee_target_condition_current": frames[0].get("ee_target_condition_current", None),
+            "ee_target_condition_valid": frames[0].get("ee_target_condition_valid", None),
         }
         return self.forward(input_dict=input_dict, predict_geometry=False)

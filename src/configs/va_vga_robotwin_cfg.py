@@ -61,7 +61,7 @@ va_vga_robotwin_cfg.enable_ee_target_module = True
 # Evaluation source for RDT EE-target condition tokens. Keep "predicted" for
 # fair policy evaluation; "oracle" uses the live RoboTwin expert cursor to
 # construct current-state-to-next-target waypoint transitions.
-va_vga_robotwin_cfg.rdt_ee_target_condition_source = "oracle"
+va_vga_robotwin_cfg.rdt_ee_target_condition_source = "predicted"
 
 # Loss toggles (camera/depth code is kept and can be re-enabled anytime).
 va_vga_robotwin_cfg.enable_camera_loss = False
@@ -76,6 +76,7 @@ va_vga_robotwin_cfg.loss_weight_ee_target = 1.0
 va_vga_robotwin_cfg.loss_weight_ee_target_xyz = 1.0
 va_vga_robotwin_cfg.loss_weight_ee_target_gripper = 0.5
 va_vga_robotwin_cfg.ee_target_sequence_len = 6
+va_vga_robotwin_cfg.ee_target_waypoint_distance = 0.05
 va_vga_robotwin_cfg.ee_target_head_num_heads = 8
 va_vga_robotwin_cfg.ee_target_head_trunk_depth = 4
 va_vga_robotwin_cfg.ee_target_head_num_iterations = 4
@@ -88,11 +89,11 @@ va_vga_robotwin_cfg.rdt_state_token_loss_weight = 0.1
 #   p = min + (max - min) * clamp((ema_loss - low) / (high - low), 0, 1)
 # High ee-target loss therefore uses more GT condition; low loss uses the
 # predicted ee-target head more often.
-va_vga_robotwin_cfg.ee_target_condition_gt_mix_enabled = True
+va_vga_robotwin_cfg.ee_target_condition_gt_mix_enabled = False
 # Set to a float in [0, 1] to directly control the probability of replacing
 # predicted EE transition condition tokens with GT tokens before RDT. If None,
 # the adaptive EMA schedule below is used.
-va_vga_robotwin_cfg.ee_target_condition_gt_prob = 1.0
+va_vga_robotwin_cfg.ee_target_condition_gt_prob = 0.0
 va_vga_robotwin_cfg.ee_target_condition_gt_prob_min = 0.0
 va_vga_robotwin_cfg.ee_target_condition_gt_prob_max = 0.8
 va_vga_robotwin_cfg.ee_target_condition_loss_low = 0.005

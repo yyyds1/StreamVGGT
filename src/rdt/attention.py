@@ -197,6 +197,7 @@ class CrossAttention(nn.Module):
         if mask is not None:
             mask = mask.reshape(bs, 1, 1, -1)
             mask = mask.expand(-1, -1, seq_len, -1)
+            has_valid_key = mask.any(dim=-1, keepdim=True)
 
         if self.use_flash_attn:
             output = F.scaled_dot_product_attention(
@@ -208,11 +209,18 @@ class CrossAttention(nn.Module):
                 is_causal=False,
                 scale=self.attn_scale,
             )
+            # Avoid propagating implementation-specific values when a sample
+            # has no valid EE-target slots.
+            if mask is not None:
+                output = output * has_valid_key.to(dtype=output.dtype)
         else:
             scores = torch.matmul(xq, ck.transpose(2, 3)) * self.attn_scale
             if mask is not None:
-                attn = attn.masked_fill_(mask.logical_not(), float('-inf'))
+                scores = scores.masked_fill(mask.logical_not(), float("-inf"))
+                scores = torch.where(has_valid_key, scores, torch.zeros_like(scores))
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            if mask is not None:
+                scores = scores * has_valid_key.to(dtype=scores.dtype)
             output = torch.matmul(scores, cv)   # (bs, n_heads, seq_len, head_size)
 
         output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)

@@ -5,6 +5,8 @@ from .va_vga_robotwin_action_only_cfg import va_vga_robotwin_action_only_cfg
 from .va_vga_robotwin_action_only_train_cfg import va_vga_robotwin_action_only_train_cfg
 from .va_vga_robotwin_cfg import va_vga_robotwin_cfg
 from .va_vga_robotwin_train_cfg import va_vga_robotwin_train_cfg
+from .head_camera_temporal_cfg import head_camera_temporal_cfg
+from .head_camera_temporal_train_cfg import head_camera_temporal_train_cfg
 
 VA_CONFIGS = {
     "robotwin": va_robotwin_cfg,
@@ -13,4 +15,6 @@ VA_CONFIGS = {
     "vga_robotwin_action_only_train": va_vga_robotwin_action_only_train_cfg,
     "vga_robotwin": va_vga_robotwin_cfg,
     "vga_robotwin_train": va_vga_robotwin_train_cfg,
+    "head_camera_temporal": head_camera_temporal_cfg,
+    "head_camera_temporal_train": head_camera_temporal_train_cfg,
 }

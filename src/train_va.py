@@ -480,6 +480,13 @@ class Trainer:
         self.ee_target_condition_loss_ema = float(
             getattr(config, "ee_target_condition_initial_loss", self.ee_target_condition_loss_high)
         )
+        logger.info(
+            "EE-target train/eval alignment: "
+            f"K={self.ee_target_sequence_len}, "
+            f"waypoint_distance={float(getattr(config, 'ee_target_waypoint_distance', 0.05)):.4f} m, "
+            f"gt_condition_mix_enabled={self.ee_target_condition_gt_mix_enabled}, "
+            f"gt_condition_prob={self.ee_target_condition_gt_prob}"
+        )
         cond_cfg = getattr(config, "rdt_condition_tokens", None)
         cond_cfg_dict = dict(cond_cfg or {})
         self.use_ee_target_as_rdt_condition = bool(
@@ -915,8 +922,19 @@ class Trainer:
 
         for name, param in self.transformer.named_parameters():
             total_params += param.numel()
-            if self.use_lora:
-                should_train = (
+            if bool(getattr(config, "freeze_visual_backbone", False)):
+                # Stage 1: keep visual feature extraction frozen, while training
+                # action/RDT conditioning and the EE-target head.
+                param.requires_grad = (
+                    name.endswith("action_query_tokens")
+                    or name.endswith("ee_target_token")
+                    or name.startswith("aggregator.action_embedder.")
+                    or name.startswith("text_token_proj.")
+                    or name.startswith("ee_target_head.")
+                    or name.startswith("ee_target_cond_proj.")
+                )
+            elif self.use_lora:
+                param.requires_grad = (
                     ("lora_" in name)
                     or name.endswith("action_query_tokens")
                     or name.endswith("ee_target_token")
@@ -925,7 +943,6 @@ class Trainer:
                     or name.startswith("ee_target_head.")
                     or name.startswith("ee_target_cond_proj.")
                 )
-                param.requires_grad = should_train
             else:
                 param.requires_grad = True
 
@@ -1282,6 +1299,10 @@ class Trainer:
         }
         if 'ee_state' in batch_dict:
             input_dict['ee_target_condition_current'] = batch_dict['ee_state']
+        if 'ee_target_sequence_valid' in batch_dict:
+            input_dict['ee_target_condition_valid'] = batch_dict['ee_target_sequence_valid']
+        elif 'ee_target_valid' in batch_dict:
+            input_dict['ee_target_condition_valid'] = batch_dict['ee_target_valid']
         episode_initial_state = actions[:, :, 0, 0, 0]  # [B, C_action], first token of current sequence
         input_dict['episode_initial_state_c'] = episode_initial_state.unsqueeze(1)  # [B, 1, C_action]
         if 'state' in batch_dict:
@@ -1747,6 +1768,7 @@ class Trainer:
                     f"expected={expected_rdt_act_cond_len}, noisy_action={action_chunk.shape[1]}"
                 )
             rdt_ee_c = rdt_conds.get("rdt_ee_c", None)
+            rdt_ee_mask = rdt_conds.get("rdt_ee_mask", None)
             expected_rdt_ee_cond_len = int(getattr(self, "ee_target_condition_num_tokens", 0))
             if expected_rdt_ee_cond_len > 0:
                 rdt_ee_cond_len = self._rdt_condition_token_len(rdt_ee_c)
@@ -1754,6 +1776,15 @@ class Trainer:
                     raise ValueError(
                         f"RDT ee-target condition length mismatch: ee_c={rdt_ee_cond_len}, "
                         f"expected={expected_rdt_ee_cond_len}"
+                    )
+                if rdt_ee_mask is None or tuple(rdt_ee_mask.shape) != (
+                    action_chunk.shape[0],
+                    expected_rdt_ee_cond_len,
+                ):
+                    raise ValueError(
+                        "RDT ee-target condition mask shape mismatch: "
+                        f"mask={None if rdt_ee_mask is None else tuple(rdt_ee_mask.shape)}, "
+                        f"expected={(action_chunk.shape[0], expected_rdt_ee_cond_len)}"
                     )
             if self.state_condition_mode == "null":
                 state_c = torch.zeros(
@@ -1786,6 +1817,7 @@ class Trainer:
                 img_c=rdt_conds['rdt_img_c'],
                 act_c=self._maybe_add_noise_to_action_condition(rdt_conds['rdt_act_c']),
                 ee_c=rdt_ee_c,
+                ee_mask=rdt_ee_mask,
                 state_c=state_c,
                 embed_input=True,
                 decode_output=True,
@@ -2207,6 +2239,10 @@ def run(args):
         config.tensorboard_log_dir = args.tensorboard_log_dir
     if args.dataset_type is not None:
         config.dataset_type = args.dataset_type
+    if args.use_lora is not None:
+        config.use_lora = bool(args.use_lora)
+    if args.freeze_visual_backbone is not None:
+        config.freeze_visual_backbone = bool(args.freeze_visual_backbone)
     if args.dataset_path is not None:
         config.dataset_path = args.dataset_path
     if args.robotwin_lerobot_epoch_unit is not None:
@@ -2329,6 +2365,14 @@ def main():
         type=str,
         default=None,
         help="Dataset loader type override, e.g. robotwin_lerobot or vga_robotwin.",
+    )
+    parser.add_argument(
+        "--use-lora", action=argparse.BooleanOptionalAction, default=None,
+        help="Override config.use_lora for stage 2 (default follows config).",
+    )
+    parser.add_argument(
+        "--freeze-visual-backbone", action=argparse.BooleanOptionalAction, default=None,
+        help="Freeze visual backbone while keeping action/EE conditioning trainable.",
     )
     parser.add_argument(
         "--dataset-path",

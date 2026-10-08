@@ -165,4 +165,58 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 ```
 
-2. 
+2.
+## Head-camera temporal training
+
+This branch adds `head_camera_temporal` (evaluation) and
+`head_camera_temporal_train` (training). Both use only `head_camera`, an
+8-frame history window, and `history_frame_stride=1`. The dataset and server
+construct history indices from the same `history_len` and stride fields. With a
+single camera, `image_time_ids` identify the temporal frame and
+`image_view_ids` remain the camera index; time is never encoded as a view.
+
+Run the CPU/static checks before any GPU job. `--static-only` works when optional
+training dependencies such as `easydict` are not installed:
+
+```bash
+python src/scripts/validate_head_camera_temporal.py --static-only
+python -m compileall -q src/configs/head_camera_temporal_cfg.py src/configs/head_camera_temporal_train_cfg.py src/scripts/validate_head_camera_temporal.py src/train_va.py src/va_server.py
+bash -n src/scripts/run_head_camera_stage1.sh src/scripts/run_head_camera_stage2.sh src/scripts/run_head_camera_eval.sh
+```
+
+Stage 1 freezes the visual backbone and disables LoRA:
+
+```bash
+NGPU=8 SAVE_ROOT=./train_out/head_camera_stage1 \
+  bash src/scripts/run_head_camera_stage1.sh
+# Single task; leave SINGLE_TASK empty for multi-task training.
+SINGLE_TASK=adjust_bottle bash src/scripts/run_head_camera_stage1.sh
+```
+
+Stage 2 defaults to LoRA (`LORA=1`). Set `LORA=0` for full-parameter training.
+It does not resume implicitly. To continue from an exact Stage 1
+`checkpoint_step_*` directory, set `RESUME_CHECKPOINT_DIR`; the script maps it
+to `--resume-checkpoint-dir`:
+
+```bash
+RESUME_CHECKPOINT_DIR=./train_out/head_camera_stage1/checkpoint_step_2000 \
+  LORA=1 SINGLE_TASK= bash src/scripts/run_head_camera_stage2.sh
+# Single-task variant:
+RESUME_CHECKPOINT_DIR=./train_out/head_camera_stage1/checkpoint_step_2000 \
+  LORA=1 SINGLE_TASK=adjust_bottle bash src/scripts/run_head_camera_stage2.sh
+```
+
+The launchers use the same CUDA library discovery, allocator setting, local-rank
+filter, and `torchrun --tee` behavior as `run_va_train.sh`. Extra arguments are
+passed through to `train_va.py`.
+
+For evaluation, `CHECKPOINT_DIR` must point to a complete `checkpoint_step_*`
+directory. The server loads `CHECKPOINT_DIR/training_config.json` by default;
+use `EVAL_CONFIG=/path/to/config.json` only when an explicit override is needed:
+
+```bash
+CHECKPOINT_DIR=./train_out/head_camera_stage2/checkpoint_step_2000 \
+  bash src/scripts/run_head_camera_eval.sh
+EVAL_CONFIG=/path/to/eval.json CHECKPOINT_DIR=/path/to/checkpoint_step_2000 \
+  bash src/scripts/run_head_camera_eval.sh
+```

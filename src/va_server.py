@@ -24,6 +24,7 @@ from scipy.spatial.transform import Rotation as R
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from actionvggt.models.actionvggt import ActionVGGT
+from vga.ee_target_mask import build_ee_target_token_mask
 from vga.models.vga import VGA
 from configs import VA_CONFIGS
 from rdt.model import RDT
@@ -538,6 +539,14 @@ class VA_Server:
         max_act_len = num_rdt_act_frames * rdt_horizon
         rdt_ee_pos_emb_config = [("ee_target", ee_condition_tokens)] if ee_condition_tokens else None
         self.ee_target_condition_num_tokens = ee_condition_tokens
+        logger.info(
+            "EE-target evaluation alignment: "
+            f"source={self.rdt_ee_target_condition_source}, "
+            f"K={ee_target_sequence_len}, "
+            f"waypoint_distance={float(getattr(self.job_config, 'ee_target_waypoint_distance', 0.05)):.4f} m, "
+            f"condition_tokens={ee_condition_tokens}, "
+            f"live_labels={bool(getattr(self.job_config, 'live_waypoint_labels', True))}"
+        )
 
         self.action_head = RDT(
             horizon=rdt_horizon,
@@ -1905,12 +1914,16 @@ class VA_Server:
             return conds
 
         sequence_len = max(1, int(getattr(self.job_config, "ee_target_sequence_len", 1)))
-        valid = current_obs.get("expert_target", {}).get("valid", None)
+        waypoint_distance = float(
+            getattr(self.job_config, "ee_target_waypoint_distance", 0.05)
+        )
+        arm_valid = current_obs.get("expert_target", {}).get("valid", None)
         transitions = build_linear_ee_target_transitions(
             current_ee.squeeze(0).detach().cpu().numpy(),
             oracle.squeeze(0).detach().cpu().numpy(),
             sequence_len,
-            valid=valid,
+            valid=arm_valid,
+            waypoint_distance=waypoint_distance,
         )
         oracle = torch.from_numpy(transitions).unsqueeze(0).to(device=oracle.device, dtype=oracle.dtype)
         reference_tokens = conds.get("rdt_ee_c", conds.get("rdt_act_c"))
@@ -1921,11 +1934,21 @@ class VA_Server:
             current_ee=None,
             dtype=reference_tokens.dtype,
         ).to(device=reference_tokens.device)
+        oracle_mask = build_ee_target_token_mask(
+            current_obs.get("ee_target_condition_valid")
+            if current_obs.get("ee_target_condition_valid") is not None
+            else arm_valid,
+            sequence_len=sequence_len,
+            batch_size=oracle.shape[0],
+            device=reference_tokens.device,
+        )
         conds = dict(conds)
         if reference_tokens.ndim == 3:
             conds["rdt_ee_c"] = oracle_tokens
+            conds["rdt_ee_mask"] = oracle_mask
         elif reference_tokens.ndim == 4:
             conds["rdt_ee_c"] = oracle_tokens[:, None].expand(-1, reference_tokens.shape[1], -1, -1)
+            conds["rdt_ee_mask"] = oracle_mask
         else:
             raise ValueError(
                 f"RDT condition must be [B,L,D] or [B,N,L,D], got {tuple(reference_tokens.shape)}"
@@ -1934,7 +1957,7 @@ class VA_Server:
         if not self._logged_oracle_ee_target_condition:
             logger.info(
                 "Oracle EE waypoint condition mode is active: using linear current-state-to-next-target "
-                f"transitions with K={sequence_len}."
+                f"transitions with K={sequence_len}, spacing={waypoint_distance:.4f} m."
             )
             self._logged_oracle_ee_target_condition = True
         return conds
@@ -2072,6 +2095,10 @@ class VA_Server:
             "image_time_ids": image_time_ids,
             "image_view_ids": image_view_ids,
             "ee_target_condition_current": self._extract_current_ee_state_from_obs(current_obs),
+            "ee_target_condition_valid": current_obs.get(
+                "ee_target_condition_valid",
+                current_obs.get("expert_target", {}).get("valid", None),
+            ),
         }
         if not self._logged_image_payload_debug:
             if self.separate_history_current_obs_views:
@@ -2122,6 +2149,8 @@ class VA_Server:
         }
         if frame_conds.get("rdt_ee_c", None) is not None:
             conds["rdt_ee_c"] = frame_conds["rdt_ee_c"].to(self.device, dtype=self.dtype)
+        if frame_conds.get("rdt_ee_mask", None) is not None:
+            conds["rdt_ee_mask"] = frame_conds["rdt_ee_mask"].to(self.device, dtype=torch.bool)
         return conds
 
     @staticmethod
@@ -2162,6 +2191,7 @@ class VA_Server:
             conds_img_c = conds["rdt_img_c"].to(self.device, dtype=action_head_dtype)
             conds_act_c = conds["rdt_act_c"].to(self.device, dtype=action_head_dtype)
             conds_ee_c = conds.get("rdt_ee_c", None)
+            conds_ee_mask = conds.get("rdt_ee_mask", None)
             if conds_ee_c is not None:
                 conds_ee_c = conds_ee_c.to(self.device, dtype=action_head_dtype)
             expected_act_cond_len = self.pred_frames * self.tokens_per_frame
@@ -2178,6 +2208,15 @@ class VA_Server:
                     raise ValueError(
                         f"RDT ee-target condition length mismatch: ee_c={ee_cond_len}, "
                         f"expected={expected_ee_cond_len}"
+                    )
+                if conds_ee_mask is None or tuple(conds_ee_mask.shape) != (
+                    conds_ee_c.shape[0],
+                    expected_ee_cond_len,
+                ):
+                    raise ValueError(
+                        "RDT ee-target condition mask shape mismatch: "
+                        f"mask={None if conds_ee_mask is None else tuple(conds_ee_mask.shape)}, "
+                        f"expected={(conds_ee_c.shape[0], expected_ee_cond_len)}"
                     )
 
             obs_state = current_obs.get("observation.state", None)
@@ -2247,6 +2286,7 @@ class VA_Server:
                     img_c=conds_img_c,
                     act_c=conds_act_c,
                     ee_c=conds_ee_c,
+                    ee_mask=conds_ee_mask,
                     state_c=state_c,
                     embed_input=True,
                     decode_output=True,

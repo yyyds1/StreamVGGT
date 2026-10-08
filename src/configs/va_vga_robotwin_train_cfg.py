@@ -11,7 +11,26 @@ va_vga_robotwin_train_cfg.update(deepcopy(va_vga_robotwin_cfg))
 
 va_vga_robotwin_train_cfg.dataset_type = "robotwin_lerobot"
 va_vga_robotwin_train_cfg.dataset_path = "/inspire/hdd/global_user/yangdongshen-253108120197/code/robotwin-labeled/data_future_target"
-va_vga_robotwin_train_cfg.use_expert_marked_rgb = True
+# Use the full future-waypoint overlay generated as
+# observation.images.<camera>.rgb_expert_plan_marked.
+va_vga_robotwin_train_cfg.use_expert_plan_marked_rgb = True
+va_vga_robotwin_train_cfg.use_expert_marked_rgb = False
+va_vga_robotwin_train_cfg.ee_target_waypoint_distance = 0.05
+# The stored training sequence may use the legacy trace-based waypoint
+# generator. Evaluation constructs live straight-line waypoints; this
+# difference is intentional and does not invalidate the labels.
+va_vga_robotwin_train_cfg.expected_ee_target_sequence_source = None
+va_vga_robotwin_train_cfg.expected_ee_target_sequence_len = 6
+va_vga_robotwin_train_cfg.expected_ee_target_waypoint_distance = 0.05
+va_vga_robotwin_train_cfg.expert_target_keypoint_mode = "sparse_gripper"
+va_vga_robotwin_train_cfg.expert_target_gripper_change_threshold = 0.2
+va_vga_robotwin_train_cfg.expected_expert_target_keypoint_mode = "sparse_gripper"
+va_vga_robotwin_train_cfg.expected_expert_target_gripper_change_threshold = 0.2
+# Train the RDT on the predicted EE-target condition by default so this
+# matches predicted-condition evaluation. Set this to 1.0 only for an
+# intentional oracle-condition experiment.
+va_vga_robotwin_train_cfg.ee_target_condition_gt_mix_enabled = False
+va_vga_robotwin_train_cfg.ee_target_condition_gt_prob = 0.0
 va_vga_robotwin_train_cfg.robotwin_action_space = "joint"
 va_vga_robotwin_train_cfg.joint_action_representation = "absolute"
 va_vga_robotwin_train_cfg.action_dim = 14

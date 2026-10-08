@@ -209,6 +209,7 @@ class RDT(nn.Module):
             lang_mask: (B, L_lang) or None, language condition mask (True for valid).
             img_mask: (B, L_img) or None, image condition mask (True for valid).
             act_mask: (B, L_act) or None, action condition mask (True for valid).
+            ee_mask: (B, L_ee) or None, EE-target condition mask (True for valid).
             embed_input: whether to map action-dim inputs to hidden size using action_embedder.
             decode_output: whether to map hidden outputs back to action dim using action_decoder.
         """

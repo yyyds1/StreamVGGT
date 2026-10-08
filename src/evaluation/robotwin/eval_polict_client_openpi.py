@@ -44,6 +44,7 @@ import json
 from pathlib import Path
 
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
+from evaluation.robotwin.joint_state import compact_dual_arm_joint_state
 from envs.utils.expert_marker import draw_expert_target_sequence_on_rgb
 from evaluation.ee_target_waypoints import build_linear_ee_target_transitions
 
@@ -419,9 +420,23 @@ def main(usr_args):
     else:
         args["single_trajectory_episode_index"] = None
     args["single_trajectory_repo_id"] = usr_args.get("single_trajectory_repo_id", None)
-    args["use_expert_marked_rgb"] = bool(usr_args.get("use_expert_marked_rgb", True))
-    args["live_waypoint_labels"] = bool(usr_args.get("live_waypoint_labels", True))
-    args["ee_target_sequence_len"] = int(usr_args.get("ee_target_sequence_len", 6))
+    if usr_args.get("use_expert_marked_rgb", None) is not None:
+        args["use_expert_marked_rgb"] = bool(usr_args["use_expert_marked_rgb"])
+    if usr_args.get("use_expert_plan_marked_rgb", None) is not None:
+        args["use_expert_plan_marked_rgb"] = bool(usr_args["use_expert_plan_marked_rgb"])
+    if usr_args.get("live_waypoint_labels", None) is not None:
+        args["live_waypoint_labels"] = bool(usr_args["live_waypoint_labels"])
+    if usr_args.get("ee_target_sequence_len", None) is not None:
+        args["ee_target_sequence_len"] = int(usr_args["ee_target_sequence_len"])
+    if usr_args.get("ee_target_waypoint_distance", None) is not None:
+        args["ee_target_waypoint_distance"] = float(usr_args["ee_target_waypoint_distance"])
+    for key, default in (
+        ("expert_target_pos_threshold", 0.05),
+        ("expert_target_rot_threshold", 45.0),
+        ("expert_target_gripper_threshold", 0.2),
+    ):
+        if usr_args.get(key, None) is not None:
+            args[key] = float(usr_args[key])
     checkpoint_dir = usr_args.get("checkpoint_dir", None)
     if checkpoint_dir is not None:
         training_config_path = Path(checkpoint_dir) / "training_config.json"
@@ -435,12 +450,64 @@ def main(usr_args):
                     "action_representation",
                     "joint_action_representation",
                     "use_expert_marked_rgb",
+                    "use_expert_plan_marked_rgb",
+                    "live_waypoint_labels",
                     "ee_target_sequence_len",
+                    "ee_target_waypoint_distance",
+                    "expert_target_pos_threshold",
+                    "expert_target_rot_threshold",
+                    "expert_target_gripper_threshold",
+                    "expert_target_keypoint_mode",
+                    "expert_target_gripper_change_threshold",
+                    "expected_expert_target_keypoint_mode",
+                    "expected_expert_target_gripper_change_threshold",
                 ):
-                    if key in training_config and key not in args:
+                    if key in training_config and usr_args.get(key, None) is None:
                         args[key] = training_config[key]
             except Exception as exc:
                 print(f"[eval] warning: failed to load checkpoint training_config.json: {exc}")
+    # ``args`` is the RobotWin task configuration, while ``usr_args`` is the
+    # client/model configuration. Copy the explicitly resolved model contract
+    # into the task args before eval_policy reads it. Without this handoff, the
+    # client parser can resolve ``joint`` correctly but eval_policy falls back
+    # to its default ``ee`` mode.
+    for key in ("robotwin_action_space", "action_representation", "joint_action_representation"):
+        if usr_args.get(key, None) is not None:
+            args[key] = usr_args[key]
+    args.setdefault("use_expert_marked_rgb", True)
+    args.setdefault("use_expert_plan_marked_rgb", False)
+    # Evaluation should use live fixed-distance waypoint labels by default.
+    args.setdefault("live_waypoint_labels", True)
+    args.setdefault(
+        "ee_target_sequence_len",
+        int(args.get("expert_target_sequence_len", 6)),
+    )
+    args.setdefault(
+        "ee_target_waypoint_distance",
+        float(args.get("expert_target_waypoint_distance", 0.05)),
+    )
+    # RoboTwin reads the expert_* names while StreamVGGT uses the ee_target_*
+    # names. Keep both namespaces identical for online waypoint construction
+    # and expert-cursor progression.
+    args["expert_target_sequence_len"] = int(args["ee_target_sequence_len"])
+    args["expert_target_waypoint_distance"] = float(args["ee_target_waypoint_distance"])
+    args.setdefault("expert_target_pos_threshold", 0.05)
+    args.setdefault("expert_target_rot_threshold", 45.0)
+    args.setdefault("expert_target_gripper_threshold", 0.2)
+    args.setdefault("expert_target_keypoint_mode", "sparse_gripper")
+    args.setdefault("expert_target_gripper_change_threshold", 0.2)
+
+    resolved_action_space = str(args.get("robotwin_action_space", "ee")).lower()
+    if resolved_action_space not in {"ee", "joint"}:
+        raise ValueError(
+            f"Invalid evaluation robotwin_action_space={resolved_action_space!r}; "
+            "expected 'ee' or 'joint'."
+        )
+    print(
+        f"[eval_client] task config resolved action space={resolved_action_space}; "
+        f"client option={usr_args.get('robotwin_action_space', None)!r}",
+        flush=True,
+    )
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -602,20 +669,10 @@ def format_robot_joint_state(task_env):
     robot = getattr(task_env, "robot", None)
     if robot is None:
         raise RuntimeError("TASK_ENV has no robot; cannot read live joint state.")
-    joint_state = np.asarray(
-        robot.get_left_arm_jointState() + robot.get_right_arm_jointState(),
-        dtype=np.float32,
-    ).reshape(-1)
-    if joint_state.size == 16:
-        return np.concatenate(
-            [
-                joint_state[:6],
-                joint_state[7:8],
-                joint_state[8:14],
-                joint_state[15:16],
-            ]
-        ).astype(np.float32)
-    return joint_state
+    return compact_dual_arm_joint_state(
+        robot.get_left_arm_jointState(),
+        robot.get_right_arm_jointState(),
+    )
 
 
 def _compact_ee_state_14(observation):
@@ -768,7 +825,13 @@ def clip_joint_action_to_dataset_bounds(qpos_action, args):
     return clipped.astype(np.float32), bool(np.any(np.abs(clipped - action) > 1e-6))
 
 
-def _get_camera_rgb(observation, camera_name, use_expert_marked_rgb=True, required=True):
+def _get_camera_rgb(
+    observation,
+    camera_name,
+    use_expert_marked_rgb=True,
+    use_expert_plan_marked_rgb=False,
+    required=True,
+):
     cameras = observation.get("observation", {})
     if camera_name not in cameras:
         if required:
@@ -778,6 +841,11 @@ def _get_camera_rgb(observation, camera_name, use_expert_marked_rgb=True, requir
             )
         return None
     camera_obs = cameras[camera_name]
+    if use_expert_plan_marked_rgb:
+        return camera_obs.get(
+            "rgb_expert_plan_marked",
+            camera_obs.get("rgb_expert_marked", camera_obs["rgb"]),
+        )
     if not use_expert_marked_rgb:
         return camera_obs["rgb"]
     return camera_obs.get("rgb_expert_marked", camera_obs["rgb"])
@@ -811,7 +879,7 @@ def _compact_expert_target(observation):
     }
 
 
-def _live_waypoint_sequence(observation, sequence_len):
+def _live_waypoint_sequence(observation, sequence_len, waypoint_distance=0.05):
     """Build projected-pose labels from live EE state to current expert targets."""
     target = _compact_expert_target(observation)
     if target is None:
@@ -819,36 +887,51 @@ def _live_waypoint_sequence(observation, sequence_len):
     try:
         current = format_eef_state(observation).reshape(2, 8).astype(np.float32)
         target_value = np.asarray(target["value"], dtype=np.float32).reshape(2, 8)
-        transitions = build_linear_ee_target_transitions(
+        transitions, waypoint_valid, _ = build_linear_ee_target_transitions(
             current,
             target_value,
             sequence_len,
             valid=target["valid"],
+            waypoint_distance=waypoint_distance,
+            return_metadata=True,
         )
     except (KeyError, TypeError, ValueError):
         return None
 
     horizon = transitions.shape[1]
-    alpha = np.arange(1, horizon + 1, dtype=np.float32) / float(horizon)
     sequence = {}
     for arm_idx, arm in enumerate(("left", "right")):
-        pose = np.zeros((horizon + 1, 7), dtype=np.float64)
-        gripper = np.ones((horizon + 1,), dtype=np.float64)
-        pose[0] = current[arm_idx, :7]
-        gripper[0] = current[arm_idx, 7]
-        pose[1:, :3] = current[arm_idx, None, :3] + alpha[:, None] * (
-            target_value[arm_idx, None, :3] - current[arm_idx, None, :3]
-        )
+        pose = np.zeros((horizon, 7), dtype=np.float64)
+        gripper = np.ones((horizon,), dtype=np.float64)
+        pose[:, :3] = current[arm_idx, None, :3] + transitions[arm_idx, :, :3]
         # Orientation is not predicted by the EE-target head; retain the live
         # orientation only so the projected point label has a valid pose.
-        pose[1:, 3:7] = current[arm_idx, None, 3:7]
-        gripper[1:] = current[arm_idx, 7] + transitions[arm_idx, :, 3]
-        valid = np.concatenate([[True], np.full((horizon,), bool(target["valid"][arm_idx]))])
-        sequence[arm] = {"pose_7d": pose, "gripper": gripper, "valid": valid}
+        pose[:, 3:7] = current[arm_idx, None, 3:7]
+        gripper[:] = current[arm_idx, 7] + transitions[arm_idx, :, 3]
+        sequence[arm] = {
+            "pose_7d": pose,
+            "gripper": gripper,
+            "valid": waypoint_valid[arm_idx],
+        }
     return sequence
 
 
-def _get_live_marked_camera_rgb(observation, camera_name, sequence_len):
+def _live_waypoint_validity(observation, sequence_len, waypoint_distance=0.05):
+    sequence = _live_waypoint_sequence(observation, sequence_len, waypoint_distance)
+    if sequence is None:
+        return None
+    return [
+        np.asarray(sequence[arm]["valid"], dtype=bool).tolist()
+        for arm in ("left", "right")
+    ]
+
+
+def _get_live_marked_camera_rgb(
+    observation,
+    camera_name,
+    sequence_len,
+    waypoint_distance=0.05,
+):
     cameras = observation.get("observation", {})
     camera_obs = cameras.get(camera_name)
     if camera_obs is None:
@@ -856,7 +939,7 @@ def _get_live_marked_camera_rgb(observation, camera_name, sequence_len):
             f"Observation is missing camera `{camera_name}`. "
             f"Available cameras={sorted(cameras.keys())}"
         )
-    sequence = _live_waypoint_sequence(observation, sequence_len)
+    sequence = _live_waypoint_sequence(observation, sequence_len, waypoint_distance)
     if sequence is None:
         return camera_obs["rgb"]
     marked, _ = draw_expert_target_sequence_on_rgb(camera_obs["rgb"], camera_obs, sequence)
@@ -867,16 +950,28 @@ def format_obs(
     observation,
     prompt,
     use_expert_marked_rgb=True,
+    use_expert_plan_marked_rgb=False,
     robotwin_action_space="ee",
     live_waypoint_labels=False,
     ee_target_sequence_len=6,
+    ee_target_waypoint_distance=0.05,
 ):
     robotwin_action_space = str(robotwin_action_space or "ee").lower()
     state = format_joint_state(observation) if robotwin_action_space == "joint" else format_eef_state(observation)
     camera_rgb = lambda name: (
-        _get_live_marked_camera_rgb(observation, name, ee_target_sequence_len)
+        _get_live_marked_camera_rgb(
+            observation,
+            name,
+            ee_target_sequence_len,
+            ee_target_waypoint_distance,
+        )
         if live_waypoint_labels
-        else _get_camera_rgb(observation, name, use_expert_marked_rgb)
+        else _get_camera_rgb(
+            observation,
+            name,
+            use_expert_marked_rgb,
+            use_expert_plan_marked_rgb,
+        )
     )
     obs = {
         "head_camera": camera_rgb("head_camera"),
@@ -893,17 +988,30 @@ def format_obs(
         observation,
         "front_camera",
         use_expert_marked_rgb,
+        use_expert_plan_marked_rgb,
         required=False,
     )
     if front_camera is not None:
         obs["front_camera"] = (
-            _get_live_marked_camera_rgb(observation, "front_camera", ee_target_sequence_len)
+            _get_live_marked_camera_rgb(
+                observation,
+                "front_camera",
+                ee_target_sequence_len,
+                ee_target_waypoint_distance,
+            )
             if live_waypoint_labels
             else front_camera
         )
     expert_target = _compact_expert_target(observation)
     if expert_target is not None:
         obs["expert_target"] = expert_target
+        waypoint_valid = _live_waypoint_validity(
+            observation,
+            ee_target_sequence_len,
+            ee_target_waypoint_distance,
+        )
+        if waypoint_valid is not None:
+            obs["ee_target_condition_valid"] = waypoint_valid
     try:
         obs["ee_state"] = format_eef_state(observation).reshape(2, 8).tolist()
     except Exception:
@@ -916,20 +1024,29 @@ def format_policy_obs(
     observation,
     prompt,
     use_expert_marked_rgb=True,
+    use_expert_plan_marked_rgb=False,
     robotwin_action_space="ee",
     live_waypoint_labels=True,
     ee_target_sequence_len=6,
+    ee_target_waypoint_distance=0.05,
 ):
     obs = format_obs(
         observation,
         prompt,
         use_expert_marked_rgb=use_expert_marked_rgb,
+        use_expert_plan_marked_rgb=use_expert_plan_marked_rgb,
         robotwin_action_space=robotwin_action_space,
         live_waypoint_labels=live_waypoint_labels,
         ee_target_sequence_len=ee_target_sequence_len,
+        ee_target_waypoint_distance=ee_target_waypoint_distance,
     )
     if str(robotwin_action_space or "ee").lower() == "joint":
         obs["observation.state"] = format_robot_joint_state(task_env)
+        if np.asarray(obs["observation.state"]).reshape(-1).size != 14:
+            raise RuntimeError(
+                "Joint-mode policy observation must contain exactly 14 qpos values "
+                "before websocket transmission."
+            )
         compact_ee = _compact_ee_state_14(observation)
         if compact_ee is not None and np.allclose(obs["observation.state"], compact_ee, atol=1e-5, rtol=1e-5):
             raise RuntimeError(
@@ -1312,9 +1429,18 @@ def eval_policy(task_name,
         initial_obs,
         prompt,
         use_expert_marked_rgb=use_expert_marked_rgb,
+        use_expert_plan_marked_rgb=bool(args.get("use_expert_plan_marked_rgb", False)),
         robotwin_action_space=robotwin_action_space,
         live_waypoint_labels=bool(args.get("live_waypoint_labels", True)),
         ee_target_sequence_len=int(args.get("ee_target_sequence_len", 6)),
+            ee_target_waypoint_distance=float(args.get("ee_target_waypoint_distance", 0.05)),
+        )
+        initial_state = np.asarray(initial_formatted_obs["observation.state"]).reshape(-1)
+        print(
+            f"[eval_client] resolved action space={robotwin_action_space}; "
+            f"observation.state shape={tuple(initial_state.shape)}; "
+            f"state source={'robot.get_*_arm_jointState()' if robotwin_action_space == 'joint' else 'endpose'}",
+            flush=True,
         )
 
         # StreamVGGT now follows p2p and encodes the prompt on the policy server with
@@ -1340,9 +1466,11 @@ def eval_policy(task_name,
                 observation,
                 prompt,
                 use_expert_marked_rgb=use_expert_marked_rgb,
+                use_expert_plan_marked_rgb=bool(args.get("use_expert_plan_marked_rgb", False)),
                 robotwin_action_space=robotwin_action_space,
                 live_waypoint_labels=bool(args.get("live_waypoint_labels", True)),
                 ee_target_sequence_len=int(args.get("ee_target_sequence_len", 6)),
+                ee_target_waypoint_distance=float(args.get("ee_target_waypoint_distance", 0.05)),
             )
             current_obs["episode_index"] = episode_index
 
@@ -1415,9 +1543,11 @@ def eval_policy(task_name,
                 TASK_ENV.get_obs(),
                 prompt,
                 use_expert_marked_rgb=use_expert_marked_rgb,
+                use_expert_plan_marked_rgb=bool(args.get("use_expert_plan_marked_rgb", False)),
                 robotwin_action_space=robotwin_action_space,
                 live_waypoint_labels=bool(args.get("live_waypoint_labels", True)),
                 ee_target_sequence_len=int(args.get("ee_target_sequence_len", 6)),
+                ee_target_waypoint_distance=float(args.get("ee_target_waypoint_distance", 0.05)),
             )
             full_obs_list.append(obs)
   
@@ -1476,7 +1606,6 @@ def eval_policy(task_name,
 def parse_args_and_config():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--overrides", nargs=argparse.REMAINDER)
     parser.add_argument("--headless", action="store_true", help="run without render self-test on headless servers")
     parser.add_argument("--host", type=str, default="127.0.0.1", help='remote policy server host.')
     parser.add_argument("--port", type=int, default=8000, help='remote policy socket port.')
@@ -1486,9 +1615,61 @@ def parse_args_and_config():
     parser.add_argument("--test_num", type=int, default=100)
     parser.add_argument("--max_episode_steps", type=int, default=None)
     parser.add_argument("--use_expert_marked_rgb", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--use_expert_plan_marked_rgb",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--live_waypoint_labels",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--ee-target-sequence-len", type=int, default=None)
+    parser.add_argument("--ee-target-waypoint-distance", type=float, default=None)
+    parser.add_argument(
+        "--expert-target-pos-threshold",
+        "--expert_target_pos_threshold",
+        dest="expert_target_pos_threshold",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--expert-target-rot-threshold",
+        "--expert_target_rot_threshold",
+        dest="expert_target_rot_threshold",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--expert-target-gripper-threshold",
+        "--expert_target_gripper_threshold",
+        dest="expert_target_gripper_threshold",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--expert-target-keypoint-mode",
+        "--expert_target_keypoint_mode",
+        dest="expert_target_keypoint_mode",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--expert-target-gripper-change-threshold",
+        "--expert_target_gripper_change_threshold",
+        dest="expert_target_gripper_change_threshold",
+        type=float,
+        default=None,
+    )
     parser.add_argument("--joint_use_direct_control", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--joint_direct_control_steps", type=int, default=None)
     parser.add_argument("--clip_joint_action_to_dataset_bounds", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--robotwin_action_space", "--robotwin-action-space", dest="robotwin_action_space", choices=("ee", "joint"), default=None)
+    parser.add_argument("--action_representation", "--action-representation", dest="action_representation", default=None)
+    parser.add_argument("--joint_action_representation", "--joint-action-representation", dest="joint_action_representation", default=None)
+    parser.add_argument("--checkpoint_dir", "--checkpoint-dir", dest="checkpoint_dir", default=None)
+    parser.add_argument("--overrides", nargs=argparse.REMAINDER)
     parser.add_argument("--single_trajectory", action="store_true")
     parser.add_argument("--single_trajectory_episode_index", type=int, default=None)
     parser.add_argument("--single_trajectory_repo_id", type=str, default=None)
@@ -1526,6 +1707,26 @@ def parse_args_and_config():
         config["max_episode_steps"] = int(args.max_episode_steps)
     if args.use_expert_marked_rgb is not None:
         config["use_expert_marked_rgb"] = bool(args.use_expert_marked_rgb)
+    if args.use_expert_plan_marked_rgb is not None:
+        config["use_expert_plan_marked_rgb"] = bool(args.use_expert_plan_marked_rgb)
+    if args.live_waypoint_labels is not None:
+        config["live_waypoint_labels"] = bool(args.live_waypoint_labels)
+    if args.ee_target_sequence_len is not None:
+        config["ee_target_sequence_len"] = int(args.ee_target_sequence_len)
+    if args.ee_target_waypoint_distance is not None:
+        config["ee_target_waypoint_distance"] = float(args.ee_target_waypoint_distance)
+    if args.expert_target_pos_threshold is not None:
+        config["expert_target_pos_threshold"] = float(args.expert_target_pos_threshold)
+    if args.expert_target_rot_threshold is not None:
+        config["expert_target_rot_threshold"] = float(args.expert_target_rot_threshold)
+    if args.expert_target_gripper_threshold is not None:
+        config["expert_target_gripper_threshold"] = float(args.expert_target_gripper_threshold)
+    if args.expert_target_keypoint_mode is not None:
+        config["expert_target_keypoint_mode"] = str(args.expert_target_keypoint_mode)
+    if args.expert_target_gripper_change_threshold is not None:
+        config["expert_target_gripper_change_threshold"] = float(
+            args.expert_target_gripper_change_threshold
+        )
     if args.joint_use_direct_control is not None:
         config["joint_use_direct_control"] = bool(args.joint_use_direct_control)
     else:
@@ -1538,6 +1739,23 @@ def parse_args_and_config():
         config["clip_joint_action_to_dataset_bounds"] = bool(args.clip_joint_action_to_dataset_bounds)
     else:
         config.setdefault("clip_joint_action_to_dataset_bounds", True)
+    # These are model-contract settings, not RobotWin task overrides. Apply
+    # them after loading the YAML and checkpoint metadata so the launch command
+    # cannot silently fall back to EE mode.
+    if args.robotwin_action_space is not None:
+        config["robotwin_action_space"] = str(args.robotwin_action_space).lower()
+    elif os.environ.get("ROBOTWIN_ACTION_SPACE"):
+        config["robotwin_action_space"] = os.environ["ROBOTWIN_ACTION_SPACE"].strip().lower()
+    if args.action_representation is not None:
+        config["action_representation"] = args.action_representation
+    if args.joint_action_representation is not None:
+        config["joint_action_representation"] = args.joint_action_representation
+    if args.checkpoint_dir is not None:
+        config["checkpoint_dir"] = args.checkpoint_dir
+    if config.get("robotwin_action_space") not in {"ee", "joint"}:
+        raise ValueError(
+            f"Invalid robotwin_action_space={config.get('robotwin_action_space')!r}; expected 'ee' or 'joint'."
+        )
     if args.single_trajectory:
         config["single_trajectory"] = True
     if args.single_trajectory_episode_index is not None:
