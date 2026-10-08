@@ -190,7 +190,7 @@ Stage 1 freezes the visual backbone and disables LoRA:
 NGPU=8 SAVE_ROOT=./train_out/head_camera_stage1 \
   bash src/scripts/run_head_camera_stage1.sh
 # Single task; leave SINGLE_TASK empty for multi-task training.
-SINGLE_TASK=adjust_bottle bash src/scripts/run_head_camera_stage1.sh
+SINGLE_TASK=adjust_bottle PYTHON_BIN=python3 bash src/scripts/run_head_camera_stage1.sh
 ```
 
 Stage 2 defaults to LoRA (`LORA=1`). Set `LORA=0` for full-parameter training.
