@@ -11,7 +11,19 @@ cd "$(dirname "$0")/.."
 : "${LORA:=1}"
 : "${SINGLE_TASK:=}"
 : "${RESUME_CHECKPOINT_DIR:=}"
-: "${PYTHON_BIN:=python3}"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    for candidate in \
+        /opt/conda/envs/RoboTwin2/bin/python \
+        /root/miniforge3/envs/RoboTwin2/bin/python \
+        /opt/miniconda/envs/RoboTwin2/bin/python \
+        "$(command -v python3 2>/dev/null || true)"; do
+        if [[ -x "$candidate" ]] && "$candidate" -c "import torch" >/dev/null 2>&1; then
+            PYTHON_BIN="$candidate"
+            break
+        fi
+    done
+fi
+: "${PYTHON_BIN:?Could not find a Python executable with torch; set PYTHON_BIN to the RoboTwin2 environment Python}"
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TORCHFT_LIGHTHOUSE
