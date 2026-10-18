@@ -342,18 +342,34 @@ class VA_Server:
         self.model_arch = str(getattr(job_config, "model_arch", "actionvggt")).lower()
         self.rdt_use_language_condition = bool(getattr(job_config, "rdt_use_language_condition", False))
         self.enable_ee_target_module = bool(getattr(job_config, "enable_ee_target_module", True))
+        self.enable_se3_guidance = bool(getattr(job_config, "enable_se3_guidance", False))
+        if self.enable_se3_guidance:
+            job_config.enable_ee_target_head_eval = False
+            job_config.enable_ee_target_loss = False
+            job_config.use_ee_target_as_rdt_condition = True
+            cond_cfg = getattr(job_config, "rdt_condition_tokens", None)
+            if cond_cfg is not None: cond_cfg.use_ee_target_tokens = True
+        self.se3_guidance_source = str(getattr(job_config, "se3_guidance_source", "oracle")).lower()
+        if self.se3_guidance_source == "oracle": self.se3_guidance_source = "client"
+        self.se3_guidance_noisy = bool(getattr(job_config, "se3_guidance_noisy_oracle", False))
+        self._logged_se3_guidance = False
         if not self.enable_ee_target_module:
             job_config.enable_ee_target_loss = False
             job_config.enable_ee_target_head_eval = False
-            job_config.use_ee_target_as_rdt_condition = False
+            job_config.use_ee_target_as_rdt_condition = bool(getattr(job_config, "enable_se3_guidance", False))
             job_config.ee_target_condition_gt_mix_enabled = False
             cond_cfg = getattr(job_config, "rdt_condition_tokens", None)
             if cond_cfg is not None:
-                cond_cfg.use_ee_target_tokens = False
+                cond_cfg.use_ee_target_tokens = bool(getattr(job_config, "enable_se3_guidance", False))
                 cond_cfg.ee_target_layers = []
         self.rdt_ee_target_condition_source = str(
             getattr(job_config, "rdt_ee_target_condition_source", "predicted")
         ).lower()
+        if self.enable_se3_guidance and self.rdt_ee_target_condition_source == "predicted":
+            self.se3_guidance_source = "oracle"
+        self.mask_ee_target_condition = bool(
+            getattr(job_config, "mask_ee_target_condition", False)
+        )
         if self.rdt_ee_target_condition_source not in {"predicted", "oracle"}:
             raise ValueError(
                 "rdt_ee_target_condition_source must be one of {'predicted', 'oracle'}, "
@@ -456,7 +472,7 @@ class VA_Server:
             cond_cfg = getattr(job_config, "rdt_condition_tokens", None)
             cond_cfg_dict = dict(cond_cfg or {})
             self.use_ee_target_as_rdt_condition = bool(
-                self.enable_ee_target_module
+                (self.enable_se3_guidance or self.enable_ee_target_module)
                 and (
                     getattr(job_config, "use_ee_target_as_rdt_condition", False)
                     or cond_cfg_dict.get("use_ee_target_tokens", False)
@@ -464,6 +480,7 @@ class VA_Server:
             )
             enable_ee_target_head_eval = bool(
                 self.enable_ee_target_module
+                and not self.enable_se3_guidance
                 and (
                     getattr(
                         job_config,
@@ -479,6 +496,9 @@ class VA_Server:
                 enable_camera_head=False,
                 enable_depth_head=False,
                 enable_ee_target_head=enable_ee_target_head_eval,
+                enable_se3_guidance=self.enable_se3_guidance,
+                se3_max_waypoints=6,
+                se3_max_duration=int(getattr(job_config, "sparse_waypoint_max_duration", 32)),
                 ee_target_head_num_heads=int(getattr(job_config, "ee_target_head_num_heads", 8)),
                 ee_target_head_trunk_depth=int(getattr(job_config, "ee_target_head_trunk_depth", 4)),
                 ee_target_head_num_iterations=int(getattr(job_config, "ee_target_head_num_iterations", 4)),
@@ -532,13 +552,15 @@ class VA_Server:
         rdt_act_pos_emb_config = [("action", (num_rdt_act_frames, rdt_horizon))]
         ee_target_sequence_len = max(1, int(getattr(self.job_config, "ee_target_sequence_len", 1)))
         ee_condition_tokens = (
-            4 * ee_target_sequence_len
-            if getattr(self, "use_ee_target_as_rdt_condition", False)
-            else 0
+            self.transformer.se3_guidance_tokenizer.MAX_WAYPOINTS
+            * self.transformer.se3_guidance_tokenizer.TOKENS_PER_BLOCK
+            if self.enable_se3_guidance
+            else (4 * ee_target_sequence_len if getattr(self, "use_ee_target_as_rdt_condition", False) else 0)
         )
         max_act_len = num_rdt_act_frames * rdt_horizon
         rdt_ee_pos_emb_config = [("ee_target", ee_condition_tokens)] if ee_condition_tokens else None
         self.ee_target_condition_num_tokens = ee_condition_tokens
+        self.se3_guidance_condition_num_tokens = ee_condition_tokens if self.enable_se3_guidance else 0
         logger.info(
             "EE-target evaluation alignment: "
             f"source={self.rdt_ee_target_condition_source}, "
@@ -1858,6 +1880,81 @@ class VA_Server:
             valid = np.asarray(valid, dtype=bool).reshape(-1)
         return torch.from_numpy(ee_target).unsqueeze(0)
 
+    def _build_se3_guidance_from_obs(self, current_obs):
+        if not isinstance(current_obs, dict): return None
+        if self.se3_guidance_source == "noisy_oracle": self.se3_guidance_noisy = True
+        elif self.se3_guidance_source not in {"oracle", "client"}:
+            raise ValueError(f"Unsupported se3_guidance_source={self.se3_guidance_source!r}")
+        payload = (current_obs.get("sparse_waypoints", current_obs.get("expert_target_sequence"))
+                   if self.se3_guidance_source == "client" else current_obs.get("oracle_sparse_waypoints"))
+        if payload is not None:
+            data = payload.get("value", payload) if isinstance(payload, dict) else payload
+            if isinstance(data, dict):
+                if isinstance(data.get("left_pose_7d"), torch.Tensor):
+                    data = {k:(v.detach().cpu().numpy() if torch.is_tensor(v) else v) for k,v in data.items()}
+                values={}
+                keys=("left_pose_7d","right_pose_7d","left_gripper","right_gripper","left_valid","right_valid","duration","phase","confidence","plan_age")
+                for key in keys:
+                    if key not in data: return None
+                    value=np.asarray(data[key])
+                    if value.ndim and value.shape[0] == 1: value=value[0]
+                    values[key]=value
+                transition=data.get("transition",data.get("mandatory_gripper_transition"))
+                if transition is None: transition=np.zeros_like(values["duration"],dtype=np.float32)
+                values["transition"]=np.asarray(transition).reshape(-1)
+                valid_count=min(6,len(values["duration"]))
+                for key,value in values.items(): values[key]=value[:valid_count]
+                frame_offset=np.asarray(data.get("frame_offset",np.arange(1,valid_count+1))).reshape(-1)[:valid_count]
+                supplied_mask=data.get("block_valid")
+                if supplied_mask is None: supplied_mask=np.ones(valid_count,dtype=bool)
+                else:
+                    supplied_mask=np.asarray(supplied_mask).reshape(-1)[:valid_count]
+                values["block_valid"]=np.asarray(supplied_mask,dtype=bool) & ((values["left_valid"]>0) | (values["right_valid"]>0)) & (frame_offset>=0)
+                if not bool(np.any(values["block_valid"])):
+                    raise RuntimeError("Client sparse waypoint payload contains no valid blocks")
+                result=values
+            else:
+                raise RuntimeError("Client sparse waypoint payload is not a mapping")
+        elif self.se3_guidance_source == "client":
+            raise RuntimeError("Client sparse waypoint payload is missing")
+        else:
+            result=None
+        if result is None:
+            target = self._extract_oracle_ee_target_from_obs(current_obs)
+            state = self._extract_current_ee_state_from_obs(current_obs)
+            if target is None or state is None: return None
+            target=target.squeeze(0).cpu().numpy(); state=state.squeeze(0).cpu().numpy()
+            count=6; phase=np.linspace(1.0/count,1.0,count,dtype=np.float32)
+            result={"left_pose_7d":np.repeat(target[0:1,:7],count,axis=0),"right_pose_7d":np.repeat(target[1:2,:7],count,axis=0),
+                    "left_gripper":np.full(count,target[0,7],np.float32),"right_gripper":np.full(count,target[1,7],np.float32),
+                    "left_valid":np.ones(count,bool),"right_valid":np.ones(count,bool),"duration":np.full(count,32//count,np.int64),
+                    "phase":phase,"confidence":np.ones(count,np.float32),"plan_age":np.zeros(count,np.float32),
+                    "transition":np.zeros(count,np.float32),"block_valid":np.ones(count,bool)}
+            for arm_idx,arm in enumerate(("left","right")):
+                q0=state[arm_idx,3:7].astype(np.float64); q1=target[arm_idx,3:7].astype(np.float64)
+                q0/=max(np.linalg.norm(q0),1e-8); q1/=max(np.linalg.norm(q1),1e-8)
+                if np.dot(q0,q1)<0: q1=-q1
+                dot=float(np.clip(np.dot(q0,q1),-1.0,1.0)); theta=np.arccos(dot)
+                if theta<1e-6: quat=np.repeat(q1[None],count,axis=0)
+                else: quat=(np.sin((1-phase[:,None])*theta)*q0[None]+np.sin(phase[:,None]*theta)*q1[None])/np.sin(theta)
+                result[f"{arm}_pose_7d"][:,3:7]=quat.astype(np.float32)
+                result[f"{arm}_pose_7d"][:,:3]=state[arm_idx,None,:3]+phase[:,None]*(target[arm_idx,None,:3]-state[arm_idx,None,:3])
+                result[f"{arm}_gripper"][:]=state[arm_idx,7]+phase*(target[arm_idx,7]-state[arm_idx,7])
+                arm_valid=current_obs.get("expert_target",{}).get("valid",[True,True])
+                result[f"{arm}_valid"][:]=bool(arm_valid[arm_idx]) if len(arm_valid)>arm_idx else True
+            result["transition"][0]=float(np.any(np.abs(target[:,7]-state[:,7])>0.2))
+        if self.se3_guidance_noisy:
+            rng=np.random.default_rng()
+            result["left_pose_7d"]=result["left_pose_7d"].copy(); result["right_pose_7d"]=result["right_pose_7d"].copy()
+            for key in ("left_pose_7d","right_pose_7d"):
+                result[key][:,:3]+=rng.normal(0,float(getattr(self.job_config,"se3_guidance_position_noise_std",0.005)),result[key][:,:3].shape)
+            result["confidence"]=np.clip(result["confidence"]-float(getattr(self.job_config,"se3_guidance_confidence_noise",0.1)),0,1)
+        current_ee = self._extract_current_ee_state_from_obs(current_obs)
+        if current_ee is None:
+            return None
+        result["current_ee"] = current_ee.squeeze(0).detach().cpu().numpy()
+        return {key: torch.as_tensor(value, device=self.device).unsqueeze(0) for key, value in result.items()}
+
     def _extract_current_ee_state_from_obs(self, current_obs):
         if not isinstance(current_obs, dict):
             return None
@@ -2095,6 +2192,7 @@ class VA_Server:
             "image_time_ids": image_time_ids,
             "image_view_ids": image_view_ids,
             "ee_target_condition_current": self._extract_current_ee_state_from_obs(current_obs),
+            "se3_guidance": None,
             "ee_target_condition_valid": current_obs.get(
                 "ee_target_condition_valid",
                 current_obs.get("expert_target", {}).get("valid", None),
@@ -2121,13 +2219,41 @@ class VA_Server:
                     f"current_image_frame_count={int(current_image_frame_count)}"
                 )
             self._logged_image_payload_debug = True
+        frame_payload["se3_guidance"] = self._build_se3_guidance_from_obs(current_obs) if self.enable_se3_guidance else None
+        if self.enable_se3_guidance and frame_payload["se3_guidance"] is None:
+            raise RuntimeError("SE3 guidance is enabled but this test observation contains no usable sparse/oracle waypoints")
         with torch.cuda.amp.autocast(enabled=False):
             transformer_out = self.transformer.inference(
                 [frame_payload],
                 past_key_values=None,
             )
         conds = transformer_out.ress
-        conds = self._replace_ee_target_condition_with_oracle(conds, current_obs)
+        if self.enable_se3_guidance and isinstance(conds, dict):
+            guidance = frame_payload.get("se3_guidance")
+            if guidance is not None:
+                ref = conds.get("rdt_act_c")
+                dtype = ref.dtype if ref is not None else next(self.transformer.parameters()).dtype
+                tok, mask = self.transformer.se3_guidance_tokenizer(guidance, dtype=dtype)
+                conds = dict(conds); conds["rdt_se3_c"] = tok; conds["rdt_se3_mask"] = mask
+                conds["rdt_ee_c"] = tok; conds["rdt_ee_mask"] = mask
+                if not self._logged_se3_guidance:
+                    block_valid = guidance.get("block_valid")
+                    valid_count = int(block_valid.to(dtype=torch.bool).sum().item()) if block_valid is not None else -1
+                    logger.info(f"SE3 guidance active: source={self.se3_guidance_source}, max_waypoints={guidance['duration'].shape[1]}, valid_blocks={valid_count}, tokens_per_block={self.transformer.se3_guidance_tokenizer.TOKENS_PER_BLOCK}, noisy={self.se3_guidance_noisy}")
+                    self._logged_se3_guidance = True
+        if self.mask_ee_target_condition and not self.enable_se3_guidance and isinstance(conds, dict):
+            ee_tokens = conds.get("rdt_ee_c")
+            if ee_tokens is not None:
+                token_len = self._rdt_condition_token_len(ee_tokens)
+                conds = dict(conds)
+                conds["rdt_ee_mask"] = torch.zeros(
+                    (ee_tokens.shape[0], token_len),
+                    device=ee_tokens.device,
+                    dtype=torch.bool,
+                )
+                if not getattr(self, "_logged_masked_ee_target_condition", False):
+                    logger.info("EE-target condition mask mode is active: all EE-target tokens are masked.")
+                    self._logged_masked_ee_target_condition = True
         return conds
 
     def _append_rdt_condition_history(self, conds):
@@ -2151,6 +2277,10 @@ class VA_Server:
             conds["rdt_ee_c"] = frame_conds["rdt_ee_c"].to(self.device, dtype=self.dtype)
         if frame_conds.get("rdt_ee_mask", None) is not None:
             conds["rdt_ee_mask"] = frame_conds["rdt_ee_mask"].to(self.device, dtype=torch.bool)
+        if frame_conds.get("rdt_se3_c", None) is not None:
+            conds["rdt_se3_c"] = frame_conds["rdt_se3_c"].to(self.device, dtype=self.dtype)
+        if frame_conds.get("rdt_se3_mask", None) is not None:
+            conds["rdt_se3_mask"] = frame_conds["rdt_se3_mask"].to(self.device, dtype=torch.bool)
         return conds
 
     @staticmethod
@@ -2190,8 +2320,8 @@ class VA_Server:
             action_head_dtype = next(self.action_head.parameters()).dtype
             conds_img_c = conds["rdt_img_c"].to(self.device, dtype=action_head_dtype)
             conds_act_c = conds["rdt_act_c"].to(self.device, dtype=action_head_dtype)
-            conds_ee_c = conds.get("rdt_ee_c", None)
-            conds_ee_mask = conds.get("rdt_ee_mask", None)
+            conds_ee_c = conds.get("rdt_se3_c", conds.get("rdt_ee_c", None))
+            conds_ee_mask = conds.get("rdt_se3_mask", conds.get("rdt_ee_mask", None))
             if conds_ee_c is not None:
                 conds_ee_c = conds_ee_c.to(self.device, dtype=action_head_dtype)
             expected_act_cond_len = self.pred_frames * self.tokens_per_frame
@@ -2597,6 +2727,13 @@ def run(args):
     if eval_config_path is not None:
         logger.info(f"Loading evaluation config from: {eval_config_path}")
         config = _load_eval_config(eval_config_path)
+        if bool(getattr(config, "enable_se3_guidance", False)):
+            config.enable_ee_target_module = False
+            config.enable_ee_target_head_eval = False
+            config.enable_ee_target_loss = False
+            config.use_ee_target_as_rdt_condition = True
+            if getattr(config, "rdt_condition_tokens", None) is not None:
+                config.rdt_condition_tokens.use_ee_target_tokens = True
     elif checkpoint_dir is not None:
         raise FileNotFoundError(f"Missing training_config.json under checkpoint dir: {checkpoint_dir}")
 
@@ -2653,6 +2790,14 @@ def run(args):
         config.disable_joint_delta_warm_start_eval = True
     if args.rdt_ee_target_condition_source is not None:
         config.rdt_ee_target_condition_source = args.rdt_ee_target_condition_source
+        if bool(getattr(config, "enable_se3_guidance", False)):
+            config.se3_guidance_source = args.rdt_ee_target_condition_source
+    if getattr(args, "se3_guidance_source", None) is not None:
+        config.se3_guidance_source = args.se3_guidance_source
+    if getattr(args, "se3_guidance_noisy_oracle", False):
+        config.se3_guidance_noisy_oracle = True
+    if args.mask_ee_target_condition:
+        config.mask_ee_target_condition = True
 
     model = VA_Server(config)
     run_async_server_mode(model, local_rank, config.host, port)
@@ -2745,12 +2890,19 @@ def main():
     )
     parser.add_argument(
         "--rdt-ee-target-condition-source",
-        choices=["predicted", "oracle"],
+        choices=["predicted", "oracle", "noisy_oracle"],
         default=None,
         help=(
             "Evaluation-only debug switch for ee-target RDT tokens. "
             "`predicted` uses the VGA ee-target head; `oracle` uses env expert_target from the client."
         ),
+    )
+    parser.add_argument("--se3-guidance-source", choices=["oracle", "noisy_oracle", "client"], default=None)
+    parser.add_argument("--se3-guidance-noisy-oracle", action="store_true")
+    parser.add_argument(
+        "--mask-ee-target-condition",
+        action="store_true",
+        help="Mask all EE-target RDT condition tokens during evaluation.",
     )
     args = parser.parse_args()
     run(args)

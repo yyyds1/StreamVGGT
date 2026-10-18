@@ -203,13 +203,13 @@ class RDT(nn.Module):
                 dimension D is assumed to be the same as the hidden size.
             act_c: (B, L_act, D), (B, N_act_layers, L_act, D), or None, action condition tokens,
                 dimension D is assumed to be the same as the hidden size.
-            ee_c: (B, L_ee, D), (B, N_ee_layers, L_ee, D), or None, ee-target condition tokens,
+            ee_c: (B, L_ee, D), (B, N_ee_layers, L_ee, D), or None, structured guidance condition tokens,
                 dimension D is assumed to be the same as the hidden size.
             state_c: (B, 1, D) or None, state condition tokens (fixed length),
             lang_mask: (B, L_lang) or None, language condition mask (True for valid).
             img_mask: (B, L_img) or None, image condition mask (True for valid).
             act_mask: (B, L_act) or None, action condition mask (True for valid).
-            ee_mask: (B, L_ee) or None, EE-target condition mask (True for valid).
+            ee_mask: (B, L_ee) or None, structured guidance condition mask (True for valid).
             embed_input: whether to map action-dim inputs to hidden size using action_embedder.
             decode_output: whether to map hidden outputs back to action dim using action_decoder.
         """

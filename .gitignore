@@ -16,7 +16,6 @@ src/wandb/
 
 __pycache__/
 
-*.md
 *.log
 
 src/train_out**/**
@@ -28,3 +27,15 @@ src/logs/**
 src/visualization/**
 
 dataset/
+# Evaluation and training artifacts
+eval_out/
+evaluation_runs/
+train_out/
+results/
+logs/
+*.log
+core.*
+
+# Local datasets and caches
+dataset/
+input/

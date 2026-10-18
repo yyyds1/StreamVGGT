@@ -58,6 +58,7 @@ va_vga_robotwin_cfg.enable_ee_target_head_eval = True
 # Convenience switch for the whole ee-target subsystem. Set this to False in a
 # derived config to train/eval an action-head-only policy.
 va_vga_robotwin_cfg.enable_ee_target_module = True
+va_vga_robotwin_cfg.enable_se3_guidance = False
 # Evaluation source for RDT EE-target condition tokens. Keep "predicted" for
 # fair policy evaluation; "oracle" uses the live RoboTwin expert cursor to
 # construct current-state-to-next-target waypoint transitions.

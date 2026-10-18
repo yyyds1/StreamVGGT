@@ -1,0 +1,28 @@
+"""50-task seven-token SE(3) guidance training with waypoint noise."""
+from copy import deepcopy
+
+from .head_camera_sparse_7token_quat_duration_50tasks_scratch_train_cfg import (
+    head_camera_sparse_legacy_ee_frozen_7token_50tasks_scratch_train_cfg,
+)
+
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg = deepcopy(
+    head_camera_sparse_legacy_ee_frozen_7token_50tasks_scratch_train_cfg
+)
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.__name__ = (
+    "Config: seven-token SE(3) guidance, noisy waypoint training, 50 RoboTwin tasks"
+)
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.save_root = (
+    "/inspire/hdd/global_user/yangdongshen-253108120197/code/StreamVGGT/"
+    "train_out/head_camera_sparse_7token_quat_duration_50tasks_noisy_stage1"
+)
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.se3_guidance_train_noise = True
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.se3_guidance_position_noise_std = 0.005
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.se3_guidance_rotation_noise_deg = 5.0
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.se3_guidance_gripper_noise_std = 0.02
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.se3_guidance_duration_noise_std = 1.0
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.transformer_resume = False
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.action_head_resume = False
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.transformer_warm_start = None
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.action_head_warm_start = None
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.transformer_resume_from = None
+head_camera_sparse_legacy_ee_frozen_7token_50tasks_noisy_train_cfg.action_head_resume_from = None

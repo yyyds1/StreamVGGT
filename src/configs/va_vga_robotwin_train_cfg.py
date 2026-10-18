@@ -13,7 +13,13 @@ va_vga_robotwin_train_cfg.dataset_type = "robotwin_lerobot"
 va_vga_robotwin_train_cfg.dataset_path = "/inspire/hdd/global_user/yangdongshen-253108120197/code/robotwin-labeled/data_future_target"
 # Use the full future-waypoint overlay generated as
 # observation.images.<camera>.rgb_expert_plan_marked.
-va_vga_robotwin_train_cfg.use_expert_plan_marked_rgb = True
+va_vga_robotwin_train_cfg.use_expert_plan_marked_rgb = False
+va_vga_robotwin_train_cfg.use_sparse_waypoint_guidance = False
+va_vga_robotwin_train_cfg.enable_se3_guidance = False
+va_vga_robotwin_train_cfg.sparse_waypoint_max_count = 6
+va_vga_robotwin_train_cfg.sparse_waypoint_max_duration = 32
+va_vga_robotwin_train_cfg.se3_guidance_source = "oracle"
+va_vga_robotwin_train_cfg.se3_guidance_noisy_oracle = False
 va_vga_robotwin_train_cfg.use_expert_marked_rgb = False
 va_vga_robotwin_train_cfg.ee_target_waypoint_distance = 0.05
 # The stored training sequence may use the legacy trace-based waypoint

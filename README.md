@@ -28,11 +28,11 @@ conda install 'llvm-openmp<16'
 1. StreamVGGT: 
  - [Hugging Face](https://huggingface.co/lch01/StreamVGGT/)
  - [Tsinghua cloud](https://cloud.tsinghua.edu.cn/d/d6ad8f36fcd541bcb246/)
- - nas: `/mnt/nas/share/home/yds/actionvggt.pth`
+ - 本地路径：`$STREAMVGGT_ROOT/ckpt/actionvggt.pth`（由下载后的权重自行放入）
 
 2. RDT:
  - [Hugging Face](https://huggingface.co/robotics-diffusion-transformer/RDT2-FM)
- - nas: `/mnt/nas/share/home/yds/RDT.pth`
+ - 本地路径：`$STREAMVGGT_ROOT/ckpt/RDT.pth`（由下载后的权重自行放入）
 
 ## Data Preparation
 ### Training Datasets
@@ -40,10 +40,11 @@ Use robotwin dataset in LeRobot dataset format as training dataset, which is pro
 
 To download the dataset:
 ```bash
-huggingface-cli download --repo-type dataset robbyant/robotwin-clean-and-aug-lerobot --local-dir /path/to/your/dataset
+huggingface-cli download --repo-type dataset robbyant/robotwin-clean-and-aug-lerobot \
+  --local-dir "$STREAMVGGT_ROOT/dataset/robotwin-clean-and-aug-lerobot"
 ```
 
-The dataset is also available in nas: `/mnt/nas/datasets5/robotwin_lerobot`
+Set `DATA_ROOT` to the local checkout when using a pre-existing copy.
 
 
 ## Folder Structure
@@ -153,7 +154,7 @@ task_group_id=0;
 bash scripts/launch_client_multigpus.sh ${save_root} ${task_group_id}
 ```
 
-Related experiments results will be save in `/path/to/your/RoboTwin/${save_root}`. Please note that an `eval_result` folder is also generated. This is a native output from RoboTwin and is identical to the contents in the results folder; it can be safely ignored.
+Related experiment results are saved under the configured `SAVE_ROOT` (for example, `$STREAMVGGT_ROOT/evaluation_runs`). Please note that an `eval_result` folder is also generated. This is a native output from RoboTwin and is identical to the contents in the results folder; it can be safely ignored.
 It is important to note that the inference server and client must be deployed on the same machine. For launching multi-GPU client, we padded the original 50 tasks to 56 via duplication and partitioned them into 7 groups to align with the 8-GPU configuration of our inference node. You can specify the `task_group_id` (0-6) to select a particular group for inference. For detailed grouping configurations, please refer to `evaluation/robotwin/launch_client_multigpus.sh`.
 
 ## Trouble Shooting
@@ -212,11 +213,16 @@ passed through to `train_va.py`.
 
 For evaluation, `CHECKPOINT_DIR` must point to a complete `checkpoint_step_*`
 directory. The server loads `CHECKPOINT_DIR/training_config.json` by default;
-use `EVAL_CONFIG=/path/to/config.json` only when an explicit override is needed:
+use `EVAL_CONFIG="$STREAMVGGT_ROOT/config/eval.json"` only when an explicit override is needed:
 
 ```bash
 CHECKPOINT_DIR=./train_out/head_camera_stage2/checkpoint_step_2000 \
   bash src/scripts/run_head_camera_eval.sh
-EVAL_CONFIG=/path/to/eval.json CHECKPOINT_DIR=/path/to/checkpoint_step_2000 \
+EVAL_CONFIG="$STREAMVGGT_ROOT/config/eval.json" CHECKPOINT_DIR="$STREAMVGGT_ROOT/train_out/checkpoint_step_2000" \
   bash src/scripts/run_head_camera_eval.sh
 ```
+
+
+## ActionVGGT + RoboTwin 协作实验手册
+
+中文环境配置、训练/测试入口、数据仓库和消融实验清单见 [`docs/actionvggt_robotwin.md`](docs/actionvggt_robotwin.md)。其中所有路径均通过仓库相对路径或环境变量表达。

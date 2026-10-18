@@ -7,7 +7,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/inspire/hdd/global_user/yangdongshen-253108120197/code/robotwin-labeled")
+robowin_root = Path(os.environ.get("ROBOTWIN_ROOT", str(Path(__file__).resolve().parents[4] / "robotwin-labeled"))).expanduser().resolve()
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -49,7 +49,7 @@ from envs.utils.expert_marker import draw_expert_target_sequence_on_rgb
 from evaluation.ee_target_waypoints import build_linear_ee_target_transitions
 
 
-DATASET_ROOT = Path("/home/yds/code/StreamVGGT/dataset")
+DATASET_ROOT = Path(os.environ.get("STREAMVGGT_DATASET_ROOT", str(Path(__file__).resolve().parents[3] / "dataset")))
 
 
 def _planner_result_payload(result):
@@ -156,6 +156,97 @@ def write_json(data: dict, fpath: Path) -> None:
     fpath.parent.mkdir(exist_ok=True, parents=True)
     with open(fpath, "w") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+def _row_array(row, key, dtype=None):
+    """Convert an Arrow/object cell containing a sparse waypoint vector to 1-D."""
+    value = row[key]
+    if hasattr(value, "to_pylist"):
+        value = value.to_pylist()
+    array = np.asarray(value, dtype=dtype)
+    return array.reshape(-1)
+
+
+def _reconstruct_cached_sparse_waypoint_records(data_frame):
+    """Rebuild the complete AWE keyframe list from per-frame future windows.
+
+    The converted dataset stores only six future waypoints in each row.  Reading
+    row zero therefore loses every keyframe after the first six.  Each row also
+    stores frame offsets, so collecting ``frame_index + frame_offset`` across the
+    episode reconstructs the full ordered sequence without rerunning AWE.
+    """
+    records_by_frame = {}
+    for _, row in data_frame.iterrows():
+        frame_index = int(np.asarray(row["frame_index"]).reshape(-1)[0])
+        durations = _row_array(row, "sparse_waypoints.duration", np.int64)
+        offsets = _row_array(row, "sparse_waypoints.frame_offset", np.int64)
+        left_valid = _row_array(row, "sparse_waypoints.left_valid", bool)
+        right_valid = _row_array(row, "sparse_waypoints.right_valid", bool)
+        left_pose = np.stack([np.asarray(value, dtype=np.float64).reshape(7) for value in row["sparse_waypoints.left_pose_7d"]], axis=0)
+        right_pose = np.stack([np.asarray(value, dtype=np.float64).reshape(7) for value in row["sparse_waypoints.right_pose_7d"]], axis=0)
+        left_gripper = _row_array(row, "sparse_waypoints.left_gripper", np.float64)
+        right_gripper = _row_array(row, "sparse_waypoints.right_gripper", np.float64)
+        transitions = _row_array(row, "sparse_waypoints.mandatory_gripper_transition", bool)
+        segment_error = _row_array(row, "sparse_waypoints.segment_error", np.float64)
+        phase = _row_array(row, "sparse_waypoints.phase", np.float64)
+        confidence = _row_array(row, "sparse_waypoints.confidence", np.float64)
+        plan_age = _row_array(row, "sparse_waypoints.plan_age", np.float64)
+        count = min(
+            len(durations), len(offsets), len(left_valid), len(right_valid),
+            len(left_pose), len(right_pose), len(left_gripper), len(right_gripper),
+        )
+        for index in range(count):
+            duration = int(durations[index])
+            offset = int(offsets[index])
+            if duration <= 0 or offset < 0 or not (bool(left_valid[index]) or bool(right_valid[index])):
+                continue
+            target_frame = frame_index + offset
+            if target_frame in records_by_frame:
+                continue
+            records_by_frame[target_frame] = {
+                "left": {"pose_7d": left_pose[index].copy(), "valid": bool(left_valid[index])},
+                "right": {"pose_7d": right_pose[index].copy(), "valid": bool(right_valid[index])},
+                "gripper": [float(left_gripper[index]), float(right_gripper[index])],
+                "duration": duration,
+                "frame_offset": offset,
+                "phase": float(phase[index]) if index < len(phase) else 0.0,
+                "confidence": float(confidence[index]) if index < len(confidence) else 1.0,
+                "plan_age": float(plan_age[index]) if index < len(plan_age) else 0.0,
+                "mandatory_gripper_transition": bool(transitions[index]) if index < len(transitions) else False,
+                "segment_error": float(segment_error[index]) if index < len(segment_error) else 0.0,
+                "frame_index": target_frame,
+            }
+    return [records_by_frame[index] for index in sorted(records_by_frame)]
+
+
+def load_cached_sparse_waypoint_episode(dataset_root: Path, task_name: str, seed: int):
+    """Load one clean test episode and reconstruct all sparse AWE keyframes."""
+    import pandas as pd
+
+    task_root = dataset_root / task_name
+    clean_root = task_root / "demo_clean"
+    raw_root = dataset_root.parent / "data_clean_test50_raw" / task_name / "demo_clean_test50"
+    seed_path = task_root / "evaluation_seeds.txt"
+    if not seed_path.is_file():
+        seed_path = raw_root / "seed.txt"
+    seeds = [int(value) for value in seed_path.read_text().split()]
+    episode_index = seeds.index(int(seed))
+    repo = clean_root / "lerobot"
+    episodes = [json.loads(line) for line in (repo / "meta/episodes.jsonl").read_text().splitlines()]
+    data_frame = pd.read_parquet(repo / episodes[episode_index]["data_path"])
+    records = _reconstruct_cached_sparse_waypoint_records(data_frame)
+    info_path = clean_root / "scene_info.json"
+    if not info_path.is_file():
+        info_path = raw_root / "scene_info.json"
+    info_db = json.loads(info_path.read_text())
+    if not records:
+        raise RuntimeError(f"cached AWE episode {task_name}/{seed} has no valid waypoint records")
+    print(
+        f"[sparse_awe_cache] task={task_name} seed={seed} episode={episode_index} "
+        f"waypoints={len(records)} frames={len(data_frame)}",
+        flush=True,
+    )
+    return episode_index, info_db[f"episode_{episode_index}"], records
 
 def add_title_bar(img, text, font_scale=0.8, thickness=2):
     """Add a black title bar with text above the image"""
@@ -413,6 +504,14 @@ def main(usr_args):
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
     args["save_root"] = save_root
+    for key in (
+        "use_cached_sparse_waypoints",
+        "sparse_waypoint_dataset_root",
+        "evaluation_seed_list",
+        "sparse_waypoint_step_scale",
+    ):
+        if key in usr_args:
+            args[key] = usr_args[key]
     args["max_episode_steps"] = usr_args.get("max_episode_steps", None)
     args["single_trajectory"] = bool(usr_args.get("single_trajectory", False))
     if usr_args.get("single_trajectory_episode_index", None) is not None:
@@ -424,6 +523,8 @@ def main(usr_args):
         args["use_expert_marked_rgb"] = bool(usr_args["use_expert_marked_rgb"])
     if usr_args.get("use_expert_plan_marked_rgb", None) is not None:
         args["use_expert_plan_marked_rgb"] = bool(usr_args["use_expert_plan_marked_rgb"])
+    if usr_args.get("use_sparse_waypoint_marked_rgb", None) is not None:
+        args["use_sparse_waypoint_marked_rgb"] = bool(usr_args["use_sparse_waypoint_marked_rgb"])
     if usr_args.get("live_waypoint_labels", None) is not None:
         args["live_waypoint_labels"] = bool(usr_args["live_waypoint_labels"])
     if usr_args.get("ee_target_sequence_len", None) is not None:
@@ -451,6 +552,7 @@ def main(usr_args):
                     "joint_action_representation",
                     "use_expert_marked_rgb",
                     "use_expert_plan_marked_rgb",
+                    "use_sparse_waypoint_marked_rgb",
                     "live_waypoint_labels",
                     "ee_target_sequence_len",
                     "ee_target_waypoint_distance",
@@ -476,8 +578,18 @@ def main(usr_args):
             args[key] = usr_args[key]
     args.setdefault("use_expert_marked_rgb", True)
     args.setdefault("use_expert_plan_marked_rgb", False)
-    # Evaluation should use live fixed-distance waypoint labels by default.
-    args.setdefault("live_waypoint_labels", True)
+    args.setdefault("use_sparse_waypoint_marked_rgb", False)
+    # Sparse-AWE training consumes the pre-rendered sparse waypoint overlay.
+    args.setdefault("live_waypoint_labels", False)
+    args.setdefault("sparse_waypoint_data", False)
+    args.setdefault("sparse_waypoint_max_count", 6)
+    args["sparse_waypoint_step_scale"] = max(
+        1.0, float(args.get("sparse_waypoint_step_scale", 1.0))
+    )
+    print(
+        f"[eval_client] sparse waypoint step scale={args['sparse_waypoint_step_scale']}",
+        flush=True,
+    )
     args.setdefault(
         "ee_target_sequence_len",
         int(args.get("expert_target_sequence_len", 6)),
@@ -599,7 +711,7 @@ def main(usr_args):
 
     seed = usr_args["seed"]
 
-    st_seed = 10000 * (1 + seed)
+    st_seed = int(usr_args.get("seed_start", 10000 * (1 + seed)))
     suc_nums = []
     test_num = usr_args["test_num"]
 
@@ -729,7 +841,7 @@ def expand_compact_joint_action_for_robotwin(action, observation):
     return action
 
 
-def execute_dense_qpos_action(task_env, qpos_action, num_steps=15):
+def execute_dense_qpos_action(task_env, qpos_action, num_steps=15, max_joint_velocity=1.0):
     """Execute a qpos target as dense drive targets instead of TOPP planning.
 
     RobotWin's take_action(qpos) treats qpos as a high-level endpoint and sends it
@@ -779,6 +891,8 @@ def execute_dense_qpos_action(task_env, qpos_action, num_steps=15):
     zero_left_vel = np.zeros(left_arm_dim, dtype=np.float32)
     zero_right_vel = np.zeros(right_arm_dim, dtype=np.float32)
     num_steps = max(1, int(num_steps))
+    # Legacy direct-target execution: no client-side joint slew-rate clamp.
+    # The simulator's configured drive controller is the only motion limiter.
     for _ in range(num_steps):
         robot.set_arm_joints(left_arm_target, zero_left_vel, "left")
         robot.set_arm_joints(right_arm_target, zero_right_vel, "right")
@@ -830,6 +944,7 @@ def _get_camera_rgb(
     camera_name,
     use_expert_marked_rgb=True,
     use_expert_plan_marked_rgb=False,
+    use_sparse_waypoint_marked_rgb=False,
     required=True,
 ):
     cameras = observation.get("observation", {})
@@ -841,6 +956,29 @@ def _get_camera_rgb(
             )
         return None
     camera_obs = cameras[camera_name]
+    if use_sparse_waypoint_marked_rgb:
+        # Re-render from the current observation window instead of trusting
+        # rgb_sparse_waypoints produced by the environment.  The latter can
+        # remain stale when the sparse-waypoint cursor advances after camera
+        # capture.  This keeps the video overlay synchronized with the exact
+        # waypoint window sent to the policy.
+        source = observation.get("sparse_waypoints", None)
+        if isinstance(source, dict):
+            sequence = {}
+            for arm in ("left", "right"):
+                sequence[arm] = {
+                    "pose_7d": source.get(f"{arm}_pose_7d", []),
+                    "gripper": source.get(f"{arm}_gripper", []),
+                    "valid": source.get(f"{arm}_valid", []),
+                }
+            try:
+                marked, _ = draw_expert_target_sequence_on_rgb(
+                    camera_obs["rgb"], camera_obs, sequence
+                )
+                return marked
+            except (KeyError, TypeError, ValueError):
+                pass
+        return camera_obs["rgb"]
     if use_expert_plan_marked_rgb:
         return camera_obs.get(
             "rgb_expert_plan_marked",
@@ -877,6 +1015,55 @@ def _compact_expert_target(observation):
         "valid": valid,
         "command_id": command_id,
     }
+
+
+def _compact_sparse_waypoints(observation, max_count=6):
+    source = observation.get("sparse_waypoints", None)
+    if not isinstance(source, dict):
+        if observation.get("expert_waypoints") is not None:
+            source = observation["expert_waypoints"]
+    if not isinstance(source, dict):
+        source = observation.get("sparse_waypoint_sequence", None)
+    if not isinstance(source, dict):
+        target = _compact_expert_target(observation)
+        if target is None:
+            return None
+        try:
+            current = format_eef_state(observation).reshape(2, 8).astype(np.float32)
+            target_pose = np.asarray(target["value"], dtype=np.float32)
+        except Exception:
+            return None
+        fractions = np.linspace(1.0 / max_count, 1.0, max_count, dtype=np.float32)
+        values = {}
+        for arm_idx, arm in enumerate(("left", "right")):
+            start_pose, end_pose = current[arm_idx], target_pose[arm_idx]
+            pose = np.repeat(end_pose[None, :7], max_count, axis=0)
+            pose[:, :3] = start_pose[None, :3] + fractions[:, None] * (end_pose[None, :3] - start_pose[None, :3])
+            q0 = start_pose[3:7] / max(float(np.linalg.norm(start_pose[3:7])), 1e-8)
+            q1 = end_pose[3:7] / max(float(np.linalg.norm(end_pose[3:7])), 1e-8)
+            if np.dot(q0, q1) < 0: q1 = -q1
+            q = (1.0 - fractions[:, None]) * q0[None, :] + fractions[:, None] * q1[None, :]
+            pose[:, 3:7] = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-8)
+            values[f"{arm}_pose_7d"] = pose
+            values[f"{arm}_valid"] = np.full(max_count, bool(target["valid"][arm_idx]))
+            values[f"{arm}_gripper"] = np.full(max_count, end_pose[7], dtype=np.float32)
+        source = {**values, "duration": np.full(max_count, 32 // max_count, dtype=np.int64),
+                  "phase": fractions, "confidence": np.ones(max_count, dtype=np.float32),
+                  "plan_age": np.zeros(max_count, dtype=np.float32),
+                  "transition": np.zeros(max_count, dtype=np.float32),
+                  "frame_offset": np.arange(1, max_count + 1, dtype=np.int64)}
+    result = {}
+    for key in ("left_pose_7d", "right_pose_7d", "left_valid", "right_valid", "left_gripper", "right_gripper", "duration", "phase", "confidence", "plan_age", "frame_offset"):
+        if key not in source: return None
+        result[key] = np.asarray(source[key])[:max_count].tolist()
+    transition = source.get("transition", source.get("mandatory_gripper_transition"))
+    if transition is None: return None
+    result["transition"] = np.asarray(transition)[:max_count].tolist()
+    result["block_valid"] = (np.asarray(result["left_valid"],dtype=bool) | np.asarray(result["right_valid"],dtype=bool)) & (np.asarray(result["frame_offset"]) >= 0)
+    result["block_valid"] = result["block_valid"].tolist()
+    # Keep an all-invalid, shape-preserving sequence so M3 reaches the
+    # explicit no-guidance fallback in _apply_ablation_profile.
+    return result
 
 
 def _live_waypoint_sequence(observation, sequence_len, waypoint_distance=0.05):
@@ -946,31 +1133,145 @@ def _get_live_marked_camera_rgb(
     return marked
 
 
+def _apply_ablation_profile(obs, profile):
+    """Apply deterministic evaluation-time camera and sparse-waypoint ablations."""
+    if not profile:
+        return obs
+
+    missing = set(profile.get("camera_missing", []))
+    camera_names = {
+        "head": ("head_camera", "observation.images.cam_high"),
+        "left_wrist": ("left_camera", "observation.images.cam_left_wrist"),
+        "right_wrist": ("right_camera", "observation.images.cam_right_wrist"),
+    }
+    for kind in missing:
+        for key in camera_names.get(kind, ()):
+            if key in obs:
+                obs[key] = np.zeros_like(np.asarray(obs[key]))
+
+    waypoint = obs.get("sparse_waypoints")
+    if not isinstance(waypoint, dict):
+        # M3 can arrive here after compaction has no valid blocks. Keep the
+        # no-guidance contract explicit instead of re-enabling an empty input.
+        if float(profile.get("waypoint_missing_rate", 0.0)) >= 1.0:
+            obs["send_sparse_waypoints"] = False
+            obs["guidance_missing"] = True
+        return obs
+
+    seed = int(profile.get("seed", 0))
+    rng = np.random.default_rng(seed)
+    noise = profile.get("waypoint_noise", {})
+    # Backward-compatible scalar: it means position noise in metres.
+    if not isinstance(noise, dict):
+        noise = {"position_std": float(noise)}
+    position_std = float(noise.get("position_std", 0.0))
+    rotation_std_deg = float(noise.get("rotation_std_deg", 0.0))
+    gripper_std = float(noise.get("gripper_std", 0.0))
+    duration_std = float(noise.get("duration_std", 0.0))
+
+    for key in ("left_pose_7d", "right_pose_7d"):
+        if key not in waypoint:
+            continue
+        pose = np.asarray(waypoint[key], dtype=np.float32).copy()
+        if position_std:
+            pose[..., :3] += rng.normal(0.0, position_std, pose[..., :3].shape).astype(np.float32)
+        if rotation_std_deg and pose.shape[-1] >= 7:
+            # Small-angle quaternion perturbation, followed by normalization.
+            angle = np.deg2rad(rng.normal(0.0, rotation_std_deg, pose[..., :3].shape[:-1]))
+            axis = rng.normal(size=pose[..., :3].shape).astype(np.float32)
+            axis /= np.maximum(np.linalg.norm(axis, axis=-1, keepdims=True), 1e-6)
+            half = angle[..., None] * 0.5
+            dq = np.concatenate([np.cos(half), axis * np.sin(half)], axis=-1)
+            q = pose[..., 3:7]
+            w1, x1, y1, z1 = np.moveaxis(dq, -1, 0)
+            w2, x2, y2, z2 = np.moveaxis(q, -1, 0)
+            pose[..., 3:7] = np.stack((w1*w2-x1*x2-y1*y2-z1*z2,
+                                       w1*x2+x1*w2+y1*z2-z1*y2,
+                                       w1*y2-x1*z2+y1*w2+z1*x2,
+                                       w1*z2+x1*y2-y1*x2+z1*w2), axis=-1)
+            pose[..., 3:7] /= np.maximum(np.linalg.norm(pose[..., 3:7], axis=-1, keepdims=True), 1e-6)
+        waypoint[key] = pose
+
+    if gripper_std:
+        for key in ("left_gripper", "right_gripper"):
+            if key in waypoint:
+                value = np.asarray(waypoint[key], dtype=np.float32)
+                waypoint[key] = np.clip(value + rng.normal(0.0, gripper_std, value.shape), -1.0, 1.0)
+    if duration_std and "duration" in waypoint:
+        value = np.asarray(waypoint["duration"], dtype=np.float32)
+        waypoint["duration"] = np.maximum(1.0, np.rint(value + rng.normal(0.0, duration_std, value.shape))).astype(np.int64)
+
+    sides = set(profile.get("waypoint_missing_sides", []))
+    rate = float(profile.get("waypoint_missing_rate", 0.0))
+    for key, side in (("left_valid", "left"), ("right_valid", "right")):
+        if key not in waypoint:
+            continue
+        valid = np.asarray(waypoint[key], dtype=bool).copy()
+        if side in sides:
+            valid[...] = False
+        elif rate > 0.0:
+            valid &= rng.random(valid.shape) >= rate
+        waypoint[key] = valid
+
+    all_missing = rate >= 1.0 or ("left" in sides and "right" in sides)
+    if all_missing:
+        for key in ("left_valid", "right_valid", "block_valid"):
+            if key in waypoint:
+                waypoint[key] = np.zeros_like(np.asarray(waypoint[key]), dtype=bool)
+        obs["send_sparse_waypoints"] = False
+        obs["guidance_missing"] = True
+    elif "block_valid" in waypoint:
+        waypoint["block_valid"] = np.asarray(waypoint.get("left_valid", False), dtype=bool) | np.asarray(waypoint.get("right_valid", False), dtype=bool)
+
+    if isinstance(obs.get("expert_target"), dict):
+        valid = obs["expert_target"].get("valid")
+        if valid is not None:
+            valid = list(valid)
+            if "left" in sides or rate >= 1.0:
+                valid[0] = False
+            if "right" in sides or rate >= 1.0:
+                valid[1] = False
+            obs["expert_target"]["valid"] = valid
+    return obs
+
 def format_obs(
     observation,
     prompt,
     use_expert_marked_rgb=True,
     use_expert_plan_marked_rgb=False,
+    use_sparse_waypoint_marked_rgb=False,
     robotwin_action_space="ee",
     live_waypoint_labels=False,
     ee_target_sequence_len=6,
     ee_target_waypoint_distance=0.05,
+    ablation_profile=None,
 ):
     robotwin_action_space = str(robotwin_action_space or "ee").lower()
     state = format_joint_state(observation) if robotwin_action_space == "joint" else format_eef_state(observation)
     camera_rgb = lambda name: (
-        _get_live_marked_camera_rgb(
-            observation,
-            name,
-            ee_target_sequence_len,
-            ee_target_waypoint_distance,
-        )
-        if live_waypoint_labels
-        else _get_camera_rgb(
+        _get_camera_rgb(
             observation,
             name,
             use_expert_marked_rgb,
             use_expert_plan_marked_rgb,
+            use_sparse_waypoint_marked_rgb,
+        )
+        if use_sparse_waypoint_marked_rgb
+        else (
+            _get_live_marked_camera_rgb(
+                observation,
+                name,
+                ee_target_sequence_len,
+                ee_target_waypoint_distance,
+            )
+            if live_waypoint_labels
+            else _get_camera_rgb(
+                observation,
+                name,
+                use_expert_marked_rgb,
+                use_expert_plan_marked_rgb,
+                use_sparse_waypoint_marked_rgb,
+            )
         )
     )
     obs = {
@@ -989,19 +1290,34 @@ def format_obs(
         "front_camera",
         use_expert_marked_rgb,
         use_expert_plan_marked_rgb,
+        use_sparse_waypoint_marked_rgb,
         required=False,
     )
     if front_camera is not None:
         obs["front_camera"] = (
-            _get_live_marked_camera_rgb(
+            _get_camera_rgb(
                 observation,
                 "front_camera",
-                ee_target_sequence_len,
-                ee_target_waypoint_distance,
+                use_expert_marked_rgb,
+                use_expert_plan_marked_rgb,
+                use_sparse_waypoint_marked_rgb,
             )
-            if live_waypoint_labels
-            else front_camera
+            if use_sparse_waypoint_marked_rgb
+            else (
+                _get_live_marked_camera_rgb(
+                    observation,
+                    "front_camera",
+                    ee_target_sequence_len,
+                    ee_target_waypoint_distance,
+                )
+                if live_waypoint_labels
+                else front_camera
+            )
         )
+    sparse_waypoints = _compact_sparse_waypoints(observation, 6)
+    if sparse_waypoints is not None:
+        obs["sparse_waypoints"] = sparse_waypoints
+    obs["send_sparse_waypoints"] = True
     expert_target = _compact_expert_target(observation)
     if expert_target is not None:
         obs["expert_target"] = expert_target
@@ -1016,7 +1332,7 @@ def format_obs(
         obs["ee_state"] = format_eef_state(observation).reshape(2, 8).tolist()
     except Exception:
         pass
-    return obs
+    return _apply_ablation_profile(obs, ablation_profile)
 
 
 def format_policy_obs(
@@ -1025,20 +1341,24 @@ def format_policy_obs(
     prompt,
     use_expert_marked_rgb=True,
     use_expert_plan_marked_rgb=False,
+    use_sparse_waypoint_marked_rgb=False,
     robotwin_action_space="ee",
     live_waypoint_labels=True,
     ee_target_sequence_len=6,
     ee_target_waypoint_distance=0.05,
+    ablation_profile=None,
 ):
     obs = format_obs(
         observation,
         prompt,
         use_expert_marked_rgb=use_expert_marked_rgb,
         use_expert_plan_marked_rgb=use_expert_plan_marked_rgb,
+        use_sparse_waypoint_marked_rgb=use_sparse_waypoint_marked_rgb,
         robotwin_action_space=robotwin_action_space,
         live_waypoint_labels=live_waypoint_labels,
         ee_target_sequence_len=ee_target_sequence_len,
         ee_target_waypoint_distance=ee_target_waypoint_distance,
+        ablation_profile=ablation_profile,
     )
     if str(robotwin_action_space or "ee").lower() == "joint":
         obs["observation.state"] = format_robot_joint_state(task_env)
@@ -1295,18 +1615,53 @@ def eval_policy(task_name,
 
     while succ_seed < test_num:
         current_episode_index = single_trajectory_episode_index if single_trajectory else now_id
-        current_seed = st_seed if single_trajectory else now_seed
+        seed_list = args.get("evaluation_seed_list")
+        current_seed = int(seed_list[succ_seed]) if seed_list is not None and succ_seed < len(seed_list) else (st_seed if single_trajectory else now_seed)
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
-        if expert_check:
+        cached_episode = bool(args.get("use_cached_sparse_waypoints", False))
+        if cached_episode:
+            dataset_root = Path(args["sparse_waypoint_dataset_root"])
+            current_episode_index, episode_info, sparse_waypoint_records = load_cached_sparse_waypoint_episode(
+                dataset_root, task_name, current_seed
+            )
+            rollout_args = deepcopy(args)
+            rollout_args["need_plan"] = False
+            rollout_args["expert_timeline"] = []
+            rollout_args["sparse_waypoint_data"] = True
+            rollout_args["sparse_waypoint_max_count"] = int(args.get("sparse_waypoint_max_count", 6))
+            rollout_args["sparse_waypoint_records"] = deepcopy(sparse_waypoint_records)
+            rollout_args["expert_target_keypoint_mode"] = "none"
+            rollout_args["expert_target_progress_mode"] = "state"
+            expert_timeline = []
+            left_joint_path = []
+            right_joint_path = []
+            print(f"[sparse_awe_cache] task={task_name} seed={current_seed} episode={current_episode_index} waypoints={len(sparse_waypoint_records)}", flush=True)
+        elif expert_check:
             try:
-                TASK_ENV.setup_demo(now_ep_num=current_episode_index, seed=current_seed, is_test=True, **args)
+                replay_args = deepcopy(args)
+                replay_args["capture_sparse_waypoint_replay"] = True
+                replay_args["sparse_waypoint_eta"] = float(args.get("sparse_waypoint_eta", 0.015))
+                replay_args["sparse_waypoint_max_segment_steps"] = int(
+                    args.get("sparse_waypoint_max_segment_steps", 32)
+                )
+                replay_args["sparse_waypoint_max_count"] = int(args.get("sparse_waypoint_max_count", 6))
+                replay_args["data_type"] = deepcopy(args.get("data_type", {}))
+                replay_args["data_type"]["qpos"] = True
+                replay_args["data_type"]["endpose"] = True
+                TASK_ENV.setup_demo(now_ep_num=current_episode_index, seed=current_seed, is_test=True, **replay_args)
                 apply_step_limit_override()
                 episode_info = TASK_ENV.play_once()
                 expert_timeline = deepcopy(getattr(TASK_ENV, "expert_timeline", []))
                 left_joint_path = deepcopy(getattr(TASK_ENV, "left_joint_path", []))
                 right_joint_path = deepcopy(getattr(TASK_ENV, "right_joint_path", []))
+                sparse_waypoint_records = TASK_ENV.finalize_sparse_waypoint_replay()
+                if not sparse_waypoint_records:
+                    raise RuntimeError(
+                        "Expert replay produced no AWE sparse waypoints; "
+                        "check replay save_freq and joint/endpose observations."
+                    )
                 TASK_ENV.close_env()
             except UnStableError as e:
                 TASK_ENV.close_env()
@@ -1328,9 +1683,9 @@ def eval_policy(task_name,
                 traceback.print_exc()
                 continue
 
-        if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
+        if cached_episode or (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
             succ_seed += 1
-            suc_test_seed_list.append(now_seed)
+            suc_test_seed_list.append(current_seed)
         else:
             if single_trajectory:
                 print("Single-trajectory expert check failed; aborting this run.")
@@ -1347,6 +1702,10 @@ def eval_policy(task_name,
         rollout_args["right_joint_path"] = right_joint_path
         rollout_args["expert_timeline"] = expert_timeline
         rollout_args["expert_target_progress_mode"] = "state"
+        rollout_args["sparse_waypoint_data"] = True
+        rollout_args["sparse_waypoint_max_count"] = int(args.get("sparse_waypoint_max_count", 6))
+        rollout_args["sparse_waypoint_records"] = deepcopy(sparse_waypoint_records)
+        rollout_args["expert_target_keypoint_mode"] = "none"
 
         TASK_ENV.setup_demo(now_ep_num=current_episode_index, seed=current_seed, is_test=True, **rollout_args)
         apply_step_limit_override()
@@ -1430,10 +1789,12 @@ def eval_policy(task_name,
         prompt,
         use_expert_marked_rgb=use_expert_marked_rgb,
         use_expert_plan_marked_rgb=bool(args.get("use_expert_plan_marked_rgb", False)),
+        use_sparse_waypoint_marked_rgb=bool(args.get("use_sparse_waypoint_marked_rgb", False)),
         robotwin_action_space=robotwin_action_space,
         live_waypoint_labels=bool(args.get("live_waypoint_labels", True)),
         ee_target_sequence_len=int(args.get("ee_target_sequence_len", 6)),
             ee_target_waypoint_distance=float(args.get("ee_target_waypoint_distance", 0.05)),
+            ablation_profile=args.get("ablation_profile"),
         )
         initial_state = np.asarray(initial_formatted_obs["observation.state"]).reshape(-1)
         print(
@@ -1467,6 +1828,7 @@ def eval_policy(task_name,
                 prompt,
                 use_expert_marked_rgb=use_expert_marked_rgb,
                 use_expert_plan_marked_rgb=bool(args.get("use_expert_plan_marked_rgb", False)),
+                use_sparse_waypoint_marked_rgb=bool(args.get("use_sparse_waypoint_marked_rgb", False)),
                 robotwin_action_space=robotwin_action_space,
                 live_waypoint_labels=bool(args.get("live_waypoint_labels", True)),
                 ee_target_sequence_len=int(args.get("ee_target_sequence_len", 6)),
@@ -1538,12 +1900,14 @@ def eval_policy(task_name,
             except Exception as exc:
                 print(f"[eval] warning: failed to send planner feedback to policy server: {exc}")
 
+            post_action_observation = TASK_ENV.get_obs()
             obs = format_policy_obs(
                 TASK_ENV,
-                TASK_ENV.get_obs(),
+                post_action_observation,
                 prompt,
                 use_expert_marked_rgb=use_expert_marked_rgb,
                 use_expert_plan_marked_rgb=bool(args.get("use_expert_plan_marked_rgb", False)),
+                use_sparse_waypoint_marked_rgb=bool(args.get("use_sparse_waypoint_marked_rgb", False)),
                 robotwin_action_space=robotwin_action_space,
                 live_waypoint_labels=bool(args.get("live_waypoint_labels", True)),
                 ee_target_sequence_len=int(args.get("ee_target_sequence_len", 6)),
@@ -1597,7 +1961,7 @@ def eval_policy(task_name,
             f"\033[93m{task_name}\033[0m | \033[94m{args['policy_name']}\033[0m | \033[92m{args['task_config']}\033[0m | \033[91m{args['ckpt_setting']}\033[0m\n"
             f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
         )
-        if not single_trajectory:
+        if not single_trajectory and seed_list is None:
             now_seed += 1
 
     return now_seed, TASK_ENV.suc
@@ -1613,6 +1977,7 @@ def parse_args_and_config():
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)
     parser.add_argument("--test_num", type=int, default=100)
+    parser.add_argument("--seed_start", type=int, default=None, help="absolute first simulator seed")
     parser.add_argument("--max_episode_steps", type=int, default=None)
     parser.add_argument("--use_expert_marked_rgb", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
@@ -1622,6 +1987,11 @@ def parse_args_and_config():
     )
     parser.add_argument(
         "--live_waypoint_labels",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--use_sparse_waypoint_marked_rgb",
         action=argparse.BooleanOptionalAction,
         default=None,
     )
@@ -1664,12 +2034,15 @@ def parse_args_and_config():
     )
     parser.add_argument("--joint_use_direct_control", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--joint_direct_control_steps", type=int, default=None)
+    parser.add_argument("--joint_max_velocity", type=float, default=None,
+                        help="Maximum joint target slew rate in rad/s for direct-control evaluation.")
     parser.add_argument("--clip_joint_action_to_dataset_bounds", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--robotwin_action_space", "--robotwin-action-space", dest="robotwin_action_space", choices=("ee", "joint"), default=None)
     parser.add_argument("--action_representation", "--action-representation", dest="action_representation", default=None)
     parser.add_argument("--joint_action_representation", "--joint-action-representation", dest="joint_action_representation", default=None)
     parser.add_argument("--checkpoint_dir", "--checkpoint-dir", dest="checkpoint_dir", default=None)
     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
+    parser.add_argument("--ablation-profile", dest="ablation_profile", default=None, help="JSON ablation profile")
     parser.add_argument("--single_trajectory", action="store_true")
     parser.add_argument("--single_trajectory_episode_index", type=int, default=None)
     parser.add_argument("--single_trajectory_repo_id", type=str, default=None)
@@ -1677,6 +2050,14 @@ def parse_args_and_config():
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+
+    profile_path = args.ablation_profile or os.environ.get("ABLATION_CONFIG")
+    if profile_path:
+        profile_path = Path(profile_path)
+        if not profile_path.is_absolute():
+            profile_path = Path(__file__).resolve().parents[3] / profile_path
+        config["ablation_profile"] = json.loads(profile_path.read_text(encoding="utf-8"))
+        print(f"[eval_client] ablation profile: {profile_path}", flush=True)
 
     # Parse overrides
     def parse_override_pairs(pairs):
@@ -1703,12 +2084,18 @@ def parse_args_and_config():
     config["video_guidance_scale"] = args.video_guidance_scale
     config["action_guidance_scale"] = args.action_guidance_scale
     config["test_num"] = args.test_num
+    if args.seed_start is not None:
+        config["seed_start"] = int(args.seed_start)
     if args.max_episode_steps is not None:
         config["max_episode_steps"] = int(args.max_episode_steps)
+    if args.joint_max_velocity is not None:
+        config["joint_max_velocity"] = float(args.joint_max_velocity)
     if args.use_expert_marked_rgb is not None:
         config["use_expert_marked_rgb"] = bool(args.use_expert_marked_rgb)
     if args.use_expert_plan_marked_rgb is not None:
         config["use_expert_plan_marked_rgb"] = bool(args.use_expert_plan_marked_rgb)
+    if args.use_sparse_waypoint_marked_rgb is not None:
+        config["use_sparse_waypoint_marked_rgb"] = bool(args.use_sparse_waypoint_marked_rgb)
     if args.live_waypoint_labels is not None:
         config["live_waypoint_labels"] = bool(args.live_waypoint_labels)
     if args.ee_target_sequence_len is not None:

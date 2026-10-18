@@ -433,14 +433,25 @@ class Trainer:
         logger.info("Loading models...")
 
         self.enable_ee_target_module = bool(getattr(config, "enable_ee_target_module", True))
+        self.enable_se3_guidance = bool(getattr(config, "enable_se3_guidance", False))
+        if self.enable_se3_guidance:
+            config.use_sparse_waypoint_guidance = True
+            # Stage-2 may train SE3 guidance together with the EE target head.
+            # Keep the EE-target supervision flags as configured.
+            config.use_ee_target_as_rdt_condition = self.enable_se3_guidance or bool(
+                getattr(config, "use_ee_target_as_rdt_condition", False)
+            )
+            cond_cfg = getattr(config, "rdt_condition_tokens", None)
+            if cond_cfg is not None:
+                cond_cfg.use_ee_target_tokens = True
         if not self.enable_ee_target_module:
             config.enable_ee_target_loss = False
             config.enable_ee_target_head_eval = False
-            config.use_ee_target_as_rdt_condition = False
+            config.use_ee_target_as_rdt_condition = self.enable_se3_guidance
             config.ee_target_condition_gt_mix_enabled = False
             cond_cfg = getattr(config, "rdt_condition_tokens", None)
             if cond_cfg is not None:
-                cond_cfg.use_ee_target_tokens = False
+                cond_cfg.use_ee_target_tokens = self.enable_se3_guidance
                 cond_cfg.ee_target_layers = []
 
         self.enable_camera_loss = bool(getattr(config, "enable_camera_loss", False))
@@ -490,8 +501,7 @@ class Trainer:
         cond_cfg = getattr(config, "rdt_condition_tokens", None)
         cond_cfg_dict = dict(cond_cfg or {})
         self.use_ee_target_as_rdt_condition = bool(
-            getattr(config, "use_ee_target_as_rdt_condition", False)
-            or cond_cfg_dict.get("use_ee_target_tokens", False)
+            getattr(config, "use_ee_target_as_rdt_condition", False) or cond_cfg_dict.get("use_ee_target_tokens", False)
         )
         self.state_noise_std = float(getattr(config, "state_noise_std", 0.0))
         self.state_noise_clip = bool(getattr(config, "state_noise_clip", True))
@@ -499,6 +509,11 @@ class Trainer:
         self.action_condition_noise_std = float(getattr(config.rdt, "action_condition_noise_std", 0.0))
         self.vga_action_state_noise_std = float(getattr(config, "vga_action_state_noise_std", 0.0))
         self.vga_action_state_noise_clip = bool(getattr(config, "vga_action_state_noise_clip", True))
+        self.se3_guidance_train_noise = bool(getattr(config, "se3_guidance_train_noise", False))
+        self.se3_guidance_position_noise_std = float(getattr(config, "se3_guidance_position_noise_std", 0.0))
+        self.se3_guidance_rotation_noise_deg = float(getattr(config, "se3_guidance_rotation_noise_deg", 0.0))
+        self.se3_guidance_gripper_noise_std = float(getattr(config, "se3_guidance_gripper_noise_std", 0.0))
+        self.se3_guidance_duration_noise_std = float(getattr(config, "se3_guidance_duration_noise_std", 0.0))
         self.use_language_condition = bool(getattr(config, "use_language_condition", True))
         self.rdt_use_language_condition = (
             self.use_language_condition
@@ -519,11 +534,13 @@ class Trainer:
         # Bypass geometry heads when corresponding losses are disabled.
         enable_camera_head = self.enable_camera_loss and self.loss_weight_camera > 0.0
         enable_depth_head = self.enable_depth_loss and self.loss_weight_depth > 0.0
-        enable_ee_target_head = (
-            self.use_ee_target_as_rdt_condition
-            or (self.enable_ee_target_loss and self.loss_weight_ee_target > 0.0)
+        enable_ee_target_head = self.enable_ee_target_module and (
+            self.use_ee_target_as_rdt_condition or (self.enable_ee_target_loss and self.loss_weight_ee_target > 0.0)
         )
         enable_geometry_heads_train = enable_camera_head or enable_depth_head or enable_ee_target_head
+        ee_condition_tokens = 0
+        if enable_ee_target_head:
+            ee_condition_tokens = self.ee_target_sequence_len * 2
 
         # Load and shard transformer with FSDP
         logger.info("Loading transformer...")
@@ -542,6 +559,13 @@ class Trainer:
             action_dim=int(getattr(config, "action_dim", 30)),
             image_frame_stride=int(getattr(config, "image_frame_stride", 8)),
             enable_ee_target_head=enable_ee_target_head,
+            enable_se3_guidance=self.enable_se3_guidance,
+            se3_max_waypoints=int(getattr(config, "sparse_waypoint_max_count", 6)),
+            se3_max_duration=int(getattr(config, "sparse_waypoint_max_duration", 32)),
+            enable_wrist_dinov2=bool(getattr(config, "enable_wrist_dinov2", False)),
+            wrist_dinov2_model=str(getattr(config, "wrist_dinov2_model", "facebook/dinov2-small")),
+            wrist_dinov2_image_size=int(getattr(config, "wrist_dinov2_image_size", 224)),
+            wrist_dinov2_local_files_only=bool(getattr(config, "wrist_dinov2_local_files_only", False)),
             ee_target_head_num_heads=int(getattr(config, "ee_target_head_num_heads", 8)),
             ee_target_head_trunk_depth=int(getattr(config, "ee_target_head_trunk_depth", 4)),
             ee_target_head_num_iterations=int(getattr(config, "ee_target_head_num_iterations", 4)),
@@ -574,6 +598,12 @@ class Trainer:
             "rdt_condition_tokens": getattr(config, "rdt_condition_tokens", None),
             "enable_ee_target_module": self.enable_ee_target_module,
             "use_ee_target_as_rdt_condition": self.use_ee_target_as_rdt_condition,
+            "enable_se3_guidance": self.enable_se3_guidance,
+            "enable_wrist_dinov2": bool(getattr(config, "enable_wrist_dinov2", False)),
+            "wrist_dinov2_model": str(getattr(config, "wrist_dinov2_model", "facebook/dinov2-small")),
+            "wrist_dinov2_image_size": int(getattr(config, "wrist_dinov2_image_size", 224)),
+            "wrist_dinov2_local_files_only": bool(getattr(config, "wrist_dinov2_local_files_only", False)),
+            "wrist_obs_cam_keys": list(getattr(config, "wrist_obs_cam_keys", [])),
             "enable_ee_target_head": enable_ee_target_head,
             "ee_target_head_num_heads": int(getattr(config, "ee_target_head_num_heads", 8)),
             "ee_target_head_trunk_depth": int(getattr(config, "ee_target_head_trunk_depth", 4)),
@@ -583,8 +613,10 @@ class Trainer:
                 getattr(config, "ee_target_head_image_cross_attn_depth", 1)
             ),
             "ee_target_sequence_len": self.ee_target_sequence_len,
+            "se3_guidance_tokens_per_block": self.transformer.se3_guidance_tokenizer.TOKENS_PER_BLOCK,
+            "sparse_waypoint_max_count": int(getattr(config, "sparse_waypoint_max_count", 6)),
             "ee_target_condition_num_tokens": (
-                4 * self.ee_target_sequence_len if self.use_ee_target_as_rdt_condition else 0
+                ee_condition_tokens
             ),
             "ee_target_condition_gt_mix_enabled": self.ee_target_condition_gt_mix_enabled,
             "ee_target_condition_gt_prob": self.ee_target_condition_gt_prob,
@@ -630,9 +662,23 @@ class Trainer:
             rdt_img_pos_emb_config = [
                 ("image", (num_rdt_img_frames * effective_num_image_views, patch_h, patch_w))
             ]
+        max_rdt_img_len = num_rdt_img_frames * img_tokens_per_frame
+        if self.transformer.wrist_dinov2 is not None:
+            wrist_patch_count = self.transformer.wrist_dinov2.tokens_per_camera
+            max_rdt_img_len += 2 * wrist_patch_count
+            # Existing position helper supports named non-image streams as 1D sequences.
+            rdt_img_pos_emb_config += [
+                ("left_wrist", wrist_patch_count),
+                ("right_wrist", wrist_patch_count),
+            ]
         rdt_horizon = self.config.chunk_size + 1
         act_tokens_per_frame = rdt_horizon
-        ee_condition_tokens = 4 * self.ee_target_sequence_len if self.use_ee_target_as_rdt_condition else 0
+        ee_condition_tokens = (
+            self.transformer.se3_guidance_tokenizer.MAX_WAYPOINTS
+            * self.transformer.se3_guidance_tokenizer.TOKENS_PER_BLOCK
+            if self.enable_se3_guidance
+            else (4 * self.ee_target_sequence_len if self.use_ee_target_as_rdt_condition else 0)
+        )
         self.ee_target_condition_num_tokens = ee_condition_tokens
         rdt_x_pos_emb_config = [("act", rdt_horizon + self.config.rdt.num_register_tokens)]
         rdt_act_pos_emb_config = [("action", (num_rdt_act_frames, act_tokens_per_frame))]
@@ -647,7 +693,7 @@ class Trainer:
             lang_pos_emb_config=None,
             max_lang_len=0,
             img_pos_emb_config=rdt_img_pos_emb_config,
-            max_img_len=num_rdt_img_frames * img_tokens_per_frame,
+            max_img_len=max_rdt_img_len,
             act_pos_emb_config=rdt_act_pos_emb_config,
             max_act_len=max_act_len,
             ee_pos_emb_config=rdt_ee_pos_emb_config,
@@ -664,7 +710,7 @@ class Trainer:
             "lang_pos_emb_config": None,
             "max_lang_len": 0,
             "img_pos_emb_config": rdt_img_pos_emb_config,
-            "max_img_len": num_rdt_img_frames * img_tokens_per_frame,
+            "max_img_len": max_rdt_img_len,
             "act_pos_emb_config": rdt_act_pos_emb_config,
             "max_act_len": max_act_len,
             "ee_pos_emb_config": rdt_ee_pos_emb_config,
@@ -765,6 +811,52 @@ class Trainer:
                     )
                     adapted.pop(key, None)
             return adapted
+
+        def _adapt_se3_tokenizer_warm_start_state(model, state):
+            if not isinstance(state, dict):
+                return state
+            adapted = dict(state)
+            model_state = model.state_dict()
+            renames = {
+                "se3_guidance_tokenizer.left_xyz_proj.": "se3_guidance_tokenizer.left_position_proj.",
+                "se3_guidance_tokenizer.right_xyz_proj.": "se3_guidance_tokenizer.right_position_proj.",
+            }
+            for old_prefix, new_prefix in renames.items():
+                for key in list(adapted):
+                    if key.startswith(old_prefix):
+                        new_key = new_prefix + key[len(old_prefix):]
+                        if new_key not in adapted:
+                            adapted[new_key] = adapted[key]
+                        adapted.pop(key)
+            for key in list(adapted):
+                if key.startswith("se3_guidance_tokenizer.") and key not in model_state:
+                    adapted.pop(key)
+                elif key in model_state and adapted[key].shape != model_state[key].shape:
+                    if key.startswith("se3_guidance_tokenizer.") or key in {"ee_pos_emb"}:
+                        logger.info(
+                            f"Skip incompatible warm-start parameter {key}: "
+                            f"checkpoint={tuple(adapted[key].shape)} model={tuple(model_state[key].shape)}"
+                        )
+                        adapted.pop(key)
+            return adapted
+
+        transformer_warm_start = getattr(config, "transformer_warm_start", None)
+        action_head_warm_start = getattr(config, "action_head_warm_start", None)
+        if transformer_warm_start or action_head_warm_start:
+            if getattr(config, "transformer_resume", False) or getattr(config, "action_head_resume", False):
+                raise ValueError("Warm-start and optimizer-state resume cannot be enabled together")
+            warm_start_dir = Path(transformer_warm_start or action_head_warm_start).parent.parent
+            if not _is_complete_checkpoint_dir(warm_start_dir):
+                raise RuntimeError(f"Warm-start checkpoint is incomplete: {warm_start_dir}")
+            if transformer_warm_start:
+                state = _load_checkpoint_state(transformer_warm_start)
+                state = _adapt_transformer_state_for_resolution(self.transformer, state)
+                state = _adapt_se3_tokenizer_warm_start_state(self.transformer, state)
+                logger.info(f"Transformer warm start: {self.transformer.load_state_dict(state, strict=False)}")
+            if action_head_warm_start:
+                state = _load_checkpoint_state(action_head_warm_start)
+                state = _adapt_action_head_state_for_condition_shape(self.action_head, state)
+                logger.info(f"Action-head warm start: {self.action_head.load_state_dict(state, strict=False)}")
 
         streamvggt_pretrained = getattr(config, "streamvggt_pretrained", None)
         if streamvggt_pretrained is None:
@@ -922,7 +1014,10 @@ class Trainer:
 
         for name, param in self.transformer.named_parameters():
             total_params += param.numel()
-            if bool(getattr(config, "freeze_visual_backbone", False)):
+            if name.startswith("wrist_dinov2."):
+                # Frozen pretrained DINO encoders; train only alignment projections and camera IDs.
+                param.requires_grad = not name.startswith("wrist_dinov2.encoders.")
+            elif bool(getattr(config, "freeze_visual_backbone", False)):
                 # Stage 1: keep visual feature extraction frozen, while training
                 # action/RDT conditioning and the EE-target head.
                 param.requires_grad = (
@@ -930,8 +1025,9 @@ class Trainer:
                     or name.endswith("ee_target_token")
                     or name.startswith("aggregator.action_embedder.")
                     or name.startswith("text_token_proj.")
-                    or name.startswith("ee_target_head.")
-                    or name.startswith("ee_target_cond_proj.")
+                    or (not self.enable_se3_guidance and name.startswith("ee_target_head."))
+                    or (not self.enable_se3_guidance and name.startswith("ee_target_cond_proj."))
+                    or (self.enable_se3_guidance and (name.startswith("se3_guidance_tokenizer.") or name.startswith("se3_guidance_out.") or name == "se3_guidance_gate"))
                 )
             elif self.use_lora:
                 param.requires_grad = (
@@ -940,11 +1036,20 @@ class Trainer:
                     or name.endswith("ee_target_token")
                     or name.startswith("aggregator.action_embedder.")
                     or name.startswith("text_token_proj.")
-                    or name.startswith("ee_target_head.")
-                    or name.startswith("ee_target_cond_proj.")
+                    or (not self.enable_se3_guidance and name.startswith("ee_target_head."))
+                    or (not self.enable_se3_guidance and name.startswith("ee_target_cond_proj."))
+                    or (self.enable_se3_guidance and (name.startswith("se3_guidance_tokenizer.") or name.startswith("se3_guidance_out.") or name == "se3_guidance_gate"))
                 )
             else:
                 param.requires_grad = True
+
+        if self.transformer.wrist_dinov2 is not None:
+            self.transformer.wrist_dinov2.freeze_backbones()
+            assert not any(p.requires_grad for p in self.transformer.wrist_dinov2.encoders.parameters())
+            assert all(p.requires_grad for p in self.transformer.wrist_dinov2.projections.parameters())
+            assert all(p.requires_grad for p in self.action_head.parameters())
+            assert all(p.requires_grad for p in self.transformer.se3_guidance_tokenizer.parameters())
+            logger.info(f"Wrist DINO frozen; projections trainable; full RDT/SE3 trainable; RDT image length={max_rdt_img_len}")
 
         if self.use_lora:
             for name, p in self.transformer.named_parameters():
@@ -962,11 +1067,20 @@ class Trainer:
             logger.info(
                 f"Example frozen parameters: {', '.join(frozen_param_names[:5])}{'...' if len(frozen_param_names) > 5 else ''}")
 
-        # Optimizer
+        # Optimizer: guidance starts at 1e-5 and follows its own ramp to 5e-5;
+        # all other trainable modules retain the configured base learning rate.
+        base_params = []
+        guidance_params = []
+        for name, p in self.transformer.named_parameters():
+            if not p.requires_grad:
+                continue
+            (guidance_params if (name.startswith("se3_guidance_tokenizer.") or name.startswith("se3_guidance_out.") or name == "se3_guidance_gate") else base_params).append(p)
+        base_params.extend([p for p in self.action_head.parameters() if p.requires_grad])
+        self.guidance_lr_initial = float(getattr(config, "se3_guidance_lr_initial", 1e-5))
+        self.guidance_lr_max = float(getattr(config, "se3_guidance_lr_max", 5e-5))
+        self.guidance_lr_ramp_steps = int(getattr(config, "se3_guidance_lr_ramp_steps", 5000))
         self.optimizer = torch.optim.AdamW(
-            [p for p in self.transformer.parameters() if p.requires_grad]
-            + [p for p in self.action_head.parameters() if p.requires_grad],
-            lr=config.learning_rate,
+            [{"params": base_params, "lr": config.learning_rate}, {"params": guidance_params, "lr": self.guidance_lr_initial}],
             betas=(config.beta1, config.beta2),
             eps=1e-8,
             weight_decay=config.weight_decay,
@@ -974,8 +1088,15 @@ class Trainer:
             foreach=False,
         )
 
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
-            lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
+        def _guidance_ramp(step):
+            # LambdaLR multiplies the group's initial lr. Keep the first
+            # effective guidance lr at guidance_lr_initial, then ramp to max.
+            progress = min(1.0, float(step) / max(1, self.guidance_lr_ramp_steps))
+            return 1.0 + progress * (self.guidance_lr_max / self.guidance_lr_initial - 1.0)
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=[
+            lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps),
+            _guidance_ramp,
+        ])
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
@@ -1239,6 +1360,11 @@ class Trainer:
             image_time_ids=batch_dict.get("image_time_ids", None),
         )
 
+        if bool(getattr(self.config, "enable_wrist_dinov2", False)):
+            if "wrist_images" not in batch_dict:
+                raise ValueError("Enabled wrist DINO but dataset did not return wrist_images")
+            image_dict["wrist_images"] = batch_dict["wrist_images"]
+
         # VGA action tokens are one history/state token per frame plus future action queries.
         action_grid_id = get_mesh_id(
             F_action + chunk_size,
@@ -1304,6 +1430,14 @@ class Trainer:
             'chunk_size': rdt_horizon,
             'future_action_chunk_size': chunk_size,
         }
+        if "se3_guidance" in batch_dict:
+            # Legacy-compatible sparse EE encoding uses the current EE state
+            # to form waypoint deltas before projecting xyz/gripper tokens.
+            guidance = dict(batch_dict["se3_guidance"])
+            if "ee_state" in batch_dict:
+                guidance["current_ee"] = batch_dict["ee_state"]
+            guidance = self._maybe_add_noise_to_se3_guidance(guidance)
+            input_dict["se3_guidance"] = guidance
         if 'ee_state' in batch_dict:
             input_dict['ee_target_condition_current'] = batch_dict['ee_state']
         if 'ee_target_sequence_valid' in batch_dict:
@@ -1421,6 +1555,52 @@ class Trainer:
         token_rms = token_rms.add(1e-6).sqrt()
         noise = torch.randn_like(action_condition_fp32) * (token_rms * self.action_condition_noise_std)
         return (action_condition_fp32 + noise).to(dtype=action_condition.dtype)
+
+    def _maybe_add_noise_to_se3_guidance(self, guidance):
+        """Add physical-space waypoint noise before SE(3) tokenization."""
+        if not self.se3_guidance_train_noise:
+            return guidance
+        result = dict(guidance)
+        left_pose = result["left_pose_7d"].float().clone()
+        right_pose = result["right_pose_7d"].float().clone()
+        left_valid = result.get("left_valid", torch.ones(left_pose.shape[:2], device=left_pose.device, dtype=torch.bool)).bool()
+        right_valid = result.get("right_valid", torch.ones(right_pose.shape[:2], device=right_pose.device, dtype=torch.bool)).bool()
+        pos_std = self.se3_guidance_position_noise_std
+        if pos_std > 0.0:
+            left_pose[..., :3] += torch.randn_like(left_pose[..., :3]) * pos_std * left_valid[..., None]
+            right_pose[..., :3] += torch.randn_like(right_pose[..., :3]) * pos_std * right_valid[..., None]
+
+        angle_std = self.se3_guidance_rotation_noise_deg * torch.pi / 180.0
+        if angle_std > 0.0:
+            def perturb_quaternion(q, valid):
+                axis = torch.randn_like(q[..., 1:])
+                axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                angle = torch.randn(q.shape[:-1] + (1,), device=q.device, dtype=q.dtype) * angle_std
+                half = angle * 0.5
+                dq = torch.cat([torch.cos(half), axis * torch.sin(half)], dim=-1)
+                w1, x1, y1, z1 = q.unbind(dim=-1)
+                w2, x2, y2, z2 = dq.unbind(dim=-1)
+                out = torch.stack((
+                    w1*w2 - x1*x2 - y1*y2 - z1*z2,
+                    w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                    w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                    w1*z2 + x1*y2 - y1*x2 + z1*w2,
+                ), dim=-1)
+                out = out / out.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                return torch.where(valid[..., None], out, q)
+            left_pose[..., 3:7] = perturb_quaternion(left_pose[..., 3:7], left_valid)
+            right_pose[..., 3:7] = perturb_quaternion(right_pose[..., 3:7], right_valid)
+
+        result["left_pose_7d"] = left_pose.to(result["left_pose_7d"].dtype)
+        result["right_pose_7d"] = right_pose.to(result["right_pose_7d"].dtype)
+        grip_std = self.se3_guidance_gripper_noise_std
+        if grip_std > 0.0:
+            result["left_gripper"] = result["left_gripper"] + torch.randn_like(result["left_gripper"].float()) * grip_std * left_valid
+            result["right_gripper"] = result["right_gripper"] + torch.randn_like(result["right_gripper"].float()) * grip_std * right_valid
+        duration_std = self.se3_guidance_duration_noise_std
+        if duration_std > 0.0:
+            result["duration"] = (result["duration"].float() + torch.randn_like(result["duration"].float()) * duration_std).clamp_min(0.0)
+        return result
 
     @staticmethod
     def _rdt_condition_token_len(condition):
@@ -1711,6 +1891,15 @@ class Trainer:
         return override_mask.flatten(1).any(dim=1).float().mean().detach().cpu().item()
 
     def train_epoch(self):
+        # Advance the distributed sampler seed on each full/partial data pass.
+        # Without set_epoch(), DistributedSampler repeats the same permutation
+        # whenever the outer step loop starts another pass over the loader.
+        sampler = getattr(self.train_loader, "sampler", None)
+        if isinstance(sampler, DistributedSampler):
+            sampler_epoch = int(getattr(self, "_data_epoch", 0))
+            sampler.set_epoch(sampler_epoch)
+            self._data_epoch = sampler_epoch + 1
+
         self.transformer.train()
 
         # Use manual progress bar control to only update on optimizer steps
@@ -1742,10 +1931,8 @@ class Trainer:
 
             input_dict = self._prepare_input_dict(batch)
             ee_target_gt_prob = self._current_ee_target_gt_condition_prob()
-            ee_target_gt_rate = self._attach_ee_target_condition_override(
-                input_dict,
-                batch,
-                ee_target_gt_prob,
+            ee_target_gt_rate = 0.0 if self.enable_se3_guidance else self._attach_ee_target_condition_override(
+                input_dict, batch, ee_target_gt_prob,
             )
 
             should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader)
@@ -1757,6 +1944,14 @@ class Trainer:
 
             output = self.transformer(input_dict)
             rdt_conds = output.ress
+            if self.step == 0 and batch_idx == 0 and self.config.rank == 0 and bool(getattr(self.config, "enable_wrist_dinov2", False)):
+                logger.info(
+                    f"WRIST_CONDITION images={tuple(input_dict['image_dict']['images'].shape)} "
+                    f"wrists={tuple(input_dict['image_dict']['wrist_images'].shape)} "
+                    f"rdt_img={tuple(rdt_conds['rdt_img_c'].shape)} "
+                    f"se3={tuple(rdt_conds['rdt_se3_c'].shape)} "
+                    f"waypoint_noise={self.se3_guidance_train_noise} ee_head={self.transformer.ee_target_head is not None}"
+                )
             if self.model_arch == "vga" and self.enable_ee_target_loss:
                 ee_target_loss_dict = self._compute_ee_target_loss_dict(batch, output)
             else:
@@ -1774,9 +1969,14 @@ class Trainer:
                     f"RDT action condition length mismatch: act_c={rdt_act_cond_len}, "
                     f"expected={expected_rdt_act_cond_len}, noisy_action={action_chunk.shape[1]}"
                 )
-            rdt_ee_c = rdt_conds.get("rdt_ee_c", None)
-            rdt_ee_mask = rdt_conds.get("rdt_ee_mask", None)
-            expected_rdt_ee_cond_len = int(getattr(self, "ee_target_condition_num_tokens", 0))
+            rdt_ee_c = rdt_conds.get("rdt_se3_c", rdt_conds.get("rdt_ee_c", None))
+            rdt_ee_mask = rdt_conds.get("rdt_se3_mask", rdt_conds.get("rdt_ee_mask", None))
+            expected_rdt_ee_cond_len = (
+                self.transformer.se3_guidance_tokenizer.MAX_WAYPOINTS
+                * self.transformer.se3_guidance_tokenizer.TOKENS_PER_BLOCK
+                if self.enable_se3_guidance
+                else int(getattr(self, "ee_target_condition_num_tokens", 0))
+            )
             if expected_rdt_ee_cond_len > 0:
                 rdt_ee_cond_len = self._rdt_condition_token_len(rdt_ee_c)
                 if rdt_ee_cond_len != expected_rdt_ee_cond_len:
@@ -2017,10 +2217,12 @@ class Trainer:
                         'lr': lr,
                     }, step=self.step)
                 self.step += 1
-                if self.step % self.config.save_interval == 0:
+                if self.step % self.config.save_interval == 0 or self.step >= self.config.num_steps:
                     if self.config.rank == 0:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
+                if self.step >= self.config.num_steps:
+                    break
 
         progress_bar.close()
 

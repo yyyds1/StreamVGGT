@@ -32,6 +32,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${SRC_DIR}"
+ABLATION_CONFIG=${ABLATION_CONFIG:-}
+ABLATION_PROFILE=${ABLATION_PROFILE:-}
+if [[ -z "${ABLATION_CONFIG}" && -n "${ABLATION_PROFILE}" ]]; then ABLATION_CONFIG="${SRC_DIR}/../configs/ablation_profiles/${ABLATION_PROFILE}.json"; fi
+export ABLATION_CONFIG
 
 START_PORT=${START_PORT:-29055}
 MASTER_PORT=${MASTER_PORT:-29061}
@@ -96,10 +100,17 @@ fi
 if [[ -n "${RDT_EE_TARGET_CONDITION_SOURCE:-}" ]]; then
     extra_args+=(--rdt-ee-target-condition-source "${RDT_EE_TARGET_CONDITION_SOURCE}")
 fi
+if [[ -n "${SE3_GUIDANCE_SOURCE:-}" ]]; then
+    extra_args+=(--se3-guidance-source "${SE3_GUIDANCE_SOURCE}")
+fi
+if [[ "${SE3_GUIDANCE_NOISY_ORACLE:-0}" == "1" ]]; then
+    extra_args+=(--se3-guidance-noisy-oracle)
+fi
 if [[ "${DISABLE_JOINT_DELTA_WARM_START_EVAL:-0}" == "1" || "${DISABLE_JOINT_DELTA_WARM_START_EVAL:-0}" == "true" || "${DISABLE_JOINT_DELTA_WARM_START_EVAL:-0}" == "True" ]]; then
     extra_args+=(--disable-joint-delta-warm-start-eval)
 fi
 
+if [[ -n "${ABLATION_CONFIG}" ]]; then [[ -f "${ABLATION_CONFIG}" ]] || { echo "Missing ablation config: ${ABLATION_CONFIG}" >&2; exit 1; }; echo "[launch_server] ablation profile: ${ABLATION_CONFIG}"; fi
 echo "[launch_server] checkpoint: ${CKPT_DIR}"
 echo "[launch_server] eval config: ${EVAL_CONFIG}"
 echo "[launch_server] port: ${START_PORT}"
@@ -113,6 +124,10 @@ fi
 if [[ -n "${RDT_EE_TARGET_CONDITION_SOURCE:-}" ]]; then
     echo "[launch_server] RDT ee-target condition source: ${RDT_EE_TARGET_CONDITION_SOURCE}"
 fi
+if [[ -n "${SE3_GUIDANCE_SOURCE:-}" ]]; then
+    echo "[launch_server] SE3 guidance source: ${SE3_GUIDANCE_SOURCE}"
+fi
+echo "[launch_server] SE3 guidance noisy oracle: ${SE3_GUIDANCE_NOISY_ORACLE:-0}"
 if [[ "${DISABLE_JOINT_DELTA_WARM_START_EVAL:-0}" == "1" || "${DISABLE_JOINT_DELTA_WARM_START_EVAL:-0}" == "true" || "${DISABLE_JOINT_DELTA_WARM_START_EVAL:-0}" == "True" ]]; then
     echo "[launch_server] joint-delta warm start: disabled"
 fi

@@ -11,6 +11,8 @@ from streamvggt.heads.camera_head import CameraHead
 from streamvggt.heads.dpt_head import DPTHead
 from vga.ee_target_mask import build_ee_target_token_mask
 from vga.heads import EETargetHead
+from vga.se3_guidance_tokenizer import SE3GuidanceTokenizer
+from vga.wrist_dinov2 import WristDINOv2Encoder, append_wrist_tokens
 from vga.models.aggregator import VGAAggregator
 from vga.utils import apply_lora_to_module
 
@@ -50,6 +52,13 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         ee_target_head_use_image_tokens=True,
         ee_target_head_image_cross_attn_depth=1,
         ee_target_sequence_len=1,
+        enable_se3_guidance=False,
+        se3_max_waypoints=6,
+        se3_max_duration=32,
+        enable_wrist_dinov2=False,
+        wrist_dinov2_model="facebook/dinov2-small",
+        wrist_dinov2_image_size=224,
+        wrist_dinov2_local_files_only=False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -63,6 +72,18 @@ class VGA(nn.Module, PyTorchModelHubMixin):
         self.image_frame_stride = image_frame_stride
         self.text_embed_dim = int(text_embed_dim)
         self.ee_target_sequence_len = max(1, int(ee_target_sequence_len))
+        self.enable_se3_guidance = bool(enable_se3_guidance)
+        self.se3_max_waypoints = int(se3_max_waypoints)
+        self.se3_guidance_tokenizer = SE3GuidanceTokenizer(embed_dim, se3_max_duration) if self.enable_se3_guidance else None
+        # Start guidance as a zero-impact residual branch and learn its scale.
+        self.se3_guidance_out = nn.Identity() if self.enable_se3_guidance else None
+        # The legacy-compatible experiment feeds projected sparse EE tokens directly
+        # to RDT, without an additional zero-init residual projection or gate.
+        if self.se3_guidance_out is not None:
+            self.se3_guidance_out = nn.Identity()
+            self.se3_guidance_gate = None
+        else:
+            self.se3_guidance_gate = None
 
         self.rdt_img_cond_mode = rdt_img_cond_mode
         self.rdt_img_pool_size = max(int(rdt_img_pool_size), 1)
@@ -135,7 +156,7 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             )
         else:
             self.ee_target_head = None
-        if self.rdt_cond_use_ee_target_tokens:
+        if self.rdt_cond_use_ee_target_tokens and not self.enable_se3_guidance:
             if self.ee_target_head is None:
                 raise ValueError("rdt_condition_tokens.use_ee_target_tokens=True requires enable_ee_target_head=True")
             self.ee_target_fourier_bands = 4
@@ -154,6 +175,10 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             self.ee_target_condition_num_tokens = 0
             self.ee_target_cond_proj = None
 
+        self.enable_wrist_dinov2 = bool(enable_wrist_dinov2)
+        self.wrist_dinov2 = WristDINOv2Encoder(
+            wrist_dinov2_model, embed_dim, wrist_dinov2_image_size, wrist_dinov2_local_files_only
+        ) if self.enable_wrist_dinov2 else None
         self.lora_replaced_modules = []
         self.lora_config = None
 
@@ -520,40 +545,35 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             )
 
         rdt_img_tokens = img_tokens
+        if self.wrist_dinov2 is not None:
+            if "wrist_images" not in image_dict:
+                raise ValueError("Wrist DINOv2 conditioning is enabled but image_dict.wrist_images is missing")
+            wrist_tokens = self.wrist_dinov2(image_dict["wrist_images"])
+            rdt_img_tokens = append_wrist_tokens(img_tokens, wrist_tokens)
         rdt_act_tokens = act_tokens
         rdt_lang_tokens = lang_tokens
         rdt_ee_tokens = None
         rdt_ee_mask = None
-        if (
-            geometry is not None
-            and "ee_target" in geometry
-            and self.rdt_cond_use_ee_target_tokens
-            and self.ee_target_cond_proj is not None
-        ):
-            ee_target_condition = self._mix_ee_target_condition_override(
-                geometry["ee_target"],
-                input_dict.get("ee_target_condition_override", None),
-                input_dict.get("ee_target_condition_override_mask", None),
-            )
-            rdt_ee_tokens = self._build_ee_target_condition_tokens(
-                ee_target=ee_target_condition,
-                current_ee=None,
-                dtype=rdt_act_tokens.dtype,
-            )
-            rdt_ee_mask = build_ee_target_token_mask(
-                input_dict.get("ee_target_condition_valid", None),
-                sequence_len=geometry["ee_target"].shape[2],
-                batch_size=geometry["ee_target"].shape[0],
-                device=rdt_ee_tokens.device,
-            )
+        guidance = input_dict.get("se3_guidance")
+        if guidance is not None and self.se3_guidance_tokenizer is not None:
+            rdt_ee_tokens, rdt_ee_mask = self.se3_guidance_tokenizer(guidance, dtype=rdt_act_tokens.dtype)
+            rdt_ee_tokens = rdt_ee_tokens.to(device=rdt_act_tokens.device)
+            rdt_ee_mask = rdt_ee_mask.to(device=rdt_act_tokens.device)
             if rdt_act_tokens.dim() == 4:
                 rdt_ee_tokens = rdt_ee_tokens[:, None].expand(-1, rdt_act_tokens.shape[1], -1, -1)
+        elif (
+            geometry is not None and "ee_target" in geometry
+            and self.rdt_cond_use_ee_target_tokens and self.ee_target_cond_proj is not None
+        ):
+            raise ValueError("SE3 guidance is required for RDT conditioning; provide input_dict['se3_guidance']")
         rdt_cond_c = self._compose_rdt_condition_tokens(
             img_c=rdt_img_tokens,
             act_c=rdt_act_tokens,
             lang_c=rdt_lang_tokens,
             ee_c=rdt_ee_tokens,
         )
+        if rdt_ee_tokens is not None:
+            rdt_ee_tokens = rdt_ee_tokens.to(dtype=rdt_act_tokens.dtype)
 
         return VGAOutput(
             ress={
@@ -566,6 +586,8 @@ class VGA(nn.Module, PyTorchModelHubMixin):
                 "rdt_img_tokens": rdt_img_tokens,
                 "rdt_action_query_tokens": rdt_act_tokens,
                 "rdt_ee_target_tokens": rdt_ee_tokens,
+                "rdt_se3_c": rdt_ee_tokens,
+                "rdt_se3_mask": rdt_ee_mask,
             },
             geometry=geometry,
             views=images,
@@ -637,5 +659,6 @@ class VGA(nn.Module, PyTorchModelHubMixin):
             "action_dict": action_dict,
             "ee_target_condition_current": frames[0].get("ee_target_condition_current", None),
             "ee_target_condition_valid": frames[0].get("ee_target_condition_valid", None),
+            "se3_guidance": frames[0].get("se3_guidance", None),
         }
         return self.forward(input_dict=input_dict, predict_geometry=False)

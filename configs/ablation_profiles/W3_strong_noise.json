@@ -1,0 +1,13 @@
+{
+  "name": "W3_strong_noise",
+  "waypoint_noise": {
+    "position_std": 0.02,
+    "rotation_std_deg": 15.0,
+    "gripper_std": 0.05,
+    "duration_std": 2.0
+  },
+  "waypoint_missing_rate": 0.0,
+  "waypoint_missing_sides": [],
+  "camera_missing": [],
+  "seed": 0
+}

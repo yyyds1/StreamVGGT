@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+MASTER_PORT=$'29555','RANK':'0','LOCAL_RANK':'0','WORLD_SIZE':'1','TOKENIZERS_PARALLELISM':'false','PYTORCH_CUDA_ALLOC_CONF':'expandable_segments:True','ROBOTWIN_CPU_ONLY_TORCH_SEED':'1'
+
 cd "$(dirname "$0")/.."
 : "${PORT:=1106}"
 : "${CHECKPOINT_DIR:?Set CHECKPOINT_DIR to a checkpoint_step_* directory}"
 if [[ -z "${PYTHON_BIN:-}" ]]; then
     for candidate in \
         /opt/conda/envs/RoboTwin2/bin/python \
-        /root/miniforge3/envs/RoboTwin2/bin/python \
+        "${PYTHON_BIN:-$(command -v python3 || command -v python)}" \
         /opt/miniconda/envs/RoboTwin2/bin/python \
         "$(command -v python3 2>/dev/null || true)"; do
         if [[ -x "$candidate" ]] && "$candidate" -c "import torch" >/dev/null 2>&1; then

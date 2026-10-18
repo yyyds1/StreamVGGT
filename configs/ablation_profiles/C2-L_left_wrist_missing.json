@@ -1,0 +1,15 @@
+{
+  "name": "C2-L_left_wrist_missing",
+  "waypoint_noise": {
+    "position_std": 0.005,
+    "rotation_std_deg": 5.0,
+    "gripper_std": 0.02,
+    "duration_std": 1.0
+  },
+  "waypoint_missing_rate": 0.0,
+  "waypoint_missing_sides": [],
+  "camera_missing": [
+    "left_wrist"
+  ],
+  "seed": 0
+}

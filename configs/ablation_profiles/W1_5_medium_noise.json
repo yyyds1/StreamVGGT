@@ -1,0 +1,13 @@
+{
+  "name": "W1_5_medium_noise",
+  "waypoint_noise": {
+    "position_std": 0.01,
+    "rotation_std_deg": 10.0,
+    "gripper_std": 0.03,
+    "duration_std": 1.5
+  },
+  "waypoint_missing_rate": 0.0,
+  "waypoint_missing_sides": [],
+  "camera_missing": [],
+  "seed": 0
+}

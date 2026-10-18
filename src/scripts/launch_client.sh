@@ -50,7 +50,7 @@ MODEL_NAME=${MODEL_NAME:-0}
 CKPT_SETTING=${CKPT_SETTING:-}
 SEED=${SEED:-0}
 HEADLESS=${HEADLESS:-1}
-MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-400}
+MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-}
 EXPERT_TARGET_POS_THRESHOLD=${EXPERT_TARGET_POS_THRESHOLD:-}
 EXPERT_TARGET_ROT_THRESHOLD=${EXPERT_TARGET_ROT_THRESHOLD:-}
 EXPERT_TARGET_GRIPPER_THRESHOLD=${EXPERT_TARGET_GRIPPER_THRESHOLD:-}
@@ -60,6 +60,7 @@ EE_TARGET_SEQUENCE_LEN=${EE_TARGET_SEQUENCE_LEN:-}
 EE_TARGET_WAYPOINT_DISTANCE=${EE_TARGET_WAYPOINT_DISTANCE:-}
 LIVE_WAYPOINT_LABELS=${LIVE_WAYPOINT_LABELS:-}
 USE_EXPERT_PLAN_MARKED_RGB=${USE_EXPERT_PLAN_MARKED_RGB:-}
+USE_SPARSE_WAYPOINT_MARKED_RGB=${USE_SPARSE_WAYPOINT_MARKED_RGB:-}
 VIDEO_GUIDANCE_SCALE=${VIDEO_GUIDANCE_SCALE:-5}
 ACTION_GUIDANCE_SCALE=${ACTION_GUIDANCE_SCALE:-1}
 TEST_NUM=${TEST_NUM:-10}
@@ -67,9 +68,19 @@ STOP_ON_ERROR=${STOP_ON_ERROR:-0}
 SUMMARY_FILE=${SUMMARY_FILE:-}
 JOINT_USE_DIRECT_CONTROL=${JOINT_USE_DIRECT_CONTROL:-1}
 JOINT_DIRECT_CONTROL_STEPS=${JOINT_DIRECT_CONTROL_STEPS:-15}
+JOINT_MAX_VELOCITY=${JOINT_MAX_VELOCITY:-1.0}
 CLIP_JOINT_ACTION_TO_DATASET_BOUNDS=${CLIP_JOINT_ACTION_TO_DATASET_BOUNDS:-1}
+USE_CACHED_SPARSE_WAYPOINTS=${USE_CACHED_SPARSE_WAYPOINTS:-0}
+SPARSE_WAYPOINT_STEP_SCALE=${SPARSE_WAYPOINT_STEP_SCALE:-1.0}
+SPARSE_WAYPOINT_DATASET_ROOT=${SPARSE_WAYPOINT_DATASET_ROOT:-}
+EVALUATION_SEED_ROOT=${EVALUATION_SEED_ROOT:-}
 DEBUG_NATIVE=${DEBUG_NATIVE:-0}
 DEBUG_NATIVE_ONLY=${DEBUG_NATIVE_ONLY:-0}
+SERVER_EXTRA_ARGS=${SERVER_EXTRA_ARGS:-}
+ABLATION_CONFIG=${ABLATION_CONFIG:-}
+ABLATION_PROFILE=${ABLATION_PROFILE:-}
+SE3_GUIDANCE_NOISY_ORACLE=${SE3_GUIDANCE_NOISY_ORACLE:-0}
+if [[ -z "${ABLATION_CONFIG}" && -n "${ABLATION_PROFILE}" ]]; then ABLATION_CONFIG="${REPO_DIR}/configs/ablation_profiles/${ABLATION_PROFILE}.json"; fi
 
 # Edit this list for batch evaluation. If TASK_NAME or the first positional
 # argument is set, only that one task is evaluated.
@@ -173,6 +184,7 @@ values = {
     "CFG_JOINT_ACTION_REPRESENTATION": cfg.get("joint_action_representation", "absolute"),
     "CFG_USE_EXPERT_MARKED_RGB": cfg.get("use_expert_marked_rgb", False),
     "CFG_USE_EXPERT_PLAN_MARKED_RGB": cfg.get("use_expert_plan_marked_rgb", False),
+    "CFG_USE_SPARSE_WAYPOINT_MARKED_RGB": cfg.get("use_sparse_waypoint_marked_rgb", False),
     "CFG_LIVE_WAYPOINT_LABELS": cfg.get("live_waypoint_labels", True),
     "CFG_EE_TARGET_SEQUENCE_LEN": cfg.get(
         "ee_target_sequence_len",
@@ -207,6 +219,7 @@ ACTION_REPRESENTATION=${ACTION_REPRESENTATION:-${CFG_ACTION_REPRESENTATION}}
 JOINT_ACTION_REPRESENTATION=${JOINT_ACTION_REPRESENTATION:-${CFG_JOINT_ACTION_REPRESENTATION}}
 USE_EXPERT_MARKED_RGB=${USE_EXPERT_MARKED_RGB:-${CFG_USE_EXPERT_MARKED_RGB}}
 USE_EXPERT_PLAN_MARKED_RGB=${USE_EXPERT_PLAN_MARKED_RGB:-${CFG_USE_EXPERT_PLAN_MARKED_RGB}}
+USE_SPARSE_WAYPOINT_MARKED_RGB=${USE_SPARSE_WAYPOINT_MARKED_RGB:-${CFG_USE_SPARSE_WAYPOINT_MARKED_RGB}}
 LIVE_WAYPOINT_LABELS=${LIVE_WAYPOINT_LABELS:-${CFG_LIVE_WAYPOINT_LABELS}}
 EE_TARGET_SEQUENCE_LEN=${EE_TARGET_SEQUENCE_LEN:-${CFG_EE_TARGET_SEQUENCE_LEN}}
 EE_TARGET_WAYPOINT_DISTANCE=${EE_TARGET_WAYPOINT_DISTANCE:-${CFG_EE_TARGET_WAYPOINT_DISTANCE}}
@@ -225,7 +238,8 @@ if [[ -z "${EVAL_CONFIG}" ]]; then
     if [[ -f "${REPO_DIR}/robotwin-labeled/policy/${POLICY_NAME}/deploy_policy.yml" ]]; then
         EVAL_CONFIG="${REPO_DIR}/robotwin-labeled/policy/${POLICY_NAME}/deploy_policy.yml"
     else
-        EVAL_CONFIG="/inspire/hdd/global_user/yangdongshen-253108120197/code/robotwin-labeled/policy/${POLICY_NAME}/deploy_policy.yml"
+        echo "Missing EVAL_CONFIG; set EVAL_CONFIG or ROBOTWIN_REPO" >&2
+        exit 1
     fi
 fi
 
@@ -242,6 +256,11 @@ fi
 plan_rgb_flag=(--no-use_expert_plan_marked_rgb)
 if [[ "${USE_EXPERT_PLAN_MARKED_RGB}" == "1" || "${USE_EXPERT_PLAN_MARKED_RGB}" == "true" || "${USE_EXPERT_PLAN_MARKED_RGB}" == "True" ]]; then
     plan_rgb_flag=(--use_expert_plan_marked_rgb)
+fi
+
+sparse_rgb_flag=(--no-use_sparse_waypoint_marked_rgb)
+if [[ "${USE_SPARSE_WAYPOINT_MARKED_RGB}" == "1" || "${USE_SPARSE_WAYPOINT_MARKED_RGB}" == "true" || "${USE_SPARSE_WAYPOINT_MARKED_RGB}" == "True" ]]; then
+    sparse_rgb_flag=(--use_sparse_waypoint_marked_rgb)
 fi
 
 live_waypoint_flag=(--no-live_waypoint_labels)
@@ -288,6 +307,11 @@ PY
 fi
 
 mkdir -p "${SAVE_ROOT}"
+ABLATION_ARGS=()
+if [[ -n "${ABLATION_CONFIG}" ]]; then
+    [[ -f "${ABLATION_CONFIG}" ]] || { echo "Missing ablation config: ${ABLATION_CONFIG}" >&2; exit 1; }
+    ABLATION_ARGS+=(--ablation-profile "${ABLATION_CONFIG}")
+fi
 
 echo "[launch_client] checkpoint: ${CKPT_DIR}"
 echo "[launch_client] action space: ${ROBOTWIN_ACTION_SPACE}"
@@ -296,10 +320,12 @@ echo "[launch_client] joint representation: ${JOINT_ACTION_REPRESENTATION}"
 echo "[launch_client] task config: ${TASK_CONFIG}"
 echo "[launch_client] use expert marked RGB: ${USE_EXPERT_MARKED_RGB}"
 echo "[launch_client] use expert plan marked RGB: ${USE_EXPERT_PLAN_MARKED_RGB}"
+echo "[launch_client] use sparse waypoint marked RGB: ${USE_SPARSE_WAYPOINT_MARKED_RGB}"
 echo "[launch_client] live waypoint labels: ${LIVE_WAYPOINT_LABELS}"
 echo "[launch_client] waypoint layout: K=${EE_TARGET_SEQUENCE_LEN}, distance=${EE_TARGET_WAYPOINT_DISTANCE}"
+echo "[launch_client] sparse waypoint step scale: ${SPARSE_WAYPOINT_STEP_SCALE}"
 echo "[launch_client] expert target thresholds: pos=${EXPERT_TARGET_POS_THRESHOLD}, rot=${EXPERT_TARGET_ROT_THRESHOLD}, gripper=${EXPERT_TARGET_GRIPPER_THRESHOLD}"
-echo "[launch_client] joint direct control: ${JOINT_USE_DIRECT_CONTROL}, steps=${JOINT_DIRECT_CONTROL_STEPS}"
+echo "[launch_client] joint direct control: ${JOINT_USE_DIRECT_CONTROL}, steps=${JOINT_DIRECT_CONTROL_STEPS}, max_velocity=${JOINT_MAX_VELOCITY} rad/s"
 echo "[launch_client] clip joint action to dataset bounds: ${CLIP_JOINT_ACTION_TO_DATASET_BOUNDS}"
 echo "[launch_client] server: ${HOST}:${PORT}"
 
@@ -365,12 +391,37 @@ if candidates:
 PY
 }
 
+max_episode_steps_args=()
+if [[ -n "${MAX_EPISODE_STEPS}" ]]; then
+    max_episode_steps_args+=(--max_episode_steps "${MAX_EPISODE_STEPS}")
+fi
+
 run_one_task() {
     local task="$1"
     local status="ok"
     local metrics_file=""
 
     echo "[launch_client] task: ${task} | test_num=${TEST_NUM}"
+    cache_overrides=()
+    seed_start_args=()
+    if [[ "${USE_CACHED_SPARSE_WAYPOINTS}" == "1" || "${USE_CACHED_SPARSE_WAYPOINTS}" == "true" ]]; then
+        if [[ -z "${SPARSE_WAYPOINT_DATASET_ROOT}" || -z "${EVALUATION_SEED_ROOT}" ]]; then
+            echo "Cached waypoint mode requires SPARSE_WAYPOINT_DATASET_ROOT and EVALUATION_SEED_ROOT" >&2
+            return 1
+        fi
+        seed_json="$(python - "${EVALUATION_SEED_ROOT}/${task}/evaluation_seeds.txt" "${TEST_NUM}" <<'PY'
+import json,sys
+from pathlib import Path
+seeds=[int(x) for x in Path(sys.argv[1]).read_text().split()]
+count=int(sys.argv[2])
+if len(seeds)<count:
+    raise SystemExit(f"Only {len(seeds)} evaluation seeds found, need {count}")
+print(json.dumps(seeds[:count]))
+PY
+)"
+        cache_overrides+=(use_cached_sparse_waypoints True sparse_waypoint_dataset_root "${SPARSE_WAYPOINT_DATASET_ROOT}" evaluation_seed_list "${seed_json}")
+        seed_start_args+=(--seed_start "$(python -c 'import json,sys; print(json.loads(sys.argv[1])[0])' "${seed_json}")")
+    fi
     joint_direct_flag=(--joint_use_direct_control)
     if [[ "${JOINT_USE_DIRECT_CONTROL}" == "0" || "${JOINT_USE_DIRECT_CONTROL}" == "false" || "${JOINT_USE_DIRECT_CONTROL}" == "False" ]]; then
         joint_direct_flag=(--no-joint_use_direct_control)
@@ -390,7 +441,8 @@ run_one_task() {
             --video_guidance_scale "${VIDEO_GUIDANCE_SCALE}" \
             --action_guidance_scale "${ACTION_GUIDANCE_SCALE}" \
             --test_num "${TEST_NUM}" \
-            --max_episode_steps "${MAX_EPISODE_STEPS}" \
+            "${seed_start_args[@]}" \
+            "${max_episode_steps_args[@]}" \
             "${joint_direct_flag[@]}" \
             --joint_direct_control_steps "${JOINT_DIRECT_CONTROL_STEPS}" \
             "${joint_clip_flag[@]}" \
@@ -409,13 +461,18 @@ run_one_task() {
             --joint_action_representation "${JOINT_ACTION_REPRESENTATION}" \
             --checkpoint_dir "${CKPT_DIR}" \
             --overrides \
-            --task_name "${task}" \
+            sparse_waypoint_data True \
+            sparse_waypoint_max_count 6 \
+            sparse_waypoint_step_scale "${SPARSE_WAYPOINT_STEP_SCALE}" \
+            "${cache_overrides[@]}" \
+            task_name "${task}" \
             --task_config "${TASK_CONFIG}" \
             --train_config_name "${TRAIN_CONFIG_NAME}" \
             --model_name "${MODEL_NAME}" \
             --ckpt_setting "${CKPT_SETTING}" \
             --seed "${SEED}" \
             --policy_name "${POLICY_NAME}" \
+            "${ABLATION_ARGS[@]}" \
             --expert_target_sequence_len "${EXPERT_TARGET_SEQUENCE_LEN}" \
             --expert_target_waypoint_distance "${EXPERT_TARGET_WAYPOINT_DISTANCE}"; then
         status="failed"

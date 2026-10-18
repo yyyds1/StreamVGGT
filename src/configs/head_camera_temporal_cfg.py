@@ -24,3 +24,12 @@ head_camera_temporal_cfg.freeze_visual_backbone = False
 head_camera_temporal_cfg.use_lora = True
 # Single-task smoke tests default to main-process loading to avoid /dev/shm pressure.
 head_camera_temporal_cfg.single_task_load_worker = 0
+
+# Structured waypoint conditions replace EE-target-head features for RDT.
+head_camera_temporal_cfg.enable_se3_guidance = True
+head_camera_temporal_cfg.se3_guidance_source = "oracle"
+head_camera_temporal_cfg.se3_guidance_noisy_oracle = False
+head_camera_temporal_cfg.sparse_waypoint_max_count = 6
+head_camera_temporal_cfg.sparse_waypoint_max_duration = 32
+head_camera_temporal_cfg.rdt_condition_tokens.use_ee_target_tokens = True
+head_camera_temporal_cfg.use_ee_target_as_rdt_condition = True

@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import os
+
 from easydict import EasyDict
 
 from .shared_config import va_shared_cfg
@@ -58,12 +60,12 @@ va_robotwin_cfg.joint_action_representation = "absolute"
 # Priority per model in train_va.py:
 # 1) *_resume_from, 2) *_pretrained, 3) random init
 va_robotwin_cfg.transformer_resume = True
-va_robotwin_cfg.transformer_resume_from = '/home/yds/code/StreamVGGT/src/train_out/checkpoint_step_35000/transformer/diffusion_pytorch_model.safetensors'
-va_robotwin_cfg.transformer_pretrained = '/mnt/nas/share/home/yds/actionvggt.pth'
+va_robotwin_cfg.transformer_resume_from = os.environ.get('TRANSFORMER_RESUME_FROM', '')
+va_robotwin_cfg.transformer_pretrained = os.environ.get('TRANSFORMER_PRETRAINED', '')
 
 va_robotwin_cfg.action_head_resume = True
-va_robotwin_cfg.action_head_resume_from = '/home/yds/code/StreamVGGT/src/train_out/checkpoint_step_35000/action_head/diffusion_pytorch_model.safetensors'
-va_robotwin_cfg.action_head_pretrained = '/mnt/nas/share/home/yds/RDT.pth'
+va_robotwin_cfg.action_head_resume_from = os.environ.get('ACTION_HEAD_RESUME_FROM', '')
+va_robotwin_cfg.action_head_pretrained = os.environ.get('ACTION_HEAD_PRETRAINED', '')
 
 va_robotwin_cfg.gradient_checkpointing = False
 va_robotwin_cfg.long_context = False

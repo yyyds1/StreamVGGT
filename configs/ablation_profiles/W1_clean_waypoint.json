@@ -1,0 +1,13 @@
+{
+  "name": "W1_clean_waypoint",
+  "waypoint_noise": {
+    "position_std": 0.0,
+    "rotation_std_deg": 0.0,
+    "gripper_std": 0.0,
+    "duration_std": 0.0
+  },
+  "waypoint_missing_rate": 0.0,
+  "waypoint_missing_sides": [],
+  "camera_missing": [],
+  "seed": 0
+}

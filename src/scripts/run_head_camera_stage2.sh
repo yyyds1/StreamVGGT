@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 if [[ -z "${PYTHON_BIN:-}" ]]; then
     for candidate in \
         /opt/conda/envs/RoboTwin2/bin/python \
-        /root/miniforge3/envs/RoboTwin2/bin/python \
+        "${PYTHON_BIN:-$(command -v python3 || command -v python)}" \
         /opt/miniconda/envs/RoboTwin2/bin/python \
         "$(command -v python3 2>/dev/null || true)"; do
         if [[ -x "$candidate" ]] && "$candidate" -c "import torch" >/dev/null 2>&1; then
