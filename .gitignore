@@ -39,3 +39,7 @@ core.*
 # Local datasets and caches
 dataset/
 input/
+
+# Local ModelScope publishing staging/runtime
+.modelscope_publish/
+.ms_model_upload_runtime/

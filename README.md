@@ -1,228 +1,104 @@
 # ActionVGGT
 
-## Overview
+ActionVGGT combines the StreamVGGT visual backbone with an RDT action head for RoboTwin sparse-waypoint control. This repository contains training, serving, evaluation, and ablation entry points.
 
-A Vision-Action Foundation Model based on [StreamVGGT](https://wzzheng.net/StreamVGGT/) visoin backbone and [RDT2](https://rdt-robotics.github.io/rdt2/) action expert.
+## Repositories and branches
+
+- ActionVGGT: https://github.com/yyyds1/StreamVGGT.git, branch `head-camera-temporal`
+- RoboTwin labeled environment: https://github.com/yyyds1/robotwin-labeled.git, branch `feature/sparse-se3-guidance-data`
+- ModelScope model repository: `yyyyds139/ActionVGGT`
+- Training dataset: `yyyyds139/robotwin-labeled-awe-train`
+- Evaluation dataset: `yyyyds139/robotwin-labeled-awe-eval`
 
 ## Installation
 
-1. Clone ActionVGGT
 ```bash
-git clone https://github.com/yyyds1/StreamVGGT.git
+git clone --branch head-camera-temporal https://github.com/yyyds1/StreamVGGT.git
+git clone --branch feature/sparse-se3-guidance-data git@github.com:yyyds1/robotwin-labeled.git
 cd StreamVGGT
-```
-2. Create conda environment
-```bash
-conda create -n ActionVGGT python=3.11 cmake=3.14.0
-conda activate ActionVGGT 
-```
-
-3. Install requirements
-```bash
+conda create -n ActionVGGT python=3.11 cmake=3.14.0 -y
+conda activate ActionVGGT
 pip install -r requirements.txt
 conda install 'llvm-openmp<16'
 ```
 
-### Download Pretrained Checkpoints
+Install RoboTwin dependencies using `robotwin-labeled/README.md` and the official RoboTwin installation guide.
 
-1. StreamVGGT: 
- - [Hugging Face](https://huggingface.co/lch01/StreamVGGT/)
- - [Tsinghua cloud](https://cloud.tsinghua.edu.cn/d/d6ad8f36fcd541bcb246/)
- - 本地路径：`$STREAMVGGT_ROOT/ckpt/actionvggt.pth`（由下载后的权重自行放入）
+## Download data and checkpoints
 
-2. RDT:
- - [Hugging Face](https://huggingface.co/robotics-diffusion-transformer/RDT2-FM)
- - 本地路径：`$STREAMVGGT_ROOT/ckpt/RDT.pth`（由下载后的权重自行放入）
+Install ModelScope CLI/API in the environment used for downloads. The repository names below are the source of truth; no Hugging Face or machine-specific paths are required.
 
-## Data Preparation
-### Training Datasets
-Use robotwin dataset in LeRobot dataset format as training dataset, which is provide by [Lingbot-VA](https://technology.robbyant.com/lingbot-va).
-
-To download the dataset:
 ```bash
-huggingface-cli download --repo-type dataset robbyant/robotwin-clean-and-aug-lerobot \
-  --local-dir "$STREAMVGGT_ROOT/dataset/robotwin-clean-and-aug-lerobot"
+modelscope download --dataset yyyyds139/robotwin-labeled-awe-eval --local_dir "$ROBOTWIN_ROOT/data_clean_test50"
+# Optional training data
+modelscope download --dataset yyyyds139/robotwin-labeled-awe-train --local_dir "$ROBOTWIN_ROOT/data"
+# Original StreamVGGT and frozen DINOv2 assets
+modelscope download --model yyyyds139/ActionVGGT --include 'original/**' --local_dir "$STREAMVGGT_ROOT/ckpt"
+# ActionVGGT experiment checkpoint
+modelscope download --model yyyyds139/ActionVGGT --include 'experiments/checkpoint_step_28000/**' --local_dir "$STREAMVGGT_ROOT"
 ```
 
-Set `DATA_ROOT` to the local checkout when using a pre-existing copy.
+Recommended layout:
 
-
-## Folder Structure
-The overall folder structure should be organized as follows：
+```text
+workdir/
+├── StreamVGGT/
+│   ├── ckpt/original/streamvggt/checkpoints.pth
+│   ├── ckpt/original/dinov2-small/
+│   ├── experiments/checkpoint_step_28000/
+│   └── src/
+└── robotwin-labeled/
+    ├── data/                 # optional training set
+    └── data_clean_test50/    # evaluation set
 ```
-StreamVGGT
-├── ckpt/
-├── data/
-└── src/
-    ├── actionvggt/ # model definition of vision backbone
-    |   ├──...
-    ├── rdt/ # model definition of action expert
-    |   ├──...
-    └── train_va.py # training script
+
+Set paths at runtime:
+
+```bash
+export STREAMVGGT_ROOT="$PWD/StreamVGGT"
+export ROBOTWIN_ROOT="$PWD/robotwin-labeled"
+export DATA_ROOT="$ROBOTWIN_ROOT/data"
+export EVAL_DATA_ROOT="$ROBOTWIN_ROOT/data_clean_test50"
+export CHECKPOINT_DIR="$STREAMVGGT_ROOT/experiments/checkpoint_step_28000"
 ```
 
 ## Training
 
-To start training, run:
-```bash
-NGPU=8 bash scripts/run_va_posttrain.sh
-```
-
-
-## Evaluation on RoboTwin-2.0
-
-**Preparing the Environment**
-
-You can follow the official instructions from the original RoboTwin-2.0 repository:  
-[https://robotwin-platform.github.io/doc/usage/robotwin-install.html](https://robotwin-platform.github.io/doc/usage/robotwin-install.html)
-
-
-In summary:
-
-1. 
-```bash
-sudo apt install libvulkan1 mesa-vulkan-drivers vulkan-tools
-```
-
-2. 
-```bash
-git clone https://github.com/RoboTwin-Platform/RoboTwin.git && cd RoboTwin && git checkout 2eeec322
-```
-
-3. modify script/requirements.txt 
-```bash
-transforms3d==0.4.2
-sapien==3.0.0b1
-scipy==1.10.1
-mplib==0.2.1
-gymnasium==0.29.1
-trimesh==4.4.3
-open3d==0.18.0
-imageio==2.34.2
-pydantic
-zarr
-openai
-huggingface_hub==0.36.2
-h5py
-# For Description Generation
-azure==4.0.0
-azure-ai-inference
-pyglet<2
-wandb
-moviepy
-imageio
-termcolor
-av
-matplotlib
-ffmpeg
-```
-
-4. modify line 8 of script/_install.sh:
-```bash
-pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable" --no-build-isolation
-```
-
-5. run:
-```bash
-bash script/_install.sh
-```
-
-6. run:
-```bash
-bash script/_download_assets.sh
-```
-
- **Deploying the Inference Server**
-```bash
-# single GPU
-bash scripts/launch_server.sh
-
-# multi-GPU
-bash scripts/launch_server_multigpus.sh
-```
-
- **Executing the Inference Client**
-```bash
-# single GPU
-task_name="adjust_bottle";
-save_root="results/";
-bash scripts/launch_client.sh ${save_root} ${task_name}
-
-# multi-GPU
-save_root="results/"
-task_group_id=0;
-bash scripts/launch_client_multigpus.sh ${save_root} ${task_group_id}
-```
-
-Related experiment results are saved under the configured `SAVE_ROOT` (for example, `$STREAMVGGT_ROOT/evaluation_runs`). Please note that an `eval_result` folder is also generated. This is a native output from RoboTwin and is identical to the contents in the results folder; it can be safely ignored.
-It is important to note that the inference server and client must be deployed on the same machine. For launching multi-GPU client, we padded the original 50 tasks to 56 via duplication and partitioned them into 7 groups to align with the 8-GPU configuration of our inference node. You can specify the `task_group_id` (0-6) to select a particular group for inference. For detailed grouping configurations, please refer to `evaluation/robotwin/launch_client_multigpus.sh`.
-
-## Trouble Shooting
-
-1. To load the dataset offline, set env variable:
-``` bash
-export HF_HUB_OFFLINE=1 
-export HF_DATASETS_OFFLINE=1 
-export TRANSFORMERS_OFFLINE=1
-```
-
-2.
-## Head-camera temporal training
-
-This branch adds `head_camera_temporal` (evaluation) and
-`head_camera_temporal_train` (training). Both use only `head_camera`, an
-8-frame history window, and `history_frame_stride=1`. The dataset and server
-construct history indices from the same `history_len` and stride fields. With a
-single camera, `image_time_ids` identify the temporal frame and
-`image_view_ids` remain the camera index; time is never encoded as a view.
-
-Run the CPU/static checks before any GPU job. `--static-only` works when optional
-training dependencies such as `easydict` are not installed:
+The current training entry points are under `src/scripts/`. Configure at least `NGPU`, `DATA_ROOT`, `STREAMVGGT_ROOT`, the training config, and an output directory. Example:
 
 ```bash
-python src/scripts/validate_head_camera_temporal.py --static-only
-python -m compileall -q src/configs/head_camera_temporal_cfg.py src/configs/head_camera_temporal_train_cfg.py src/scripts/validate_head_camera_temporal.py src/train_va.py src/va_server.py
-bash -n src/scripts/run_head_camera_stage1.sh src/scripts/run_head_camera_stage2.sh src/scripts/run_head_camera_eval.sh
+cd "$STREAMVGGT_ROOT"
+NGPU=8 DATA_ROOT="$DATA_ROOT" SAVE_ROOT="$STREAMVGGT_ROOT/train_out" \
+  bash src/scripts/run_head_wrist_dinov2_noisy_lora_bs12_rank256_8gpu_100k.sh
 ```
 
-Stage 1 freezes the visual backbone and disables LoRA:
+Training outputs should contain `checkpoint_step_*`, `training_config.json`, `transformer/`, and `action_head/`.
+
+## Evaluation
+
+Start the model server and then the RoboTwin client on the same machine:
 
 ```bash
-NGPU=8 SAVE_ROOT=./train_out/head_camera_stage1 \
-  bash src/scripts/run_head_camera_stage1.sh
-# Single task; leave SINGLE_TASK empty for multi-task training.
-SINGLE_TASK=adjust_bottle PYTHON_BIN=python3 bash src/scripts/run_head_camera_stage1.sh
+cd "$STREAMVGGT_ROOT"
+CHECKPOINT_DIR="$CHECKPOINT_DIR" EVAL_CONFIG="$CHECKPOINT_DIR/training_config.json" \
+  bash src/scripts/launch_server.sh
+
+ROBOTWIN_REPO="$ROBOTWIN_ROOT" CHECKPOINT_DIR="$CHECKPOINT_DIR" \
+TEST_NUM=10 TASK_CONFIG=demo_clean SPARSE_WAYPOINT_STEP_SCALE=1.5 \
+  bash src/scripts/launch_client.sh
 ```
 
-Stage 2 defaults to LoRA (`LORA=1`). Set `LORA=0` for full-parameter training.
-It does not resume implicitly. To continue from an exact Stage 1
-`checkpoint_step_*` directory, set `RESUME_CHECKPOINT_DIR`; the script maps it
-to `--resume-checkpoint-dir`:
+The baseline protocol is checkpoint `checkpoint_step_28000`, 50 tasks, 10 demos per task, wrist camera input, noisy waypoint input, task-level episode limits, and waypoint speed scale `1.5`.
+
+## Ablation experiments
+
+Each condition has a JSON profile and a shell entry point under `configs/ablation_profiles/` and `src/scripts/ablation/`. For example:
 
 ```bash
-RESUME_CHECKPOINT_DIR=./train_out/head_camera_stage1/checkpoint_step_2000 \
-  LORA=1 SINGLE_TASK= bash src/scripts/run_head_camera_stage2.sh
-# Single-task variant:
-RESUME_CHECKPOINT_DIR=./train_out/head_camera_stage1/checkpoint_step_2000 \
-  LORA=1 SINGLE_TASK=adjust_bottle bash src/scripts/run_head_camera_stage2.sh
+ABLATION_PROFILE=W1_clean_waypoint bash src/scripts/ablation/run_W1_clean_waypoint.sh
+ABLATION_PROFILE=C3_both_wrist_missing bash src/scripts/ablation/run_C3_both_wrist_missing.sh
 ```
 
-The launchers use the same CUDA library discovery, allocator setting, local-rank
-filter, and `torchrun --tee` behavior as `run_va_train.sh`. Extra arguments are
-passed through to `train_va.py`.
+Record the command, environment variables, git commit, checkpoint, seed, task list, and summary TSV for every run.
 
-For evaluation, `CHECKPOINT_DIR` must point to a complete `checkpoint_step_*`
-directory. The server loads `CHECKPOINT_DIR/training_config.json` by default;
-use `EVAL_CONFIG="$STREAMVGGT_ROOT/config/eval.json"` only when an explicit override is needed:
-
-```bash
-CHECKPOINT_DIR=./train_out/head_camera_stage2/checkpoint_step_2000 \
-  bash src/scripts/run_head_camera_eval.sh
-EVAL_CONFIG="$STREAMVGGT_ROOT/config/eval.json" CHECKPOINT_DIR="$STREAMVGGT_ROOT/train_out/checkpoint_step_2000" \
-  bash src/scripts/run_head_camera_eval.sh
-```
-
-
-## ActionVGGT + RoboTwin 协作实验手册
-
-中文环境配置、训练/测试入口、数据仓库和消融实验清单见 [`docs/actionvggt_robotwin.md`](docs/actionvggt_robotwin.md)。其中所有路径均通过仓库相对路径或环境变量表达。
+The full Chinese collaboration guide is [docs/中文实验协作指南.md](docs/中文实验协作指南.md).
