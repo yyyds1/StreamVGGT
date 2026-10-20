@@ -225,7 +225,9 @@ def load_cached_sparse_waypoint_episode(dataset_root: Path, task_name: str, seed
 
     task_root = dataset_root / task_name
     clean_root = task_root / "demo_clean"
-    raw_root = dataset_root.parent / "data_clean_test50_raw" / task_name / "demo_clean_test50"
+    raw_root = dataset_root / task_name / "demo_clean_test50"
+    if not (raw_root / "scene_info.json").is_file():
+        raw_root = dataset_root.parent / "data_clean_test50_raw" / task_name / "demo_clean_test50"
     seed_path = task_root / "evaluation_seeds.txt"
     if not seed_path.is_file():
         seed_path = raw_root / "seed.txt"
