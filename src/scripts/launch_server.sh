@@ -35,13 +35,20 @@ cd "${SRC_DIR}"
 ABLATION_CONFIG=${ABLATION_CONFIG:-}
 ABLATION_PROFILE=${ABLATION_PROFILE:-}
 if [[ -z "${ABLATION_CONFIG}" && -n "${ABLATION_PROFILE}" ]]; then ABLATION_CONFIG="${SRC_DIR}/../configs/ablation_profiles/${ABLATION_PROFILE}.json"; fi
+if [[ -z "${SAVE_ROOT}" ]]; then
+    if [[ -n "${ABLATION_PROFILE}" ]]; then
+        SAVE_ROOT="${SRC_DIR}/../eval_out/ablation_${ABLATION_PROFILE}/server_outputs"
+    else
+        SAVE_ROOT="${SRC_DIR}/../eval_out/server_outputs"
+    fi
+fi
 export ABLATION_CONFIG
 
 START_PORT=${START_PORT:-29055}
 MASTER_PORT=${MASTER_PORT:-29061}
 NGPU=${NGPU:-1}
 CONFIG_NAME=${CONFIG_NAME:-vga_robotwin}
-SAVE_ROOT=${SAVE_ROOT:-"${SRC_DIR}/visualization"}
+SAVE_ROOT=${SAVE_ROOT:-}
 TRAIN_OUT_ROOT=${TRAIN_OUT_ROOT:-"${SRC_DIR}/train_out"}
 
 find_latest_checkpoint() {
@@ -112,6 +119,9 @@ fi
 
 if [[ -n "${ABLATION_CONFIG}" ]]; then [[ -f "${ABLATION_CONFIG}" ]] || { echo "Missing ablation config: ${ABLATION_CONFIG}" >&2; exit 1; }; echo "[launch_server] ablation profile: ${ABLATION_CONFIG}"; fi
 echo "[launch_server] checkpoint: ${CKPT_DIR}"
+echo "[launch_server] output root: ${SAVE_ROOT}"
+echo "[launch_server] ablation profile: ${ABLATION_PROFILE:-<none>}"
+echo "[launch_server] ablation config: ${ABLATION_CONFIG:-<none>}"
 echo "[launch_server] eval config: ${EVAL_CONFIG}"
 echo "[launch_server] port: ${START_PORT}"
 echo "[launch_server] CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"

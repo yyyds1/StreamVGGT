@@ -506,6 +506,11 @@ def main(usr_args):
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
     args["save_root"] = save_root
+    # The ablation profile is parsed by parse_args_and_config(), but the
+    # RobotWin task args are rebuilt from task_config here.  Preserve the
+    # parsed profile explicitly so format_policy_obs() actually applies the
+    # W1/W3/M1/M3 transformation to every observation.
+    args["ablation_profile"] = usr_args.get("ablation_profile")
     for key in (
         "use_cached_sparse_waypoints",
         "sparse_waypoint_dataset_root",
@@ -515,6 +520,17 @@ def main(usr_args):
         if key in usr_args:
             args[key] = usr_args[key]
     args["max_episode_steps"] = usr_args.get("max_episode_steps", None)
+    profile = args.get("ablation_profile")
+    if profile:
+        print(
+            f"[eval] ablation_profile={profile.get('name', '<unnamed>')} "
+            f"missing_rate={profile.get('waypoint_missing_rate', 0.0)} "
+            f"waypoint_noise={profile.get('waypoint_noise', {})}",
+            flush=True,
+        )
+    else:
+        print("[eval] ablation_profile=<none>", flush=True)
+    print(f"[eval] max_episode_steps_override={args['max_episode_steps']}", flush=True)
     args["single_trajectory"] = bool(usr_args.get("single_trajectory", False))
     if usr_args.get("single_trajectory_episode_index", None) is not None:
         args["single_trajectory_episode_index"] = int(usr_args["single_trajectory_episode_index"])

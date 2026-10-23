@@ -40,7 +40,7 @@ TRAIN_OUT_ROOT=${TRAIN_OUT_ROOT:-"${SRC_DIR}/train_out"}
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-${START_PORT:-29055}}
 TASK_NAME=${TASK_NAME:-${1:-}}
-SAVE_ROOT=${SAVE_ROOT:-${2:-"${SRC_DIR}/results"}}
+SAVE_ROOT=${SAVE_ROOT:-${2:-}}
 CKPT_DIR=${CKPT_DIR:-${3:-}}
 POLICY_NAME=${POLICY_NAME:-ACT}
 EVAL_CONFIG=${EVAL_CONFIG:-}
@@ -51,6 +51,10 @@ CKPT_SETTING=${CKPT_SETTING:-}
 SEED=${SEED:-0}
 HEADLESS=${HEADLESS:-1}
 MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-}
+# When enabled, ignore any fixed MAX_EPISODE_STEPS value and let RoboTwin
+# load task_config/_eval_step_limit.yml per task. This prevents a stale
+# MAX_EPISODE_STEPS=400 from truncating long-horizon tasks in ablations.
+USE_TASK_STEP_LIMITS=${USE_TASK_STEP_LIMITS:-0}
 EXPERT_TARGET_POS_THRESHOLD=${EXPERT_TARGET_POS_THRESHOLD:-}
 EXPERT_TARGET_ROT_THRESHOLD=${EXPERT_TARGET_ROT_THRESHOLD:-}
 EXPERT_TARGET_GRIPPER_THRESHOLD=${EXPERT_TARGET_GRIPPER_THRESHOLD:-}
@@ -81,6 +85,13 @@ ABLATION_CONFIG=${ABLATION_CONFIG:-}
 ABLATION_PROFILE=${ABLATION_PROFILE:-}
 SE3_GUIDANCE_NOISY_ORACLE=${SE3_GUIDANCE_NOISY_ORACLE:-0}
 if [[ -z "${ABLATION_CONFIG}" && -n "${ABLATION_PROFILE}" ]]; then ABLATION_CONFIG="${REPO_DIR}/configs/ablation_profiles/${ABLATION_PROFILE}.json"; fi
+if [[ -z "${SAVE_ROOT}" ]]; then
+    if [[ -n "${ABLATION_PROFILE}" ]]; then
+        SAVE_ROOT="${SRC_DIR}/../eval_out/ablation_${ABLATION_PROFILE}/rollouts"
+    else
+        SAVE_ROOT="${SRC_DIR}/../eval_out/rollouts"
+    fi
+fi
 
 # Edit this list for batch evaluation. If TASK_NAME or the first positional
 # argument is set, only that one task is evaluated.
@@ -314,6 +325,9 @@ if [[ -n "${ABLATION_CONFIG}" ]]; then
 fi
 
 echo "[launch_client] checkpoint: ${CKPT_DIR}"
+echo "[launch_client] output root: ${SAVE_ROOT}"
+echo "[launch_client] ablation profile: ${ABLATION_PROFILE:-<none>}"
+echo "[launch_client] ablation config: ${ABLATION_CONFIG:-<none>}"
 echo "[launch_client] action space: ${ROBOTWIN_ACTION_SPACE}"
 echo "[launch_client] ee representation: ${ACTION_REPRESENTATION}"
 echo "[launch_client] joint representation: ${JOINT_ACTION_REPRESENTATION}"
@@ -392,8 +406,11 @@ PY
 }
 
 max_episode_steps_args=()
-if [[ -n "${MAX_EPISODE_STEPS}" ]]; then
+if [[ "${USE_TASK_STEP_LIMITS}" == "1" || "${USE_TASK_STEP_LIMITS}" == "true" || "${USE_TASK_STEP_LIMITS}" == "True" ]]; then
+    echo "[launch_client] episode step limits: task_config/_eval_step_limit.yml"
+elif [[ -n "${MAX_EPISODE_STEPS}" ]]; then
     max_episode_steps_args+=(--max_episode_steps "${MAX_EPISODE_STEPS}")
+    echo "[launch_client] episode step limit override: ${MAX_EPISODE_STEPS}"
 fi
 
 run_one_task() {
