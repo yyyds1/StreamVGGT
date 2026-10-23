@@ -516,6 +516,7 @@ def main(usr_args):
         "sparse_waypoint_dataset_root",
         "evaluation_seed_list",
         "sparse_waypoint_step_scale",
+        "sparse_waypoint_progress_mode",
     ):
         if key in usr_args:
             args[key] = usr_args[key]
@@ -1350,7 +1351,33 @@ def format_obs(
         obs["ee_state"] = format_eef_state(observation).reshape(2, 8).tolist()
     except Exception:
         pass
-    return _apply_ablation_profile(obs, ablation_profile)
+    obs = _apply_ablation_profile(obs, ablation_profile)
+    if ablation_profile and not getattr(format_obs, "_ablation_diagnostic_logged", False):
+        waypoint = obs.get("sparse_waypoints")
+        if isinstance(waypoint, dict):
+            left_valid = int(np.asarray(waypoint.get("left_valid", []), dtype=bool).sum())
+            right_valid = int(np.asarray(waypoint.get("right_valid", []), dtype=bool).sum())
+            pose_checksum = float(
+                np.asarray(waypoint.get("left_pose_7d", []), dtype=np.float32).sum()
+                + np.asarray(waypoint.get("right_pose_7d", []), dtype=np.float32).sum()
+            )
+            duration_checksum = float(np.asarray(waypoint.get("duration", []), dtype=np.float32).sum())
+            print(
+                f"[eval] ablation_observation_check profile={ablation_profile.get('name', '<unnamed>')} "
+                f"left_valid={left_valid} right_valid={right_valid} "
+                f"pose_checksum={pose_checksum:.6f} duration_checksum={duration_checksum:.1f} "
+                f"send_sparse_waypoints={bool(obs.get('send_sparse_waypoints', True))}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[eval] ablation_observation_check profile={ablation_profile.get('name', '<unnamed>')} "
+                "sparse_waypoints=<none> "
+                f"send_sparse_waypoints={bool(obs.get('send_sparse_waypoints', True))}",
+                flush=True,
+            )
+        format_obs._ablation_diagnostic_logged = True
+    return obs
 
 
 def format_policy_obs(
@@ -1851,6 +1878,7 @@ def eval_policy(task_name,
                 live_waypoint_labels=bool(args.get("live_waypoint_labels", True)),
                 ee_target_sequence_len=int(args.get("ee_target_sequence_len", 6)),
                 ee_target_waypoint_distance=float(args.get("ee_target_waypoint_distance", 0.05)),
+                ablation_profile=args.get("ablation_profile"),
             )
             current_obs["episode_index"] = episode_index
 
@@ -1930,6 +1958,7 @@ def eval_policy(task_name,
                 live_waypoint_labels=bool(args.get("live_waypoint_labels", True)),
                 ee_target_sequence_len=int(args.get("ee_target_sequence_len", 6)),
                 ee_target_waypoint_distance=float(args.get("ee_target_waypoint_distance", 0.05)),
+                ablation_profile=args.get("ablation_profile"),
             )
             full_obs_list.append(obs)
   

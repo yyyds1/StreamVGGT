@@ -1911,14 +1911,51 @@ class VA_Server:
                     supplied_mask=np.asarray(supplied_mask).reshape(-1)[:valid_count]
                 values["block_valid"]=np.asarray(supplied_mask,dtype=bool) & ((values["left_valid"]>0) | (values["right_valid"]>0)) & (frame_offset>=0)
                 if not bool(np.any(values["block_valid"])):
-                    raise RuntimeError("Client sparse waypoint payload contains no valid blocks")
-                result=values
+                    if bool(current_obs.get("guidance_missing", False)) or not bool(
+                        current_obs.get("send_sparse_waypoints", True)
+                    ):
+                        # An explicit all-waypoints-missing ablation is a
+                        # supported no-guidance condition, not a malformed
+                        # client payload.  Leave result=None so inference
+                        # proceeds without SE3 waypoint tokens.
+                        result = None
+                    else:
+                        raise RuntimeError("Client sparse waypoint payload contains no valid blocks")
+                else:
+                    result=values
             else:
                 raise RuntimeError("Client sparse waypoint payload is not a mapping")
         elif self.se3_guidance_source == "client":
             raise RuntimeError("Client sparse waypoint payload is missing")
         else:
             result=None
+        if result is None and (
+            bool(current_obs.get("guidance_missing", False))
+            or not bool(current_obs.get("send_sparse_waypoints", True))
+        ):
+            # Preserve the model's fixed 42-token condition shape while
+            # masking every token: this is the explicit all-waypoints-missing
+            # ablation, not malformed input and not an oracle fallback.
+            current = self._extract_current_ee_state_from_obs(current_obs)
+            if current is None:
+                return None
+            state = current.squeeze(0).cpu().numpy()
+            count = int(self.transformer.se3_guidance_tokenizer.MAX_WAYPOINTS)
+            phase = np.linspace(1.0 / count, 1.0, count, dtype=np.float32)
+            result = {
+                "left_pose_7d": np.repeat(state[0:1, :7], count, axis=0),
+                "right_pose_7d": np.repeat(state[1:2, :7], count, axis=0),
+                "left_gripper": np.full(count, state[0, 7], np.float32),
+                "right_gripper": np.full(count, state[1, 7], np.float32),
+                "left_valid": np.zeros(count, dtype=bool),
+                "right_valid": np.zeros(count, dtype=bool),
+                "duration": np.ones(count, dtype=np.int64),
+                "phase": phase,
+                "confidence": np.zeros(count, dtype=np.float32),
+                "plan_age": np.zeros(count, dtype=np.float32),
+                "transition": np.zeros(count, dtype=np.float32),
+                "block_valid": np.zeros(count, dtype=bool),
+            }
         if result is None:
             target = self._extract_oracle_ee_target_from_obs(current_obs)
             state = self._extract_current_ee_state_from_obs(current_obs)
@@ -2221,7 +2258,16 @@ class VA_Server:
             self._logged_image_payload_debug = True
         frame_payload["se3_guidance"] = self._build_se3_guidance_from_obs(current_obs) if self.enable_se3_guidance else None
         if self.enable_se3_guidance and frame_payload["se3_guidance"] is None:
-            raise RuntimeError("SE3 guidance is enabled but this test observation contains no usable sparse/oracle waypoints")
+            if bool(current_obs.get("guidance_missing", False)) or not bool(
+                current_obs.get("send_sparse_waypoints", True)
+            ):
+                if not getattr(self, "_logged_missing_guidance_fallback", False):
+                    logger.info(
+                        "Explicit no-guidance ablation active: skipping SE3 waypoint tokens."
+                    )
+                    self._logged_missing_guidance_fallback = True
+            else:
+                raise RuntimeError("SE3 guidance is enabled but this test observation contains no usable sparse/oracle waypoints")
         with torch.cuda.amp.autocast(enabled=False):
             transformer_out = self.transformer.inference(
                 [frame_payload],

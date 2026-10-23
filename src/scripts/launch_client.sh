@@ -76,6 +76,7 @@ JOINT_MAX_VELOCITY=${JOINT_MAX_VELOCITY:-1.0}
 CLIP_JOINT_ACTION_TO_DATASET_BOUNDS=${CLIP_JOINT_ACTION_TO_DATASET_BOUNDS:-1}
 USE_CACHED_SPARSE_WAYPOINTS=${USE_CACHED_SPARSE_WAYPOINTS:-0}
 SPARSE_WAYPOINT_STEP_SCALE=${SPARSE_WAYPOINT_STEP_SCALE:-1.0}
+SPARSE_WAYPOINT_PROGRESS_MODE=${SPARSE_WAYPOINT_PROGRESS_MODE:-auto}
 SPARSE_WAYPOINT_DATASET_ROOT=${SPARSE_WAYPOINT_DATASET_ROOT:-}
 EVALUATION_SEED_ROOT=${EVALUATION_SEED_ROOT:-}
 DEBUG_NATIVE=${DEBUG_NATIVE:-0}
@@ -338,6 +339,7 @@ echo "[launch_client] use sparse waypoint marked RGB: ${USE_SPARSE_WAYPOINT_MARK
 echo "[launch_client] live waypoint labels: ${LIVE_WAYPOINT_LABELS}"
 echo "[launch_client] waypoint layout: K=${EE_TARGET_SEQUENCE_LEN}, distance=${EE_TARGET_WAYPOINT_DISTANCE}"
 echo "[launch_client] sparse waypoint step scale: ${SPARSE_WAYPOINT_STEP_SCALE}"
+echo "[launch_client] sparse waypoint progress mode: ${SPARSE_WAYPOINT_PROGRESS_MODE}"
 echo "[launch_client] expert target thresholds: pos=${EXPERT_TARGET_POS_THRESHOLD}, rot=${EXPERT_TARGET_ROT_THRESHOLD}, gripper=${EXPERT_TARGET_GRIPPER_THRESHOLD}"
 echo "[launch_client] joint direct control: ${JOINT_USE_DIRECT_CONTROL}, steps=${JOINT_DIRECT_CONTROL_STEPS}, max_velocity=${JOINT_MAX_VELOCITY} rad/s"
 echo "[launch_client] clip joint action to dataset bounds: ${CLIP_JOINT_ACTION_TO_DATASET_BOUNDS}"
@@ -477,10 +479,12 @@ PY
             --action_representation "${ACTION_REPRESENTATION}" \
             --joint_action_representation "${JOINT_ACTION_REPRESENTATION}" \
             --checkpoint_dir "${CKPT_DIR}" \
+            "${ABLATION_ARGS[@]}" \
             --overrides \
             sparse_waypoint_data True \
             sparse_waypoint_max_count 6 \
             sparse_waypoint_step_scale "${SPARSE_WAYPOINT_STEP_SCALE}" \
+            sparse_waypoint_progress_mode "${SPARSE_WAYPOINT_PROGRESS_MODE}" \
             "${cache_overrides[@]}" \
             task_name "${task}" \
             --task_config "${TASK_CONFIG}" \
@@ -489,7 +493,6 @@ PY
             --ckpt_setting "${CKPT_SETTING}" \
             --seed "${SEED}" \
             --policy_name "${POLICY_NAME}" \
-            "${ABLATION_ARGS[@]}" \
             --expert_target_sequence_len "${EXPERT_TARGET_SEQUENCE_LEN}" \
             --expert_target_waypoint_distance "${EXPERT_TARGET_WAYPOINT_DISTANCE}"; then
         status="failed"
