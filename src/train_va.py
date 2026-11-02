@@ -5,6 +5,7 @@ import os
 import sys
 import re
 import shutil
+import time
 from pathlib import Path
 
 from datetime import datetime
@@ -789,10 +790,13 @@ class Trainer:
 
             for key in list(adapted.keys()):
                 if key in model_state and adapted[key].shape != model_state[key].shape:
-                    if key.startswith("ee_target_cond_proj."):
+                    if (
+                        key.startswith("ee_target_cond_proj.")
+                        or key.startswith("aggregator.action_embedder.")
+                    ):
                         logger.warning(
-                            f"Skip loading {key}: checkpoint shape {tuple(adapted[key].shape)} "
-                            f"!= model shape {tuple(model_state[key].shape)}"
+                            f"Skip loading action/condition projection {key}: checkpoint shape "
+                            f"{tuple(adapted[key].shape)} != model shape {tuple(model_state[key].shape)}"
                         )
                         adapted.pop(key, None)
 
@@ -2217,11 +2221,27 @@ class Trainer:
                         'lr': lr,
                     }, step=self.step)
                 self.step += 1
-                if self.step % self.config.save_interval == 0 or self.step >= self.config.num_steps:
+                step_limit = getattr(self.config, "num_steps", None)
+                reached_step_limit = step_limit is not None and self.step >= int(step_limit)
+                save_interval = int(getattr(self.config, "save_interval", 1))
+                save_due = self.step % save_interval == 0 or reached_step_limit
+                time_limit = getattr(self.config, "max_training_time_seconds", None)
+                time_stop = False
+                if time_limit is not None:
+                    stop_flag = torch.zeros((), device=self.device, dtype=torch.int32)
+                    if self.config.rank == 0 and time.monotonic() >= self._training_deadline:
+                        stop_flag.fill_(1)
+                    if dist.is_initialized():
+                        dist.broadcast(stop_flag, src=0)
+                    time_stop = bool(stop_flag.item())
+                    save_due = save_due or time_stop
+
+                if save_due:
                     if self.config.rank == 0:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
-                if self.step >= self.config.num_steps:
+                if reached_step_limit or time_stop:
+                    self._time_limit_reached = time_stop
                     break
 
         progress_bar.close()
@@ -2413,15 +2433,22 @@ class Trainer:
 
     def train(self):
         """Main training loop."""
-        logger.info(f"Starting training for {self.config.num_steps} steps...")
+        time_limit = getattr(self.config, "max_training_time_seconds", None)
+        step_limit = getattr(self.config, "num_steps", None)
+        self._time_limit_reached = False
+        if time_limit is not None:
+            self._training_deadline = getattr(self.config, "_training_deadline", time.monotonic() + float(time_limit))
+            logger.info(f"Starting time-bounded training for {float(time_limit):.0f} seconds (no step limit)...")
+        else:
+            logger.info(f"Starting training for {step_limit} steps...")
 
-        while self.step < self.config.num_steps:
+        while (step_limit is None or self.step < int(step_limit)) and not self._time_limit_reached:
             logger.info(f"Starting epoch at step {self.step}...")
             self.train_epoch()
             if dist.is_initialized():
                 dist.barrier()
 
-        logger.info("Training completed!")
+        logger.info("Training time limit reached; final checkpoint saved." if self._time_limit_reached else "Training completed!")
         self._close_metric_logger()
 
 
@@ -2538,7 +2565,14 @@ def run(args):
                     f"::episode_{int(getattr(config, 'single_trajectory_episode_index')):06d}"
                 )
 
+    time_limit = getattr(config, "max_training_time_seconds", None)
+    if time_limit is not None:
+        # Start the deadline before model construction so setup time is included.
+        config._training_deadline = time.monotonic() + float(time_limit)
+
     trainer = Trainer(config)
+    if time_limit is not None:
+        trainer._training_deadline = config._training_deadline
     trainer.train()
 
 def main():

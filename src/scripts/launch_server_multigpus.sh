@@ -2,6 +2,19 @@
 
 set -euo pipefail
 
+# Prefer the active Python environment's CUDA/cuDNN/NCCL libraries. System
+# cuDNN may be ABI-incompatible with the PyTorch wheel inside RoboTwin2.
+if [[ "${PREFER_CONDA_CUDA_LIBS:-1}" == "1" ]]; then
+    NVIDIA_LIB_DIRS="$(python -c 'import pathlib, site; print(":".join(str(p) for base in site.getsitepackages() for p in sorted((pathlib.Path(base) / "nvidia").glob("*/lib")) if p.is_dir()))' 2>/dev/null || true)"
+    if [[ -n "${NVIDIA_LIB_DIRS}" ]]; then
+        export LD_LIBRARY_PATH="${NVIDIA_LIB_DIRS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    fi
+fi
+export PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER:-1}
+
+echo "[launch_server_multigpus] python: $(command -v python)"
+echo "[launch_server_multigpus] LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-<unset>}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${SRC_DIR}"
@@ -58,8 +71,23 @@ checkpoint_args=(
     --checkpoint-dir "${CKPT_DIR}"
     --eval-config "${EVAL_CONFIG}"
 )
+if [[ -n "${ROBOTWIN_ACTION_SPACE:-}" ]]; then
+    checkpoint_args+=(--robotwin-action-space "${ROBOTWIN_ACTION_SPACE}")
+fi
+if [[ -n "${ACTION_REPRESENTATION:-}" ]]; then
+    checkpoint_args+=(--action-representation "${ACTION_REPRESENTATION}")
+fi
+if [[ -n "${JOINT_ACTION_REPRESENTATION:-}" ]]; then
+    checkpoint_args+=(--joint-action-representation "${JOINT_ACTION_REPRESENTATION}")
+fi
 if [[ -n "${RDT_EE_TARGET_CONDITION_SOURCE:-}" ]]; then
     checkpoint_args+=(--rdt-ee-target-condition-source "${RDT_EE_TARGET_CONDITION_SOURCE}")
+fi
+if [[ -n "${SE3_GUIDANCE_SOURCE:-}" ]]; then
+    checkpoint_args+=(--se3-guidance-source "${SE3_GUIDANCE_SOURCE}")
+fi
+if [[ "${SE3_GUIDANCE_NOISY_ORACLE:-0}" == "1" ]]; then
+    checkpoint_args+=(--se3-guidance-noisy-oracle)
 fi
 
 batch_time=$(date +%Y%m%d_%H%M%S)

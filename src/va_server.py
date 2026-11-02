@@ -289,6 +289,8 @@ class VA_Server:
         self.chunk_size = int(getattr(job_config, "chunk_size", 24))
         self.rdt_horizon = self.chunk_size + 1
         self.action_chunk_exec_steps = max(1, int(getattr(job_config, "action_chunk_exec_steps", 1)))
+        self.chunk_boundary_overlap_steps = max(0, int(getattr(job_config, "chunk_boundary_overlap_steps", 0)))
+        self.chunk_boundary_overlap_alpha = float(np.clip(getattr(job_config, "chunk_boundary_overlap_alpha", 0.6), 0.0, 1.0))
         self.image_frame_stride = int(getattr(job_config, "image_frame_stride", 8))
         self.robotwin_action_space = str(getattr(job_config, "robotwin_action_space", "ee")).lower()
         if self.robotwin_action_space not in {"ee", "joint"}:
@@ -365,8 +367,18 @@ class VA_Server:
         self.rdt_ee_target_condition_source = str(
             getattr(job_config, "rdt_ee_target_condition_source", "predicted")
         ).lower()
+        # ``se3_guidance_source`` is the explicit source for sparse waypoint
+        # guidance. Legacy RDT EE-target source must not overwrite a client
+        # waypoint payload, otherwise cached midpoint waypoints fall back to
+        # the environment's EE oracle sequence.
         if self.enable_se3_guidance and self.rdt_ee_target_condition_source == "predicted":
-            self.se3_guidance_source = "oracle"
+            if str(getattr(job_config, "se3_guidance_source", "oracle")).lower() != "client":
+                self.se3_guidance_source = "oracle"
+        # Final precedence: an explicit checkpoint client source must survive
+        # legacy RDT EE-target condition compatibility handling above.
+        explicit_se3_source = str(getattr(job_config, "se3_guidance_source", "oracle")).lower()
+        if explicit_se3_source == "client":
+            self.se3_guidance_source = "client"
         self.mask_ee_target_condition = bool(
             getattr(job_config, "mask_ee_target_condition", False)
         )
@@ -426,7 +438,17 @@ class VA_Server:
                 f"warm_start_blend={self.warm_start_blend}"
             )
         self.unexecuted_action_buffer = deque()
+        if self.chunk_boundary_overlap_steps >= self.action_chunk_exec_steps:
+            raise ValueError(
+                "chunk_boundary_overlap_steps must be smaller than action_chunk_exec_steps "
+                f"({self.chunk_boundary_overlap_steps} >= {self.action_chunk_exec_steps})"
+            )
         self.actions_served_since_last_prediction = 0
+        logger.info(
+            "Chunk boundary overlap config: steps=%d alpha=%.3f",
+            self.chunk_boundary_overlap_steps,
+            self.chunk_boundary_overlap_alpha,
+        )
         self._logged_image_payload_debug = False
         self._logged_oracle_ee_target_condition = False
         guard_cfg = getattr(job_config, "ee_target_guard", None)
@@ -564,6 +586,7 @@ class VA_Server:
         logger.info(
             "EE-target evaluation alignment: "
             f"source={self.rdt_ee_target_condition_source}, "
+            f"sparse_guidance_source={self.se3_guidance_source}, "
             f"K={ee_target_sequence_len}, "
             f"waypoint_distance={float(getattr(self.job_config, 'ee_target_waypoint_distance', 0.05)):.4f} m, "
             f"condition_tokens={ee_condition_tokens}, "
@@ -1681,7 +1704,15 @@ class VA_Server:
         ).numpy()
         return absolute_action, relative_action
 
-    def _buffer_action_chunk(self, absolute_action_chunk):
+    def _blend_chunk_boundary_actions(self, previous_step, current_step, alpha):
+        previous_step = np.asarray(previous_step, dtype=np.float32).reshape(-1)
+        current_step = np.asarray(current_step, dtype=np.float32).reshape(-1)
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        if self.robotwin_action_space == "ee" and previous_step.size == 16 and current_step.size == 16:
+            return self._smooth_absolute_compact_action(previous_step, current_step, alpha)
+        return ((1.0 - alpha) * previous_step + alpha * current_step).astype(np.float32)
+
+    def _buffer_action_chunk(self, absolute_action_chunk, overlap_reference=None):
         absolute_action_chunk = np.asarray(absolute_action_chunk, dtype=np.float32)
         if absolute_action_chunk.ndim == 2:
             absolute_action_chunk = absolute_action_chunk[:, :, None]
@@ -1691,9 +1722,33 @@ class VA_Server:
             )
 
         exec_steps = min(self.action_chunk_exec_steps, int(absolute_action_chunk.shape[1]))
-        for step_idx in range(exec_steps):
-            step = np.asarray(absolute_action_chunk[:, step_idx], dtype=np.float32).reshape(-1)
-            self.unexecuted_action_buffer.append(step.copy())
+        chunk_steps = [
+            np.asarray(absolute_action_chunk[:, step_idx], dtype=np.float32).reshape(-1).copy()
+            for step_idx in range(exec_steps)
+        ]
+        overlap_steps = min(
+            self.chunk_boundary_overlap_steps,
+            len(chunk_steps),
+            len(overlap_reference) if overlap_reference is not None else 0,
+        )
+        if overlap_steps:
+            reference = list(overlap_reference)[-overlap_steps:]
+            old_len = len(self.unexecuted_action_buffer)
+            if old_len < overlap_steps:
+                raise RuntimeError(
+                    f"chunk overlap needs {overlap_steps} pending actions, buffer has {old_len}"
+                )
+            # Replace the pending tail with a blend of old and new predictions.
+            pending = list(self.unexecuted_action_buffer)
+            tail_start = old_len - overlap_steps
+            for idx in range(overlap_steps):
+                pending[tail_start + idx] = self._blend_chunk_boundary_actions(
+                    reference[idx], chunk_steps[idx], self.chunk_boundary_overlap_alpha
+                )
+            self.unexecuted_action_buffer = deque(pending)
+        for step_idx in range(overlap_steps, len(chunk_steps)):
+            self.unexecuted_action_buffer.append(chunk_steps[step_idx])
+        return overlap_steps
 
     def postprocess_action(self, action):
         action = action.cpu()  # [B, C, F, N, 1]
@@ -1887,6 +1942,16 @@ class VA_Server:
             raise ValueError(f"Unsupported se3_guidance_source={self.se3_guidance_source!r}")
         payload = (current_obs.get("sparse_waypoints", current_obs.get("expert_target_sequence"))
                    if self.se3_guidance_source == "client" else current_obs.get("oracle_sparse_waypoints"))
+        if self.se3_guidance_source == "client" and isinstance(payload, dict):
+            left = np.asarray(payload.get("left_pose_7d", []))
+            right = np.asarray(payload.get("right_pose_7d", []))
+            self._client_guidance_log_count = int(getattr(self, "_client_guidance_log_count", 0)) + 1
+            if self._client_guidance_log_count <= 3:
+                logger.info(
+                    "SE3 client guidance payload: left_first_xyz=%s right_first_xyz=%s",
+                    left.reshape(-1, 7)[0, :3].tolist() if left.size else None,
+                    right.reshape(-1, 7)[0, :3].tolist() if right.size else None,
+                )
         if payload is not None:
             data = payload.get("value", payload) if isinstance(payload, dict) else payload
             if isinstance(data, dict):
@@ -1983,9 +2048,15 @@ class VA_Server:
         if self.se3_guidance_noisy:
             rng=np.random.default_rng()
             result["left_pose_7d"]=result["left_pose_7d"].copy(); result["right_pose_7d"]=result["right_pose_7d"].copy()
+            noise_std = getattr(self.job_config, "se3_guidance_position_noise_std", 0.005)
+            # New absolute-EE midpoint checkpoints may omit this legacy eval
+            # field; baseline noisy guidance uses the established 5 mm default.
+            noise_std = 0.005 if noise_std is None else float(noise_std)
             for key in ("left_pose_7d","right_pose_7d"):
-                result[key][:,:3]+=rng.normal(0,float(getattr(self.job_config,"se3_guidance_position_noise_std",0.005)),result[key][:,:3].shape)
-            result["confidence"]=np.clip(result["confidence"]-float(getattr(self.job_config,"se3_guidance_confidence_noise",0.1)),0,1)
+                result[key][:,:3]+=rng.normal(0,noise_std,result[key][:,:3].shape)
+            confidence_noise = getattr(self.job_config, "se3_guidance_confidence_noise", 0.1)
+            confidence_noise = 0.1 if confidence_noise is None else float(confidence_noise)
+            result["confidence"]=np.clip(result["confidence"]-confidence_noise,0,1)
         current_ee = self._extract_current_ee_state_from_obs(current_obs)
         if current_ee is None:
             return None
@@ -2666,7 +2737,14 @@ class VA_Server:
         else:
             current_frames = self._preprocess_obs_to_frames([current_obs])
             frame_tensor = current_frames[-1].to(self.device, dtype=self.dtype)
-        need_new_chunk = len(self.unexecuted_action_buffer) == 0
+        overlap_steps = min(
+            self.chunk_boundary_overlap_steps,
+            self.action_chunk_exec_steps - 1,
+        )
+        need_new_chunk = (
+            len(self.unexecuted_action_buffer) == 0
+            or (overlap_steps > 0 and len(self.unexecuted_action_buffer) <= overlap_steps)
+        )
         frame_conds = self._update_transformer_cache_with_frame(
             frame_tensor,
             current_obs=current_obs,
@@ -2679,7 +2757,15 @@ class VA_Server:
             action_chunk = pred["absolute_action"]
             self.prev_absolute_action_chunk = action_chunk.astype(np.float32).copy()
             self.actions_served_since_last_prediction = 0
-            self._buffer_action_chunk(action_chunk)
+            overlap_reference = list(self.unexecuted_action_buffer)[-overlap_steps:] if overlap_steps else None
+            blended = self._buffer_action_chunk(action_chunk, overlap_reference=overlap_reference)
+            if blended:
+                logger.info(
+                    "Chunk boundary overlap: steps=%d alpha=%.3f action_space=%s",
+                    blended,
+                    self.chunk_boundary_overlap_alpha,
+                    self.robotwin_action_space,
+                )
         else:
             logger.info(
                 f"################# Pop Buffered Action ({len(self.unexecuted_action_buffer)} remaining) #################"
@@ -2830,6 +2916,10 @@ def run(args):
         config.joint_action_representation = args.joint_action_representation
     if args.action_chunk_exec_steps is not None:
         config.action_chunk_exec_steps = int(args.action_chunk_exec_steps)
+    if args.chunk_boundary_overlap_steps is not None:
+        config.chunk_boundary_overlap_steps = int(args.chunk_boundary_overlap_steps)
+    if args.chunk_boundary_overlap_alpha is not None:
+        config.chunk_boundary_overlap_alpha = float(args.chunk_boundary_overlap_alpha)
     if args.joint_delta_action_chunk_exec_steps is not None:
         config.joint_delta_action_chunk_exec_steps = int(args.joint_delta_action_chunk_exec_steps)
     if args.disable_joint_delta_warm_start_eval:
@@ -2922,6 +3012,18 @@ def main():
         type=int,
         default=None,
         help="Override how many cached actions are served from each predicted chunk.",
+    )
+    parser.add_argument(
+        "--chunk-boundary-overlap-steps",
+        type=int,
+        default=None,
+        help="Number of pending old/new action steps to blend at each chunk boundary.",
+    )
+    parser.add_argument(
+        "--chunk-boundary-overlap-alpha",
+        type=float,
+        default=None,
+        help="Weight of the new chunk in boundary blending (0=old, 1=new).",
     )
     parser.add_argument(
         "--joint-delta-action-chunk-exec-steps",

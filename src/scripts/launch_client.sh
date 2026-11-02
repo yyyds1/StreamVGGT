@@ -75,6 +75,8 @@ JOINT_DIRECT_CONTROL_STEPS=${JOINT_DIRECT_CONTROL_STEPS:-15}
 JOINT_MAX_VELOCITY=${JOINT_MAX_VELOCITY:-1.0}
 CLIP_JOINT_ACTION_TO_DATASET_BOUNDS=${CLIP_JOINT_ACTION_TO_DATASET_BOUNDS:-1}
 USE_CACHED_SPARSE_WAYPOINTS=${USE_CACHED_SPARSE_WAYPOINTS:-0}
+STRICT_SCENE_REPLAY=${STRICT_SCENE_REPLAY:-0}
+SCENE_REPLAY_DATASET_ROOT=${SCENE_REPLAY_DATASET_ROOT:-}
 SPARSE_WAYPOINT_STEP_SCALE=${SPARSE_WAYPOINT_STEP_SCALE:-1.0}
 SPARSE_WAYPOINT_PROGRESS_MODE=${SPARSE_WAYPOINT_PROGRESS_MODE:-auto}
 SPARSE_WAYPOINT_DATASET_ROOT=${SPARSE_WAYPOINT_DATASET_ROOT:-}
@@ -198,6 +200,9 @@ values = {
     "CFG_USE_EXPERT_PLAN_MARKED_RGB": cfg.get("use_expert_plan_marked_rgb", False),
     "CFG_USE_SPARSE_WAYPOINT_MARKED_RGB": cfg.get("use_sparse_waypoint_marked_rgb", False),
     "CFG_LIVE_WAYPOINT_LABELS": cfg.get("live_waypoint_labels", True),
+    "CFG_SPARSE_WAYPOINT_POSE_MODE": cfg.get("sparse_waypoint_pose_mode", "ee"),
+    "CFG_SPARSE_WAYPOINT_POSE_OFFSET_EE": json.dumps(cfg.get("sparse_waypoint_pose_offset_ee", [0.0, 0.0, 0.0])),
+    "CFG_SPARSE_WAYPOINT_FIELD_PREFIX": cfg.get("sparse_waypoint_field_prefix", "sparse_waypoints"),
     "CFG_EE_TARGET_SEQUENCE_LEN": cfg.get(
         "ee_target_sequence_len",
         cfg.get("expert_target_sequence_len", 6),
@@ -225,6 +230,20 @@ for key, value in values.items():
     print(f"{key}={shlex.quote(str(value))}")
 PY
 )"
+
+SPARSE_WAYPOINT_POSE_MODE=${SPARSE_WAYPOINT_POSE_MODE:-${CFG_SPARSE_WAYPOINT_POSE_MODE}}
+SPARSE_WAYPOINT_POSE_OFFSET_EE=${SPARSE_WAYPOINT_POSE_OFFSET_EE:-${CFG_SPARSE_WAYPOINT_POSE_OFFSET_EE}}
+SPARSE_WAYPOINT_FIELD_PREFIX=${SPARSE_WAYPOINT_FIELD_PREFIX:-${CFG_SPARSE_WAYPOINT_FIELD_PREFIX}}
+case "${SPARSE_WAYPOINT_POSE_MODE}" in
+    ee)
+        SPARSE_WAYPOINT_POSE_OFFSET_EE='[0,0,0]'
+        SPARSE_WAYPOINT_FIELD_PREFIX='sparse_waypoints'
+        ;;
+    gripper_midpoint)
+        SPARSE_WAYPOINT_FIELD_PREFIX='sparse_gripper_midpoint_waypoints'
+        ;;
+    *) echo "Invalid SPARSE_WAYPOINT_POSE_MODE=${SPARSE_WAYPOINT_POSE_MODE}; expected ee or gripper_midpoint" >&2; exit 2 ;;
+esac
 
 ROBOTWIN_ACTION_SPACE=${ROBOTWIN_ACTION_SPACE:-${CFG_ROBOTWIN_ACTION_SPACE}}
 ACTION_REPRESENTATION=${ACTION_REPRESENTATION:-${CFG_ACTION_REPRESENTATION}}
@@ -340,6 +359,11 @@ echo "[launch_client] live waypoint labels: ${LIVE_WAYPOINT_LABELS}"
 echo "[launch_client] waypoint layout: K=${EE_TARGET_SEQUENCE_LEN}, distance=${EE_TARGET_WAYPOINT_DISTANCE}"
 echo "[launch_client] sparse waypoint step scale: ${SPARSE_WAYPOINT_STEP_SCALE}"
 echo "[launch_client] sparse waypoint progress mode: ${SPARSE_WAYPOINT_PROGRESS_MODE}"
+echo "[launch_client] sparse waypoint pose mode: ${SPARSE_WAYPOINT_POSE_MODE}"
+echo "[launch_client] sparse waypoint field prefix: ${SPARSE_WAYPOINT_FIELD_PREFIX}"
+echo "[launch_client] sparse waypoint pose offset EE: ${SPARSE_WAYPOINT_POSE_OFFSET_EE}"
+echo "[launch_client] strict scene replay: ${STRICT_SCENE_REPLAY}"
+echo "[launch_client] scene replay dataset root: ${SCENE_REPLAY_DATASET_ROOT:-<same-as-waypoint-dataset>}"
 echo "[launch_client] expert target thresholds: pos=${EXPERT_TARGET_POS_THRESHOLD}, rot=${EXPERT_TARGET_ROT_THRESHOLD}, gripper=${EXPERT_TARGET_GRIPPER_THRESHOLD}"
 echo "[launch_client] joint direct control: ${JOINT_USE_DIRECT_CONTROL}, steps=${JOINT_DIRECT_CONTROL_STEPS}, max_velocity=${JOINT_MAX_VELOCITY} rad/s"
 echo "[launch_client] clip joint action to dataset bounds: ${CLIP_JOINT_ACTION_TO_DATASET_BOUNDS}"
@@ -439,6 +463,12 @@ print(json.dumps(seeds[:count]))
 PY
 )"
         cache_overrides+=(use_cached_sparse_waypoints True sparse_waypoint_dataset_root "${SPARSE_WAYPOINT_DATASET_ROOT}" evaluation_seed_list "${seed_json}")
+        if [[ "${STRICT_SCENE_REPLAY}" == "1" || "${STRICT_SCENE_REPLAY}" == "true" || "${STRICT_SCENE_REPLAY}" == "True" ]]; then
+            if [[ -z "${SCENE_REPLAY_DATASET_ROOT}" ]]; then
+                SCENE_REPLAY_DATASET_ROOT="${SPARSE_WAYPOINT_DATASET_ROOT}"
+            fi
+            cache_overrides+=(strict_scene_replay True scene_replay_dataset_root "${SCENE_REPLAY_DATASET_ROOT}")
+        fi
         seed_start_args+=(--seed_start "$(python -c 'import json,sys; print(json.loads(sys.argv[1])[0])' "${seed_json}")")
     fi
     joint_direct_flag=(--joint_use_direct_control)
@@ -449,6 +479,11 @@ PY
     if [[ "${CLIP_JOINT_ACTION_TO_DATASET_BOUNDS}" == "0" || "${CLIP_JOINT_ACTION_TO_DATASET_BOUNDS}" == "false" || "${CLIP_JOINT_ACTION_TO_DATASET_BOUNDS}" == "False" ]]; then
         joint_clip_flag=(--no-clip_joint_action_to_dataset_bounds)
     fi
+    sparse_waypoint_offset_overrides=(
+        sparse_waypoint_pose_mode "${SPARSE_WAYPOINT_POSE_MODE}"
+        sparse_waypoint_pose_offset_ee "${SPARSE_WAYPOINT_POSE_OFFSET_EE}"
+        sparse_waypoint_field_prefix "${SPARSE_WAYPOINT_FIELD_PREFIX}"
+    )
     if ! PYTHONWARNINGS=ignore::UserWarning \
         XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
         python -m evaluation.robotwin.eval_polict_client_openpi \
@@ -467,6 +502,7 @@ PY
             "${joint_clip_flag[@]}" \
             "${rgb_flag[@]}" \
             "${plan_rgb_flag[@]}" \
+            "${sparse_rgb_flag[@]}" \
             "${live_waypoint_flag[@]}" \
             --ee-target-sequence-len "${EE_TARGET_SEQUENCE_LEN}" \
             --ee-target-waypoint-distance "${EE_TARGET_WAYPOINT_DISTANCE}" \
@@ -478,6 +514,7 @@ PY
             --robotwin_action_space "${ROBOTWIN_ACTION_SPACE}" \
             --action_representation "${ACTION_REPRESENTATION}" \
             --joint_action_representation "${JOINT_ACTION_REPRESENTATION}" \
+            --sparse-waypoint-pose-mode "${SPARSE_WAYPOINT_POSE_MODE}" \
             --checkpoint_dir "${CKPT_DIR}" \
             "${ABLATION_ARGS[@]}" \
             --overrides \
@@ -485,6 +522,7 @@ PY
             sparse_waypoint_max_count 6 \
             sparse_waypoint_step_scale "${SPARSE_WAYPOINT_STEP_SCALE}" \
             sparse_waypoint_progress_mode "${SPARSE_WAYPOINT_PROGRESS_MODE}" \
+            "${sparse_waypoint_offset_overrides[@]}" \
             "${cache_overrides[@]}" \
             task_name "${task}" \
             --task_config "${TASK_CONFIG}" \

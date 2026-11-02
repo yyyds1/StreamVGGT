@@ -101,6 +101,12 @@ fi
 if [[ -n "${ACTION_CHUNK_EXEC_STEPS:-}" ]]; then
     extra_args+=(--action-chunk-exec-steps "${ACTION_CHUNK_EXEC_STEPS}")
 fi
+if [[ -n "${CHUNK_BOUNDARY_OVERLAP_STEPS:-}" ]]; then
+    extra_args+=(--chunk-boundary-overlap-steps "${CHUNK_BOUNDARY_OVERLAP_STEPS}")
+fi
+if [[ -n "${CHUNK_BOUNDARY_OVERLAP_ALPHA:-}" ]]; then
+    extra_args+=(--chunk-boundary-overlap-alpha "${CHUNK_BOUNDARY_OVERLAP_ALPHA}")
+fi
 if [[ -n "${JOINT_DELTA_ACTION_CHUNK_EXEC_STEPS:-}" ]]; then
     extra_args+=(--joint-delta-action-chunk-exec-steps "${JOINT_DELTA_ACTION_CHUNK_EXEC_STEPS}")
 fi

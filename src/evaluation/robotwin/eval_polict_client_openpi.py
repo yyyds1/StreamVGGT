@@ -167,7 +167,7 @@ def _row_array(row, key, dtype=None):
     return array.reshape(-1)
 
 
-def _reconstruct_cached_sparse_waypoint_records(data_frame):
+def _reconstruct_cached_sparse_waypoint_records(data_frame, field_prefix="sparse_waypoints"):
     """Rebuild the complete AWE keyframe list from per-frame future windows.
 
     The converted dataset stores only six future waypoints in each row.  Reading
@@ -178,19 +178,19 @@ def _reconstruct_cached_sparse_waypoint_records(data_frame):
     records_by_frame = {}
     for _, row in data_frame.iterrows():
         frame_index = int(np.asarray(row["frame_index"]).reshape(-1)[0])
-        durations = _row_array(row, "sparse_waypoints.duration", np.int64)
-        offsets = _row_array(row, "sparse_waypoints.frame_offset", np.int64)
-        left_valid = _row_array(row, "sparse_waypoints.left_valid", bool)
-        right_valid = _row_array(row, "sparse_waypoints.right_valid", bool)
-        left_pose = np.stack([np.asarray(value, dtype=np.float64).reshape(7) for value in row["sparse_waypoints.left_pose_7d"]], axis=0)
-        right_pose = np.stack([np.asarray(value, dtype=np.float64).reshape(7) for value in row["sparse_waypoints.right_pose_7d"]], axis=0)
-        left_gripper = _row_array(row, "sparse_waypoints.left_gripper", np.float64)
-        right_gripper = _row_array(row, "sparse_waypoints.right_gripper", np.float64)
-        transitions = _row_array(row, "sparse_waypoints.mandatory_gripper_transition", bool)
-        segment_error = _row_array(row, "sparse_waypoints.segment_error", np.float64)
-        phase = _row_array(row, "sparse_waypoints.phase", np.float64)
-        confidence = _row_array(row, "sparse_waypoints.confidence", np.float64)
-        plan_age = _row_array(row, "sparse_waypoints.plan_age", np.float64)
+        durations = _row_array(row, f"{field_prefix}.duration", np.int64)
+        offsets = _row_array(row, f"{field_prefix}.frame_offset", np.int64)
+        left_valid = _row_array(row, f"{field_prefix}.left_valid", bool)
+        right_valid = _row_array(row, f"{field_prefix}.right_valid", bool)
+        left_pose = np.stack([np.asarray(value, dtype=np.float64).reshape(7) for value in row[f"{field_prefix}.left_pose_7d"]], axis=0)
+        right_pose = np.stack([np.asarray(value, dtype=np.float64).reshape(7) for value in row[f"{field_prefix}.right_pose_7d"]], axis=0)
+        left_gripper = _row_array(row, f"{field_prefix}.left_gripper", np.float64)
+        right_gripper = _row_array(row, f"{field_prefix}.right_gripper", np.float64)
+        transitions = _row_array(row, f"{field_prefix}.mandatory_gripper_transition", bool)
+        segment_error = _row_array(row, f"{field_prefix}.segment_error", np.float64)
+        phase = _row_array(row, f"{field_prefix}.phase", np.float64)
+        confidence = _row_array(row, f"{field_prefix}.confidence", np.float64)
+        plan_age = _row_array(row, f"{field_prefix}.plan_age", np.float64)
         count = min(
             len(durations), len(offsets), len(left_valid), len(right_valid),
             len(left_pose), len(right_pose), len(left_gripper), len(right_gripper),
@@ -219,28 +219,87 @@ def _reconstruct_cached_sparse_waypoint_records(data_frame):
     return [records_by_frame[index] for index in sorted(records_by_frame)]
 
 
-def load_cached_sparse_waypoint_episode(dataset_root: Path, task_name: str, seed: int):
+def load_cached_sparse_waypoint_episode(
+    dataset_root: Path,
+    task_name: str,
+    seed: int,
+    pose_mode: str = "ee",
+    field_prefix: str = None,
+    episode_ordinal: int = None,
+    strict_scene_replay: bool = False,
+):
     """Load one clean test episode and reconstruct all sparse AWE keyframes."""
     import pandas as pd
 
     task_root = dataset_root / task_name
     clean_root = task_root / "demo_clean"
-    raw_root = dataset_root / task_name / "demo_clean_test50"
+    if not clean_root.is_dir():
+        clean_root = task_root / "demo_randomized"
+    if not clean_root.is_dir():
+        raise FileNotFoundError(f"cached sparse waypoint task data missing under {task_root}")
+    raw_root = task_root / "demo_clean_test50"
     if not (raw_root / "scene_info.json").is_file():
         raw_root = dataset_root.parent / "data_clean_test50_raw" / task_name / "demo_clean_test50"
     seed_path = task_root / "evaluation_seeds.txt"
     if not seed_path.is_file():
         seed_path = raw_root / "seed.txt"
-    seeds = [int(value) for value in seed_path.read_text().split()]
-    episode_index = seeds.index(int(seed))
     repo = clean_root / "lerobot"
     episodes = [json.loads(line) for line in (repo / "meta/episodes.jsonl").read_text().splitlines()]
+    episode_index = None
+    if seed_path.is_file():
+        seeds = [int(value) for value in seed_path.read_text().split()]
+        if int(seed) in seeds:
+            episode_index = seeds.index(int(seed))
+    if episode_index is None and strict_scene_replay:
+        raise FileNotFoundError(
+            f"strict scene replay requires an evaluation seed manifest containing seed {seed}: {seed_path}"
+        )
+    if episode_index is None:
+        # Converted datasets retain episode order but may not copy the source
+        # copy the original evaluation seed manifest. In that case the caller's
+        # ordinal in the evaluation seed list is the authoritative mapping.
+        if episode_ordinal is not None and 0 <= int(episode_ordinal) < len(episodes):
+            episode_index = int(episode_ordinal)
+        else:
+            episode_index = int(seed) if 0 <= int(seed) < len(episodes) else -1
+            matches = [
+                i for i, episode in enumerate(episodes)
+                if int(episode.get("source_episode_index", -1)) == int(seed)
+            ]
+            if matches:
+                episode_index = matches[0]
+    if episode_index is None or episode_index < 0 or episode_index >= len(episodes):
+        raise FileNotFoundError(
+            f"cannot map seed {seed} to an episode in {repo}; provide episode_ordinal"
+        )
     data_frame = pd.read_parquet(repo / episodes[episode_index]["data_path"])
-    records = _reconstruct_cached_sparse_waypoint_records(data_frame)
+    pose_mode = str(pose_mode).lower()
+    if pose_mode not in {"ee", "gripper_midpoint"}:
+        raise ValueError(f"Invalid cached sparse waypoint pose mode={pose_mode!r}")
+    default_prefix = (
+        "sparse_gripper_midpoint_waypoints"
+        if pose_mode == "gripper_midpoint"
+        else "sparse_waypoints"
+    )
+    if field_prefix is None:
+        field_prefix = str(episodes[episode_index].get("sparse_waypoint_field_prefix", default_prefix))
+        if pose_mode == "gripper_midpoint" and field_prefix == "sparse_waypoints":
+            field_prefix = "sparse_gripper_midpoint_waypoints"
+        elif pose_mode == "ee":
+            field_prefix = "sparse_waypoints"
+    field_prefix = str(field_prefix)
+    if not any(column.startswith(field_prefix + ".") for column in data_frame.columns):
+        raise RuntimeError(
+            f"cached episode {task_name}/{seed} is missing waypoint namespace {field_prefix!r}"
+        )
+    records = _reconstruct_cached_sparse_waypoint_records(
+        data_frame,
+        field_prefix=field_prefix,
+    )
     info_path = clean_root / "scene_info.json"
     if not info_path.is_file():
         info_path = raw_root / "scene_info.json"
-    info_db = json.loads(info_path.read_text())
+    info_db = json.loads(info_path.read_text()) if info_path.is_file() else {}
     if not records:
         raise RuntimeError(f"cached AWE episode {task_name}/{seed} has no valid waypoint records")
     print(
@@ -248,7 +307,8 @@ def load_cached_sparse_waypoint_episode(dataset_root: Path, task_name: str, seed
         f"waypoints={len(records)} frames={len(data_frame)}",
         flush=True,
     )
-    return episode_index, info_db[f"episode_{episode_index}"], records
+    episode_info = info_db.get(f"episode_{episode_index}", {})
+    return episode_index, episode_info, records
 
 def add_title_bar(img, text, font_scale=0.8, thickness=2):
     """Add a black title bar with text above the image"""
@@ -517,9 +577,20 @@ def main(usr_args):
         "evaluation_seed_list",
         "sparse_waypoint_step_scale",
         "sparse_waypoint_progress_mode",
+        "sparse_waypoint_pose_mode",
+        "sparse_waypoint_pose_offset_ee",
+        "sparse_waypoint_field_prefix",
+        "strict_scene_replay",
+        "scene_replay_dataset_root",
     ):
         if key in usr_args:
             args[key] = usr_args[key]
+    args["sparse_waypoint_pose_mode"] = usr_args.get(
+        "sparse_waypoint_pose_mode", args.get("sparse_waypoint_pose_mode", "ee")
+    )
+    args["sparse_waypoint_pose_offset_ee"] = usr_args.get(
+        "sparse_waypoint_pose_offset_ee", args.get("sparse_waypoint_pose_offset_ee", [0.0, 0.0, 0.0])
+    )
     args["max_episode_steps"] = usr_args.get("max_episode_steps", None)
     profile = args.get("ablation_profile")
     if profile:
@@ -573,6 +644,9 @@ def main(usr_args):
                     "use_expert_plan_marked_rgb",
                     "use_sparse_waypoint_marked_rgb",
                     "live_waypoint_labels",
+                    "sparse_waypoint_pose_mode",
+                    "sparse_waypoint_pose_offset_ee",
+                    "sparse_waypoint_field_prefix",
                     "ee_target_sequence_len",
                     "ee_target_waypoint_distance",
                     "expert_target_pos_threshold",
@@ -592,7 +666,14 @@ def main(usr_args):
     # into the task args before eval_policy reads it. Without this handoff, the
     # client parser can resolve ``joint`` correctly but eval_policy falls back
     # to its default ``ee`` mode.
-    for key in ("robotwin_action_space", "action_representation", "joint_action_representation"):
+    for key in (
+        "robotwin_action_space",
+        "action_representation",
+        "joint_action_representation",
+        "sparse_waypoint_pose_mode",
+        "sparse_waypoint_pose_offset_ee",
+        "sparse_waypoint_field_prefix",
+    ):
         if usr_args.get(key, None) is not None:
             args[key] = usr_args[key]
     args.setdefault("use_expert_marked_rgb", True)
@@ -1668,15 +1749,46 @@ def eval_policy(task_name,
         cached_episode = bool(args.get("use_cached_sparse_waypoints", False))
         if cached_episode:
             dataset_root = Path(args["sparse_waypoint_dataset_root"])
+            cached_pose_mode = str(args.get("sparse_waypoint_pose_mode", "ee")).lower()
+            requested_prefix = args.get("sparse_waypoint_field_prefix")
             current_episode_index, episode_info, sparse_waypoint_records = load_cached_sparse_waypoint_episode(
-                dataset_root, task_name, current_seed
+                dataset_root,
+                task_name,
+                current_seed,
+                pose_mode=cached_pose_mode,
+                field_prefix=requested_prefix,
+                episode_ordinal=succ_seed,
+                strict_scene_replay=bool(args.get("strict_scene_replay", False)),
             )
             rollout_args = deepcopy(args)
             rollout_args["need_plan"] = False
             rollout_args["expert_timeline"] = []
             rollout_args["sparse_waypoint_data"] = True
             rollout_args["sparse_waypoint_max_count"] = int(args.get("sparse_waypoint_max_count", 6))
+            # Cached rows have separate EE and midpoint namespaces. Read the
+            # selected precomputed coordinates as-is; do not transform them.
+            rollout_args["sparse_waypoint_source"] = f"cached_precomputed:{cached_pose_mode}"
+            rollout_args["sparse_waypoint_source_records"] = deepcopy(sparse_waypoint_records)
             rollout_args["sparse_waypoint_records"] = deepcopy(sparse_waypoint_records)
+            rollout_args["sparse_waypoint_pose_offset_ee"] = [0.0, 0.0, 0.0]
+            rollout_args["sparse_waypoint_field_prefix"] = (
+                requested_prefix
+                or ("sparse_gripper_midpoint_waypoints" if cached_pose_mode == "gripper_midpoint" else "sparse_waypoints")
+            )
+            if bool(args.get("strict_scene_replay", False)):
+                replay_root = Path(args.get("scene_replay_dataset_root", dataset_root))
+                rollout_args["replay_dataset_root"] = str(replay_root)
+                rollout_args["replay_task"] = task_name
+                rollout_args["replay_episode_index"] = int(current_episode_index)
+                replay_meta = replay_root / task_name / "demo_clean_test50"
+                for required in (replay_meta / "scene_info.json", replay_meta / "_traj_data" / f"episode{current_episode_index}.pkl"):
+                    if not required.is_file():
+                        raise FileNotFoundError(f"strict scene replay metadata missing: {required}")
+                print(
+                    f"[strict_scene_replay] task={task_name} episode={current_episode_index} "
+                    f"metadata={replay_meta}",
+                    flush=True,
+                )
             rollout_args["expert_target_keypoint_mode"] = "none"
             rollout_args["expert_target_progress_mode"] = "state"
             expert_timeline = []
@@ -1741,7 +1853,8 @@ def eval_policy(task_name,
 
         args["render_freq"] = render_freq
 
-        rollout_args = deepcopy(args)
+        if not cached_episode:
+            rollout_args = deepcopy(args)
         rollout_args["need_plan"] = False
         rollout_args["left_joint_path"] = left_joint_path
         rollout_args["right_joint_path"] = right_joint_path
@@ -1749,12 +1862,59 @@ def eval_policy(task_name,
         rollout_args["expert_target_progress_mode"] = "state"
         rollout_args["sparse_waypoint_data"] = True
         rollout_args["sparse_waypoint_max_count"] = int(args.get("sparse_waypoint_max_count", 6))
+        rollout_args["sparse_waypoint_source_records"] = deepcopy(sparse_waypoint_records)
         rollout_args["sparse_waypoint_records"] = deepcopy(sparse_waypoint_records)
         rollout_args["expert_target_keypoint_mode"] = "none"
 
         TASK_ENV.setup_demo(now_ep_num=current_episode_index, seed=current_seed, is_test=True, **rollout_args)
+        cached_precomputed = str(rollout_args.get("sparse_waypoint_source", "")).startswith("cached_precomputed:")
+        requested_offset = np.asarray(args.get("sparse_waypoint_pose_offset_ee", [0.0, 0.0, 0.0]), dtype=np.float64)
+        pose_mode = str(args.get("sparse_waypoint_pose_mode", "ee")).lower()
+        if cached_precomputed:
+            # Cached evaluation data has separate EE and midpoint namespaces.
+            # Select the requested namespace and never translate it again.
+            requested_offset = np.zeros(3, dtype=np.float64)
+        if pose_mode not in {"ee", "gripper_midpoint"}:
+            raise ValueError(f"Invalid sparse_waypoint_pose_mode={pose_mode!r}")
+        if hasattr(TASK_ENV, "set_sparse_waypoint_pose_offset"):
+            if cached_precomputed or pose_mode == "ee":
+                requested_offset = np.zeros(3, dtype=np.float64)
+            if cached_precomputed and hasattr(TASK_ENV, "set_sparse_waypoint_records"):
+                TASK_ENV.set_sparse_waypoint_records(
+                    sparse_waypoint_records,
+                    source=rollout_args["sparse_waypoint_source"],
+                )
+                applied_offset = np.zeros(3, dtype=np.float64)
+            else:
+                applied_offset = TASK_ENV.set_sparse_waypoint_pose_offset(requested_offset)
+        else:
+            raise RuntimeError("Task environment cannot apply sparse waypoint pose mode")
+        if hasattr(TASK_ENV, "_serialize_sparse_waypoint_sequence"):
+            serialized = TASK_ENV._serialize_sparse_waypoint_sequence()
+            left_target = serialized["left_pose_7d"][0]
+            right_target = serialized["right_pose_7d"][0]
+        else:
+            left_target = np.zeros(7, dtype=np.float32)
+            right_target = np.zeros(7, dtype=np.float32)
+        source_mode = (
+            str(rollout_args["sparse_waypoint_source"]).split(":", 1)[1]
+            if cached_precomputed
+            else pose_mode
+        )
+        if cached_precomputed and str(args.get("se3_guidance_source", "client")).lower() != "client":
+            raise RuntimeError(
+                "Cached precomputed sparse waypoints require se3_guidance_source='client'; "
+                f"got {args.get('se3_guidance_source')!r}"
+            )
+        print(
+            f"[sparse_waypoint_pose] mode={source_mode} source={rollout_args.get('sparse_waypoint_source', 'online_replay')} "
+            f"offset_ee={applied_offset.tolist()} "
+            f"left_first_waypoint_xyz={np.asarray(left_target[:3]).tolist()} "
+            f"right_first_waypoint_xyz={np.asarray(right_target[:3]).tolist()}",
+            flush=True,
+        )
         apply_step_limit_override()
-        episode_info_list = [episode_info["info"]]
+        episode_info_list = [episode_info.get("info", {})]
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
         instruction = np.random.choice(results[0][instruction_type])
         if single_trajectory:
@@ -1784,7 +1944,7 @@ def eval_policy(task_name,
                     f"env_instruction={instruction}, dataset_instruction=None"
                 )
         if single_trajectory:
-            print(f"[single_trajectory][eval] env_info={episode_info['info']}")
+            print(f"[single_trajectory][eval] env_info={episode_info.get('info', {})}")
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:
@@ -2088,6 +2248,7 @@ def parse_args_and_config():
     parser.add_argument("--action_representation", "--action-representation", dest="action_representation", default=None)
     parser.add_argument("--joint_action_representation", "--joint-action-representation", dest="joint_action_representation", default=None)
     parser.add_argument("--checkpoint_dir", "--checkpoint-dir", dest="checkpoint_dir", default=None)
+    parser.add_argument("--sparse-waypoint-pose-mode", choices=("ee", "gripper_midpoint"), default=None)
     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
     parser.add_argument("--ablation-profile", dest="ablation_profile", default=None, help="JSON ablation profile")
     parser.add_argument("--single_trajectory", action="store_true")
@@ -2186,6 +2347,8 @@ def parse_args_and_config():
         config["joint_action_representation"] = args.joint_action_representation
     if args.checkpoint_dir is not None:
         config["checkpoint_dir"] = args.checkpoint_dir
+    if args.sparse_waypoint_pose_mode is not None:
+        config["sparse_waypoint_pose_mode"] = args.sparse_waypoint_pose_mode
     if config.get("robotwin_action_space") not in {"ee", "joint"}:
         raise ValueError(
             f"Invalid robotwin_action_space={config.get('robotwin_action_space')!r}; expected 'ee' or 'joint'."
