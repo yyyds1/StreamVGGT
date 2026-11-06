@@ -1,0 +1,17 @@
+{
+  "name": "EE-C3_all_cameras_missing",
+  "waypoint_noise": {
+    "position_std": 0.005,
+    "rotation_std_deg": 5.0,
+    "gripper_std": 0.02,
+    "duration_std": 1.0
+  },
+  "waypoint_missing_rate": 0.0,
+  "waypoint_missing_sides": [],
+  "seed": 0,
+  "camera_missing": [
+    "head",
+    "left_wrist",
+    "right_wrist"
+  ]
+}
