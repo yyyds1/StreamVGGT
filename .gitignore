@@ -40,6 +40,6 @@ core.*
 dataset/
 input/
 
-# Local ModelScope publishing staging/runtime
+# Temporary ModelScope upload staging/runtime (may contain model weights)
 .modelscope_publish/
 .ms_model_upload_runtime/

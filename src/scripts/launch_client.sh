@@ -95,6 +95,10 @@ if [[ -z "${SAVE_ROOT}" ]]; then
         SAVE_ROOT="${SRC_DIR}/../eval_out/rollouts"
     fi
 fi
+if [[ -n "${ABLATION_PROFILE}" ]]; then
+    ABLATION_RUN_ID=${ABLATION_RUN_ID:-$(date +%Y%m%d_%H%M%S)}
+    SAVE_ROOT="${SAVE_ROOT%/}/${ABLATION_RUN_ID}"
+fi
 
 # Edit this list for batch evaluation. If TASK_NAME or the first positional
 # argument is set, only that one task is evaluated.
