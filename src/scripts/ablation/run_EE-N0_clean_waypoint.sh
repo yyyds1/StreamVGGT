@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export POLICY_NAME="ACT"
 export ABLATION_PROFILE="EE-N0_clean_waypoint"
 export SE3_GUIDANCE_NOISY_ORACLE=0
+export SPARSE_WAYPOINT_PROGRESS_MODE="time"
+export SPARSE_WAYPOINT_STEP_SCALE="${SPARSE_WAYPOINT_STEP_SCALE:-1.5}"
 
 : "${CKPT_DIR:?Set CKPT_DIR to the complete noisy absolute-EE checkpoint directory}"
 : "${SAVE_ROOT:?Set SAVE_ROOT to a unique output directory}"

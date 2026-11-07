@@ -35,6 +35,8 @@ results/
 logs/
 *.log
 core.*
+experiments/
+env_actionvggt_robotwin.sh
 
 # Local datasets and caches
 dataset/

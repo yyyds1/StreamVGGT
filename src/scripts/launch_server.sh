@@ -79,7 +79,7 @@ if [[ -z "${CKPT_DIR}" || "${CKPT_DIR}" == "latest" ]]; then
     CKPT_DIR="$(find_latest_checkpoint)"
 fi
 CKPT_DIR="$(cd "${CKPT_DIR}" && pwd)"
-EVAL_CONFIG=${EVAL_CONFIG:-"${CKPT_DIR}/training_config.json"}
+EVAL_CONFIG=${SERVER_EVAL_CONFIG:-${EVAL_CONFIG:-"${CKPT_DIR}/training_config.json"}}
 
 if [[ ! -f "${EVAL_CONFIG}" ]]; then
     echo "Missing evaluation config: ${EVAL_CONFIG}" >&2

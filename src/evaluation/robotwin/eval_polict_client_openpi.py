@@ -683,9 +683,9 @@ def main(usr_args):
     args.setdefault("live_waypoint_labels", False)
     args.setdefault("sparse_waypoint_data", False)
     args.setdefault("sparse_waypoint_max_count", 6)
-    args["sparse_waypoint_step_scale"] = max(
-        1.0, float(args.get("sparse_waypoint_step_scale", 1.0))
-    )
+    args["sparse_waypoint_step_scale"] = float(args.get("sparse_waypoint_step_scale", 1.0))
+    if not np.isfinite(args["sparse_waypoint_step_scale"]) or args["sparse_waypoint_step_scale"] <= 0:
+        raise ValueError("sparse_waypoint_step_scale must be a positive finite duration multiplier")
     print(
         f"[eval_client] sparse waypoint step scale={args['sparse_waypoint_step_scale']}",
         flush=True,
